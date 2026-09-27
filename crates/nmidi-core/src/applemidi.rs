@@ -9,6 +9,8 @@ pub enum AppleMidiCommand {
     Invitation,
     /// Invitation accepted ("OK")
     InvitationAccepted,
+    /// Invitation rejected ("NO")
+    InvitationRejected,
     /// End session ("BY")
     End,
     /// Clock synchronization ("CK")
@@ -27,6 +29,7 @@ impl AppleMidiCommand {
         match self {
             Self::Invitation => b"IN\0\0",
             Self::InvitationAccepted => b"OK\0\0",
+            Self::InvitationRejected => b"NO\0\0",
             Self::End => b"BY\0\0",
             Self::Synchronization => b"CK", // Updated to reflect 2-byte command
             Self::ReceiverFeedback => b"RS",
@@ -45,6 +48,7 @@ impl AppleMidiCommand {
         let cmd = match bytes[0..2] {
             [b'I', b'N'] => Self::Invitation,
             [b'O', b'K'] => Self::InvitationAccepted,
+            [b'N', b'O'] => Self::InvitationRejected,
             [b'B', b'Y'] => Self::End,
             [b'C', b'K'] => Self::Synchronization,
             [b'R', b'S'] => Self::ReceiverFeedback,
@@ -78,6 +82,13 @@ pub enum AppleMidiPacket {
     },
     /// Invitation accepted packet
     InvitationAccepted {
+        version: u16,
+        token: u32,
+        ssrc: u32,
+        name: String,
+    },
+    /// Invitation rejected packet ("NO"): the remote declined the session.
+    InvitationRejected {
         version: u16,
         token: u32,
         ssrc: u32,
@@ -121,7 +132,9 @@ impl AppleMidiPacket {
         let mut offset = 2 + consumed;
 
         match command {
-            AppleMidiCommand::Invitation | AppleMidiCommand::InvitationAccepted => {
+            AppleMidiCommand::Invitation
+            | AppleMidiCommand::InvitationAccepted
+            | AppleMidiCommand::InvitationRejected => {
                 let header_len = 2 /*sig*/ + consumed + 2 /*version*/ + 4 /*token*/ + 4 /*ssrc*/;
                 if data.len() < header_len {
                     return Err(ProtocolError::PacketTooShort {
@@ -144,20 +157,25 @@ impl AppleMidiPacket {
                     .unwrap_or(name_bytes.len());
                 let name = String::from_utf8_lossy(&name_bytes[..name_end]).to_string();
 
-                if command == AppleMidiCommand::Invitation {
-                    Ok(AppleMidiPacket::Invitation {
+                match command {
+                    AppleMidiCommand::Invitation => Ok(AppleMidiPacket::Invitation {
                         version,
                         token,
                         ssrc,
                         name,
-                    })
-                } else {
-                    Ok(AppleMidiPacket::InvitationAccepted {
+                    }),
+                    AppleMidiCommand::InvitationRejected => Ok(AppleMidiPacket::InvitationRejected {
                         version,
                         token,
                         ssrc,
                         name,
-                    })
+                    }),
+                    _ => Ok(AppleMidiPacket::InvitationAccepted {
+                        version,
+                        token,
+                        ssrc,
+                        name,
+                    }),
                 }
             }
             AppleMidiCommand::End => {
@@ -266,6 +284,19 @@ impl AppleMidiPacket {
                 buf.put_slice(name.as_bytes());
                 buf.put_u8(0); // null terminator
             }
+            AppleMidiPacket::InvitationRejected {
+                version,
+                token,
+                ssrc,
+                name,
+            } => {
+                buf.put_slice(AppleMidiCommand::InvitationRejected.tx_bytes());
+                buf.put_u16(*version);
+                buf.put_u32(*token);
+                buf.put_u32(*ssrc);
+                buf.put_slice(name.as_bytes());
+                buf.put_u8(0); // null terminator
+            }
             AppleMidiPacket::End {
                 version,
                 token,
@@ -307,6 +338,7 @@ impl AppleMidiPacket {
         match self {
             AppleMidiPacket::Invitation { ssrc, .. }
             | AppleMidiPacket::InvitationAccepted { ssrc, .. }
+            | AppleMidiPacket::InvitationRejected { ssrc, .. }
             | AppleMidiPacket::End { ssrc, .. }
             | AppleMidiPacket::Synchronization { ssrc, .. }
             | AppleMidiPacket::ReceiverFeedback { ssrc, .. } => *ssrc,
@@ -377,6 +409,35 @@ mod tests {
         assert_eq!(u16::from_be_bytes(bytes[6..8].try_into().unwrap()), 2);
         assert_eq!(u32::from_be_bytes(bytes[8..12].try_into().unwrap()), 12345);
         assert_eq!(u32::from_be_bytes(bytes[12..16].try_into().unwrap()), 222);
+    }
+
+    #[test]
+    fn test_invitation_rejected_roundtrip() {
+        let packet = AppleMidiPacket::InvitationRejected {
+            version: 2,
+            token: 12345,
+            ssrc: 333,
+            name: "TestDevice".to_string(),
+        };
+
+        let bytes = packet.to_bytes();
+        let parsed = AppleMidiPacket::parse(&bytes).unwrap();
+
+        assert_eq!(packet, parsed);
+        assert_eq!(&bytes[2..6], b"NO\0\0");
+    }
+
+    #[test]
+    fn test_parses_a_rejection_wire_packet() {
+        // A "NO" packet with the invitation header layout parses to a rejection.
+        let bytes = make_inv_bytes(b"NO\0\0");
+        match AppleMidiPacket::parse(&bytes).unwrap() {
+            AppleMidiPacket::InvitationRejected { token, ssrc, .. } => {
+                assert_eq!(token, 12345);
+                assert_eq!(ssrc, 67890);
+            }
+            other => panic!("expected InvitationRejected, got {other:?}"),
+        }
     }
 
     #[test]
