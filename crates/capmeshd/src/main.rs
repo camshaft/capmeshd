@@ -223,6 +223,11 @@ async fn main() -> Result<()> {
         info!("no data-plane kinds configured; browsing only");
     }
 
+    // Reconcile permanent mounts (DESIGN §9) against the local MIDI data-plane daemon at
+    // startup. Best-effort: if the daemon socket is down (e.g. nmidid not up yet), log and
+    // carry on — a later tick's reconcile / the daemon coming up converges it.
+    reconcile_permanent_mounts(&cfg).await;
+
     let events = discovery::browse().context("start mDNS browse")?;
     info!("browsing {} for peers", discovery::SERVICE_TYPE);
 
@@ -337,6 +342,74 @@ fn parse_role(s: &str) -> Result<MountRole> {
         "mirror-sink" => Ok(MountRole::MirrorSink),
         "link" => Ok(MountRole::Link),
         other => anyhow::bail!("unknown role `{other}` (mirror-source | mirror-sink | link)"),
+    }
+}
+
+/// Build a `MountSpec` (§3.1) from a config permanent-mount (§9).
+fn permanent_to_spec(pm: &config::PermanentMount) -> Result<MountSpec> {
+    let role = parse_role(&pm.role)?;
+    let host = pm
+        .remote
+        .host
+        .clone()
+        .unwrap_or_else(|| pm.remote.addr.to_string());
+    let mount_id = pm
+        .mount_id
+        .clone()
+        .unwrap_or_else(|| format!("{host}-{}", pm.remote.port_id));
+    Ok(MountSpec {
+        mount_id,
+        role,
+        local: LocalEndpoint {
+            is_virtual: !matches!(role, MountRole::Link),
+            name: pm.local_name.clone(),
+        },
+        remote: RemoteEndpoint {
+            host,
+            addr: pm.remote.addr,
+            port: pm.remote.port,
+            port_id: pm.remote.port_id.clone(),
+        },
+        format: Format {
+            codec: pm.codec.clone(),
+            params: Default::default(),
+        },
+    })
+}
+
+/// Reconcile the config's permanent mounts (DESIGN §9) against the local MIDI data-plane
+/// daemon named by `[dataplane.midi].socket`. Best-effort at startup: an unreachable daemon
+/// or an invalid mount is logged, not fatal — the daemon keeps advertising/browsing.
+async fn reconcile_permanent_mounts(cfg: &Config) {
+    if cfg.permanent_mounts.is_empty() {
+        return;
+    }
+    let Some(socket) = cfg.dataplane.get("midi").and_then(|d| d.socket.clone()) else {
+        warn!("permanent-mounts configured but no [dataplane.midi] socket; skipping reconcile");
+        return;
+    };
+    let specs: Vec<MountSpec> = match cfg.permanent_mounts.iter().map(permanent_to_spec).collect() {
+        Ok(specs) => specs,
+        Err(e) => {
+            warn!("invalid permanent-mount: {e:#}");
+            return;
+        }
+    };
+    let reconciler = Reconciler::with_desired(specs);
+    match connect_and_hello(&socket).await {
+        Ok(mut client) => match reconciler.reconcile_once(&mut client).await {
+            Ok(plan) if plan.is_empty() => info!("permanent-mounts: converged (no changes)"),
+            Ok(plan) => info!(
+                mounted = plan.to_mount.len(),
+                unmounted = plan.to_unmount.len(),
+                "permanent-mounts: reconciled"
+            ),
+            Err(e) => warn!("permanent-mount reconcile failed: {e:#}"),
+        },
+        Err(e) => warn!(
+            socket = %socket.display(),
+            "permanent-mount reconcile skipped (data-plane daemon unreachable): {e:#}"
+        ),
     }
 }
 
