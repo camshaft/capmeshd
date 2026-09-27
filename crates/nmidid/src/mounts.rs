@@ -1,55 +1,82 @@
 //! Mount lifecycle: the `mount` / `unmount` / `mount-status` methods (§3).
 //!
 //! [`MountRegistry`] tracks live mounts daemon-wide (shared across every control
-//! connection). Materializing the OS-level endpoint is behind a [`Mounter`] seam
-//! so the registry, validation, and state machine are unit-tested without a real
-//! ALSA/CoreMIDI backend; the production [`MidirMounter`] creates the virtual
-//! port via `midir`.
-//!
-//! This slice (M0a increment 2, sub-slice A) implements the `mirror-source`
-//! validation + local virtual-endpoint materialization, registering the mount as
-//! `connecting`. The remote AppleMIDI handshake and the RTP-MIDI pump that drives
-//! it to `active` land in the next sub-slice.
+//! connection). Two seams keep the registry, validation, and state machine
+//! unit-testable without a real ALSA/CoreMIDI backend or network:
+//! - [`Mounter`] materializes the local OS endpoint and hands back a [`MidiSink`]
+//!   to push events into (the production [`MidirMounter`] creates the virtual
+//!   `midir` port);
+//! - [`Connector`] drives the mount's data path — the production connector (see
+//!   `crate::pump`) spawns the AppleMIDI handshake + RTP-MIDI pump that moves the
+//!   mount `connecting → active`; tests inject a no-op connector.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use tokio::task::AbortHandle;
+
 use crate::ports::PortProvider;
-use crate::protocol::{DaemonError, MountRole, MountSpec, MountState, MountStats, MountStatus};
+use crate::protocol::{
+    DaemonError, MountRole, MountSpec, MountState, MountStats, MountStatus, RemoteEndpoint,
+};
 
-/// An opaque, RAII keep-alive for a materialized local endpoint. Dropping it
-/// tears the endpoint down (e.g. removes the virtual MIDI port).
-pub type MountHandle = Box<dyn Send>;
+/// A place to push decoded MIDI bytes — the local end of a mount. Owned by the
+/// mount's data-path task; dropping it releases the underlying endpoint (e.g.
+/// removes the virtual MIDI port).
+pub trait MidiSink: Send {
+    /// Send one MIDI message (raw status+data bytes) to the local endpoint.
+    fn send(&self, message: &[u8]) -> anyhow::Result<()>;
+}
 
-/// Materializes and tears down the local OS endpoint of a mount.
+/// Materializes the local OS endpoint of a mount.
 pub trait Mounter: Send + Sync {
     /// Whether this daemon/platform can create virtual endpoints.
     fn supports_virtual(&self) -> bool;
 
     /// Create a local virtual **source** (a port other apps read from, into
-    /// which we push the remote source's events) named `display_name`.
-    fn create_virtual_source(&self, display_name: &str) -> anyhow::Result<MountHandle>;
+    /// which we push the remote source's events) named `display_name`, returning
+    /// the sink to push into.
+    fn create_virtual_source(&self, display_name: &str) -> anyhow::Result<Box<dyn MidiSink>>;
+}
+
+/// Drives a mount's data path: connects to the remote and pumps events into the
+/// sink, updating `status`. Returns a handle to abort the task on unmount (or
+/// `None` if the connector does not spawn one, e.g. in tests).
+pub trait Connector: Send + Sync {
+    fn start(
+        &self,
+        remote: RemoteEndpoint,
+        sink: Box<dyn MidiSink>,
+        status: Arc<Mutex<MountStatus>>,
+    ) -> Option<AbortHandle>;
 }
 
 struct MountEntry {
-    status: MountStatus,
-    /// Kept alive for the mount's lifetime; dropped on unmount.
-    _handle: MountHandle,
+    /// Shared with the data-path task, which updates state/stats live.
+    status: Arc<Mutex<MountStatus>>,
+    /// Aborts the data-path task on unmount (which drops the sink → endpoint).
+    abort: Option<AbortHandle>,
 }
 
-/// Tracks live mounts and drives their creation/teardown through a [`Mounter`].
+/// Tracks live mounts and drives their creation/teardown.
 pub struct MountRegistry {
     mounter: Arc<dyn Mounter>,
+    connector: Arc<dyn Connector>,
     ports: Arc<dyn PortProvider>,
     mounts: Mutex<HashMap<String, MountEntry>>,
 }
 
 impl MountRegistry {
-    pub fn new(mounter: Arc<dyn Mounter>, ports: Arc<dyn PortProvider>) -> Self {
+    pub fn new(
+        mounter: Arc<dyn Mounter>,
+        connector: Arc<dyn Connector>,
+        ports: Arc<dyn PortProvider>,
+    ) -> Self {
         MountRegistry {
             mounter,
+            connector,
             ports,
             mounts: Mutex::new(HashMap::new()),
         }
@@ -61,9 +88,10 @@ impl MountRegistry {
         {
             let mounts = self.mounts.lock().unwrap();
             if let Some(entry) = mounts.get(&spec.mount_id) {
+                let status = entry.status.lock().unwrap();
                 return Ok(serde_json::json!({
-                    "mount-id": entry.status.mount_id,
-                    "state": entry.status.state,
+                    "mount-id": status.mount_id,
+                    "state": status.state,
                 }));
             }
         }
@@ -123,45 +151,53 @@ impl MountRegistry {
             .clone()
             .unwrap_or_else(|| format!("nmidid: {}", spec.remote.port_id));
 
-        let handle = self
+        let sink = self
             .mounter
             .create_virtual_source(&display_name)
             .map_err(|e| {
                 DaemonError::domain("busy", format!("could not create virtual port: {e}"))
             })?;
 
-        let status = MountStatus {
+        let status = Arc::new(Mutex::new(MountStatus {
             mount_id: spec.mount_id.clone(),
             state: MountState::Connecting,
             since: now_rfc3339(),
             stats: MountStats::default(),
             detail: None,
-        };
-        let result = serde_json::json!({ "mount-id": status.mount_id, "state": status.state });
+        }));
+        let result = serde_json::json!({ "mount-id": spec.mount_id, "state": "connecting" });
 
-        self.mounts.lock().unwrap().insert(
-            spec.mount_id.clone(),
-            MountEntry {
-                status,
-                _handle: handle,
-            },
-        );
+        // Hand the data path off to the connector (spawns the pump task).
+        let abort = self
+            .connector
+            .start(spec.remote.clone(), sink, Arc::clone(&status));
+
+        self.mounts
+            .lock()
+            .unwrap()
+            .insert(spec.mount_id.clone(), MountEntry { status, abort });
         Ok(result)
     }
 
     /// Tear a mount down (§3). Idempotent: an unknown id is a clean no-op.
     pub fn unmount(&self, mount_id: &str) -> serde_json::Value {
-        // Drop removes the entry (and its handle → the virtual port).
-        self.mounts.lock().unwrap().remove(mount_id);
+        if let Some(entry) = self.mounts.lock().unwrap().remove(mount_id) {
+            // Abort the data-path task; dropping it drops the sink → the
+            // virtual port is removed.
+            if let Some(abort) = entry.abort {
+                abort.abort();
+            }
+        }
         serde_json::json!({})
     }
 
     /// One or all live mounts (§3).
     pub fn status(&self, mount_id: Option<&str>) -> serde_json::Value {
         let mounts = self.mounts.lock().unwrap();
-        let list: Vec<&MountStatus> = match mount_id {
-            Some(id) => mounts.get(id).map(|e| &e.status).into_iter().collect(),
-            None => mounts.values().map(|e| &e.status).collect(),
+        let snapshot = |e: &MountEntry| e.status.lock().unwrap().clone();
+        let list: Vec<MountStatus> = match mount_id {
+            Some(id) => mounts.get(id).map(snapshot).into_iter().collect(),
+            None => mounts.values().map(snapshot).collect(),
         };
         serde_json::json!({ "mounts": list })
     }
@@ -170,13 +206,27 @@ impl MountRegistry {
 /// Production mounter: creates the virtual port via `midir`.
 pub struct MidirMounter;
 
+#[cfg(unix)]
+struct MidirSink(Mutex<midir::MidiOutputConnection>);
+
+#[cfg(unix)]
+impl MidiSink for MidirSink {
+    fn send(&self, message: &[u8]) -> anyhow::Result<()> {
+        self.0
+            .lock()
+            .unwrap()
+            .send(message)
+            .map_err(|e| anyhow::anyhow!("midir send failed: {e}"))
+    }
+}
+
 impl Mounter for MidirMounter {
     fn supports_virtual(&self) -> bool {
         // `midir` supports virtual ports on ALSA (Linux) and CoreMIDI (macOS).
         cfg!(unix)
     }
 
-    fn create_virtual_source(&self, display_name: &str) -> anyhow::Result<MountHandle> {
+    fn create_virtual_source(&self, display_name: &str) -> anyhow::Result<Box<dyn MidiSink>> {
         #[cfg(unix)]
         {
             use midir::MidiOutput;
@@ -187,7 +237,7 @@ impl Mounter for MidirMounter {
             let conn = out
                 .create_virtual(display_name)
                 .map_err(|e| anyhow::anyhow!("create_virtual failed: {e}"))?;
-            Ok(Box::new(conn))
+            Ok(Box::new(MidirSink(Mutex::new(conn))))
         }
         #[cfg(not(unix))]
         {
@@ -198,7 +248,7 @@ impl Mounter for MidirMounter {
 }
 
 /// A dependency-free RFC 3339 (UTC) timestamp for `MountStatus.since`.
-fn now_rfc3339() -> String {
+pub(crate) fn now_rfc3339() -> String {
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -229,19 +279,45 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 pub struct NullMounter;
 
 #[cfg(test)]
+struct NullSink;
+
+#[cfg(test)]
+impl MidiSink for NullSink {
+    fn send(&self, _message: &[u8]) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
 impl Mounter for NullMounter {
     fn supports_virtual(&self) -> bool {
         true
     }
-    fn create_virtual_source(&self, _display_name: &str) -> anyhow::Result<MountHandle> {
-        Ok(Box::new(()))
+    fn create_virtual_source(&self, _display_name: &str) -> anyhow::Result<Box<dyn MidiSink>> {
+        Ok(Box::new(NullSink))
+    }
+}
+
+/// A no-op connector for tests: never spawns a task, leaves the mount `connecting`.
+#[cfg(test)]
+pub struct NullConnector;
+
+#[cfg(test)]
+impl Connector for NullConnector {
+    fn start(
+        &self,
+        _remote: RemoteEndpoint,
+        _sink: Box<dyn MidiSink>,
+        _status: Arc<Mutex<MountStatus>>,
+    ) -> Option<AbortHandle> {
+        None
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{Format, LocalEndpoint, PortDescriptor, RemoteEndpoint};
+    use crate::protocol::{Format, LocalEndpoint, PortDescriptor};
 
     struct StaticPorts(Vec<PortDescriptor>);
     impl PortProvider for StaticPorts {
@@ -257,8 +333,8 @@ mod tests {
         fn supports_virtual(&self) -> bool {
             self.supports_virtual
         }
-        fn create_virtual_source(&self, _display_name: &str) -> anyhow::Result<MountHandle> {
-            Ok(Box::new(()))
+        fn create_virtual_source(&self, _display_name: &str) -> anyhow::Result<Box<dyn MidiSink>> {
+            Ok(Box::new(NullSink))
         }
     }
 
@@ -277,6 +353,7 @@ mod tests {
     fn registry(supports_virtual: bool) -> MountRegistry {
         MountRegistry::new(
             Arc::new(FakeMounter { supports_virtual }),
+            Arc::new(NullConnector),
             Arc::new(StaticPorts(vec![source_port("source-0")])),
         )
     }
