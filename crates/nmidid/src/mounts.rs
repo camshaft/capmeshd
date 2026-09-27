@@ -267,6 +267,24 @@ impl MountRegistry {
         serde_json::json!({})
     }
 
+    /// Tear down every live mount for daemon shutdown: each pump is signalled to
+    /// stop gracefully (sends `End`/BY so no source holds a stale session) and a
+    /// torn-down state is announced. Returns the number of mounts torn down.
+    pub fn shutdown_all(&self) -> usize {
+        let entries: Vec<MountEntry> = self
+            .mounts
+            .lock()
+            .unwrap()
+            .drain()
+            .map(|(_, entry)| entry)
+            .collect();
+        for entry in &entries {
+            entry.cancel.notify_one();
+            transition(&entry.status, &self.notifier, MountState::TornDown, None);
+        }
+        entries.len()
+    }
+
     /// One or all live mounts (§3).
     pub fn status(&self, mount_id: Option<&str>) -> serde_json::Value {
         let mounts = self.mounts.lock().unwrap();
@@ -484,6 +502,19 @@ mod tests {
         assert!(reg.status(None)["mounts"].as_array().unwrap().is_empty());
         // Unknown id is a clean no-op.
         reg.unmount("nope");
+    }
+
+    #[test]
+    fn shutdown_all_tears_down_every_mount() {
+        let reg = registry(true);
+        reg.mount(spec("m1", "source-0", "midi1")).unwrap();
+        reg.mount(spec("m2", "source-0", "midi1")).unwrap();
+        assert_eq!(reg.status(None)["mounts"].as_array().unwrap().len(), 2);
+
+        assert_eq!(reg.shutdown_all(), 2);
+        assert!(reg.status(None)["mounts"].as_array().unwrap().is_empty());
+        // Idempotent: nothing left to tear down.
+        assert_eq!(reg.shutdown_all(), 0);
     }
 
     #[test]
