@@ -52,11 +52,30 @@
               mainProgram = "nmidid";
             };
           };
+
+          # The browser-surface data-plane daemon crate (DESIGN §10.1). Pure
+          # Rust (axum/tokio/hyper) — links no system libraries, so no
+          # buildInputs. doCheck runs the pure store/http unit tests (in-memory
+          # + tempfile, no network) in the sandbox.
+          surfaced = pkgs.rustPlatform.buildRustPackage {
+            pname = "surfaced";
+            version = "0.1.0";
+            src = self;
+            cargoLock.lockFile = ./Cargo.lock;
+            cargoBuildFlags = [ "-p" "surfaced" ];
+            cargoTestFlags = [ "-p" "surfaced" ];
+            meta = {
+              description = "Browser surface data-plane daemon — durable scriptable display sinks";
+              license = pkgs.lib.licenses.mit;
+              mainProgram = "surfaced";
+            };
+          };
         in
         {
           packages.default = capmeshd;
           packages.capmeshd = capmeshd;
           packages.nmidid = nmidid;
+          packages.surfaced = surfaced;
 
           checks.clippy = capmeshd.overrideAttrs (old: {
             pname = "${old.pname}-clippy";
@@ -74,6 +93,46 @@
             installPhase = "touch $out";
             doCheck = false;
           });
+
+          # surfaced's own gate coverage: clippy over the daemon crate (owned by v-surfaced).
+          checks.surfaced-clippy = surfaced.overrideAttrs (old: {
+            pname = "${old.pname}-clippy";
+            nativeBuildInputs = (old.nativeBuildInputs or [ ]) ++ [ pkgs.clippy ];
+            buildPhase = "cargo clippy -p surfaced --all-targets --release -- -D warnings";
+            installPhase = "touch $out";
+            doCheck = false;
+          });
+
+          # Prove the services.surfaced module's enabled path evaluates and renders
+          # a systemd unit that runs surfaced with a durable state dir.
+          checks.surfaced-module-eval =
+            let
+              sys = nixpkgs.lib.nixosSystem {
+                inherit system;
+                modules = [
+                  self.nixosModules.surfaced
+                  ({ ... }: {
+                    boot.loader.grub.enable = false;
+                    fileSystems."/" = { device = "none"; fsType = "tmpfs"; };
+                    system.stateVersion = "24.11";
+                    services.surfaced = {
+                      enable = true;
+                      address = "0.0.0.0";
+                      port = 8787;
+                      openFirewall = true;
+                    };
+                  })
+                ];
+              };
+              execStart = toString sys.config.systemd.services.surfaced.serviceConfig.ExecStart;
+            in
+            pkgs.runCommand "surfaced-module-eval" { inherit execStart; } ''
+              printf '%s\n' "$execStart" | tee exec
+              grep -q 'bin/surfaced' exec
+              grep -q -- '--http-addr 0.0.0.0:8787' exec
+              grep -q -- '--state-dir /var/lib/surfaced' exec
+              cp exec $out
+            '';
 
           # Prove the NixOS module's enabled path evaluates and renders a §4.1 TOML that
           # the parser's `deny_unknown_fields` accepts (built by cargo test above).
@@ -118,5 +177,6 @@
       nixosModules.default = import ./nix/module.nix { inherit self; };
       nixosModules.capmesh = self.nixosModules.default;
       nixosModules.nmidid = import ./nix/nmidid-module.nix { inherit self; };
+      nixosModules.surfaced = import ./nix/surfaced-module.nix { inherit self; };
     };
 }
