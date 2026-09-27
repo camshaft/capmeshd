@@ -833,6 +833,32 @@ mod tests {
         assert_eq!(lines[1]["result"]["daemon"], DAEMON_ID);
     }
 
+    /// Well-formed JSON-RPC whose method params are missing/invalid must yield
+    /// `invalid-params` (not a crash or the wrong code), and the connection must
+    /// keep serving afterwards.
+    #[tokio::test]
+    async fn malformed_params_yield_invalid_params_and_keep_serving() {
+        // mount missing local/remote/format; unmount missing mount-id;
+        // describe-port missing port-id.
+        let bad_mount = serde_json::json!({"jsonrpc":"2.0","id":2,"method":"mount",
+            "params":{"mount-id":"m1","role":"mirror-source"}});
+        let bad_unmount =
+            serde_json::json!({"jsonrpc":"2.0","id":3,"method":"unmount","params":{}});
+        let bad_describe =
+            serde_json::json!({"jsonrpc":"2.0","id":4,"method":"describe-port","params":{}});
+        let list = serde_json::json!({"jsonrpc":"2.0","id":5,"method":"list-ports","params":{}});
+        let out = exchange(
+            sample_ports(),
+            &[hello(), bad_mount, bad_unmount, bad_describe, list],
+        )
+        .await;
+        assert_eq!(out[1]["error"]["data"]["code"], "invalid-params");
+        assert_eq!(out[2]["error"]["data"]["code"], "invalid-params");
+        assert_eq!(out[3]["error"]["data"]["code"], "invalid-params");
+        // Every bad request was survived; the connection still serves.
+        assert!(out[4]["result"]["ports"].is_array());
+    }
+
     /// Exercise the real `run` accept path over an actual Unix socket: bind an
     /// *enforcing* policy that does not name us, then connect from this same
     /// process. The connection must still be served via the always-allowed
