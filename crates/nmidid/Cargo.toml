@@ -29,3 +29,9 @@ serde.workspace = true
 serde_json.workspace = true
 midir.workspace = true
 libc = "0.2"
+
+[dev-dependencies]
+# Guard that the PortDescriptor nmidid emits stays wire-compatible with the
+# canonical capmesh-model definition capmeshd's client (and the mesh fetch)
+# deserialize. Test-only: does not couple the production types.
+capmesh-model = { path = "../capmesh-model" }

@@ -243,3 +243,51 @@ pub struct MountStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The `PortDescriptor` nmidid emits over `capmesh-ctl` is also the payload a
+    /// peer fetches over the mesh (docs/MESH-PROTOCOL.md), and `capmesh-model`
+    /// holds the canonical definition capmeshd's client deserializes. These are
+    /// two independent structs, so guard their wire compatibility: a round-trip
+    /// through `capmesh_model::PortDescriptor` must preserve every field. This
+    /// fails CI if either side renames/adds/drops a field and the wire drifts.
+    #[test]
+    fn port_descriptor_wire_matches_capmesh_model() {
+        let ours = PortDescriptor {
+            port_id: "source-keystation-49e".to_string(),
+            kind: "stream".to_string(),
+            dir: Some("source".to_string()),
+            r#type: "midi".to_string(),
+            name: "Keystation 49e".to_string(),
+            virtualizable: true,
+            formats: vec![Format {
+                codec: "midi1".to_string(),
+                params: {
+                    let mut m = Map::new();
+                    m.insert("group".to_string(), Value::from(0));
+                    m
+                },
+            }],
+        };
+
+        // ours → JSON → capmesh-model must parse and preserve the JSON verbatim.
+        let ours_json = serde_json::to_value(&ours).unwrap();
+        let theirs: capmesh_model::PortDescriptor =
+            serde_json::from_value(ours_json.clone()).unwrap();
+        let theirs_json = serde_json::to_value(&theirs).unwrap();
+        assert_eq!(
+            ours_json, theirs_json,
+            "PortDescriptor wire shape drifted between nmidid and capmesh-model"
+        );
+
+        // Spot-check the renamed/keyword fields survive the round-trip.
+        assert_eq!(theirs.port_id, ours.port_id);
+        assert_eq!(theirs.type_, ours.r#type);
+        assert_eq!(theirs.dir, ours.dir);
+        assert_eq!(theirs.formats[0].codec, "midi1");
+        assert_eq!(theirs.formats[0].params["group"], Value::from(0));
+    }
+}
