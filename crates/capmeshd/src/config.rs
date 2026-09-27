@@ -10,7 +10,11 @@
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
-use std::{collections::HashMap, net::Ipv4Addr, path::Path, path::PathBuf};
+use std::{
+    collections::HashMap,
+    net::{IpAddr, Ipv4Addr},
+    path::{Path, PathBuf},
+};
 
 /// The default control-endpoint port advertised over `_capmesh._tcp`.
 pub const DEFAULT_PORT: u16 = 7420;
@@ -48,6 +52,52 @@ pub struct Config {
     #[serde(default)]
     #[allow(dead_code)] // consumed by the reconciler's auto-mount pass (M1)
     pub automount: Vec<Automount>,
+
+    /// Permanent desired mounts (DESIGN §9) — reconciled at startup + on drift.
+    #[serde(rename = "permanent-mount", default)]
+    pub permanent_mounts: Vec<PermanentMount>,
+}
+
+fn default_role() -> String {
+    "mirror-source".to_string()
+}
+
+fn default_codec() -> String {
+    "midi1".to_string()
+}
+
+/// A permanent desired mount (DESIGN §9), reconciled every boot for self-heal. M0b takes a
+/// concrete remote endpoint; discovery-resolved capability names arrive with the connect API
+/// + auto-mount (M1).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PermanentMount {
+    /// Idempotency key (§3.1); defaults from the remote endpoint when absent.
+    #[serde(rename = "mount-id", default)]
+    pub mount_id: Option<String>,
+    /// `mirror-source` | `mirror-sink` | `link` (§3.1).
+    #[serde(default = "default_role")]
+    pub role: String,
+    /// Display name for the local virtual device (mirror roles).
+    #[serde(rename = "local-name", default)]
+    pub local_name: Option<String>,
+    /// Chosen wire-format codec.
+    #[serde(default = "default_codec")]
+    pub codec: String,
+    pub remote: RemoteMount,
+}
+
+/// The remote endpoint of a permanent mount (§3.1) — connect by IP, never a `.local` name.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteMount {
+    #[serde(default)]
+    pub host: Option<String>,
+    /// The peer IP (typed so a `.local`/`.lan` name will not deserialize; DESIGN §5).
+    pub addr: IpAddr,
+    pub port: u16,
+    #[serde(rename = "port-id")]
+    pub port_id: String,
 }
 
 /// One data-plane adapter binding (DESIGN §4.1).
@@ -170,5 +220,43 @@ lifetime = "while-advertised"
     #[test]
     fn unknown_field_is_rejected() {
         assert!(Config::parse("bogus-key = 1").is_err());
+    }
+
+    #[test]
+    fn parses_a_permanent_mount() {
+        let cfg = Config::parse(
+            r#"
+host-id = "music-host"
+
+[dataplane.midi]
+protocol = "nmidi-ctl"
+socket   = "/run/nmidid.sock"
+
+[[permanent-mount]]
+local-name = "studio keyboard"
+remote = { host = "studio", addr = "192.168.1.23", port = 5004, port-id = "kbd-0" }
+"#,
+        )
+        .expect("parse");
+        assert_eq!(cfg.permanent_mounts.len(), 1);
+        let pm = &cfg.permanent_mounts[0];
+        assert_eq!(pm.role, "mirror-source"); // default
+        assert_eq!(pm.codec, "midi1"); // default
+        assert_eq!(pm.local_name.as_deref(), Some("studio keyboard"));
+        assert_eq!(pm.remote.addr, "192.168.1.23".parse::<IpAddr>().unwrap());
+        assert_eq!(pm.remote.port, 5004);
+        assert_eq!(pm.remote.port_id, "kbd-0");
+    }
+
+    #[test]
+    fn permanent_mount_rejects_a_non_ip_addr() {
+        // Connect-by-IP (§5): a `.local` remote must not parse.
+        let err = Config::parse(
+            r#"
+[[permanent-mount]]
+remote = { addr = "studio.local", port = 5004, port-id = "kbd-0" }
+"#,
+        );
+        assert!(err.is_err());
     }
 }
