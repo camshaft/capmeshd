@@ -41,8 +41,15 @@ pub enum SurfaceEvent {
     Snapshot { surface: SurfaceView },
     /// A newly pushed item.
     Item { item: InboxItem },
-    /// The main view changed to a given item id (or none).
-    View { current_view: Option<String> },
+    /// The main view changed to a given item id (or none). The field is renamed
+    /// explicitly: `rename_all` on an enum renames the *variants*, not the fields
+    /// inside a struct variant, so without this the wire key would be
+    /// `current_view` while the snapshot (from `SurfaceView`) uses `current-view`
+    /// — the page reads `current-view` and would see the live update as null.
+    View {
+        #[serde(rename = "current-view")]
+        current_view: Option<String>,
+    },
 }
 
 /// A read-only snapshot of a surface for the wire (REST `GET` + SSE snapshot).
@@ -658,6 +665,19 @@ mod tests {
         assert_eq!(snap.items[2].item, text("three"));
         // The main view is the last promoted item after replay.
         assert_eq!(snap.current_view, Some(snap.items[2].id.clone()));
+    }
+
+    #[test]
+    fn view_event_serializes_current_view_in_kebab_case() {
+        // The page reads `current-view`; the snapshot (via SurfaceView) uses it,
+        // so the live `view` event MUST match or a click reads it as null.
+        let ev = SurfaceEvent::View {
+            current_view: Some("abc".to_string()),
+        };
+        let v: serde_json::Value = serde_json::to_value(&ev).unwrap();
+        assert_eq!(v["kind"], "view");
+        assert_eq!(v["current-view"], "abc");
+        assert!(v.get("current_view").is_none(), "must not use snake_case key");
     }
 
     #[test]
