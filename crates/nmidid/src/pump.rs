@@ -315,4 +315,39 @@ mod tests {
         drop(s);
         pump.abort();
     }
+
+    /// When the pump can't establish the session, the mount must transition to
+    /// `failed` (with a detail) and emit a `mount-state` failed notification —
+    /// the signal capmeshd's reconciler keys re-reconcile off. Driven fast via
+    /// an unparseable remote address so run_pump returns immediately.
+    #[tokio::test]
+    async fn pump_failure_transitions_to_failed_and_notifies() {
+        let (notifier, mut rx) = broadcast::channel(8);
+        let status = connecting_status();
+        let remote = RemoteEndpoint {
+            host: None,
+            addr: "definitely-not-an-ip".to_string(),
+            port: 5008,
+            port_id: "source-0".to_string(),
+        };
+
+        RtpConnector.start(
+            remote,
+            Box::new(RecordingSink::new()),
+            Arc::clone(&status),
+            notifier,
+        );
+
+        let notification = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("failed notification within timeout")
+            .expect("notification received");
+        assert_eq!(notification["method"], "mount-state");
+        assert_eq!(notification["params"]["state"], "failed");
+        assert!(
+            notification["params"]["detail"].is_string(),
+            "failed notification carries a detail"
+        );
+        assert_eq!(status.lock().unwrap().state, MountState::Failed);
+    }
 }
