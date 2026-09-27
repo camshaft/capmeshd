@@ -9,17 +9,16 @@
 //! the control API land in following slices.
 
 mod config;
-mod negotiate;
-mod reconcile;
 
 use anyhow::{Context, Result};
 use capmesh_ctl::{CtlClient, Format, LocalEndpoint, MountRole, MountSpec, RemoteEndpoint};
+use capmesh_daemon::negotiate;
+use capmesh_daemon::reconcile::{self, Reconciler};
 use capmesh_discovery as discovery;
 use clap::{Parser, Subcommand};
 use config::Config;
 use discovery::{CapabilityAdvert, ServiceAdvertiser};
 use mdns_sd::ServiceEvent;
-use reconcile::Reconciler;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use tracing::{info, warn};

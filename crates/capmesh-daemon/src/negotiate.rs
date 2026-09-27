@@ -1,5 +1,6 @@
-//! Format negotiation (DESIGN §4). Negotiation lives in capmeshd (the daemon only confirms
-//! it can honour the chosen format), so the algorithm is here, transport-agnostic.
+//! Format negotiation (DESIGN §4). Negotiation lives in the control plane (the data-plane
+//! daemon only confirms it can honour the chosen format), so the algorithm is here,
+//! transport-agnostic.
 //!
 //! §4.1: from the consuming side's preference-ordered formats and the producing side's
 //! formats, pick the top-ranked format compatible with both. M0 does **direct** matching

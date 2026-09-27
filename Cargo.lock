@@ -198,6 +198,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "capmesh-daemon"
+version = "0.1.0"
+dependencies = [
+ "capmesh-ctl",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "capmesh-discovery"
 version = "0.1.0"
 dependencies = [
@@ -220,6 +230,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "capmesh-ctl",
+ "capmesh-daemon",
  "capmesh-discovery",
  "clap",
  "hostname",
@@ -684,6 +695,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "libc",
  "midir",
  "nmidi-core",
  "serde",
