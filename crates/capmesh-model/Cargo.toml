@@ -1,0 +1,10 @@
+[package]
+name = "capmesh-model"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "capmesh typed model: the capmesh-ctl node/port descriptor and mount value types"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
