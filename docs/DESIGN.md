@@ -199,9 +199,10 @@ trait CapabilityPlugin {
   separate nmidi workstream** (see §11): closing nmidi's two `TODO`s *and* wrapping them behind a
   control socket, so nmidi becomes "purely in charge of the MIDI data plane."
 
-The capmesh control protocol (flavor 2) is a small line/JSON-RPC protocol over a Unix domain socket,
-specified in `docs/CONTROL-PROTOCOL.md` (to be written): `list-caps`, `mount {local-port, peer,
-descriptor}`, `unmount {mount-id}`, `status {mount-id}`. Any future first-party data-plane daemon
+The capmesh control protocol (flavor 2) is a small JSON-RPC 2.0 / NDJSON protocol over a Unix domain
+socket, specified in [`docs/CONTROL-PROTOCOL.md`](CONTROL-PROTOCOL.md): `hello`, `list-ports`,
+`describe-port`, `mount`, `unmount`, `mount-status`, plus hot-plug/state notifications and
+format negotiation. Any future first-party data-plane daemon
 implements it and drops straight into capmeshd. Adding a capability kind = one plugin (a socket
 client) + either an existing daemon's native protocol or a small daemon speaking this protocol.
 `MountHandle: Drop` gives idempotent teardown (the reconciler converges "unmounted" by dropping it).
