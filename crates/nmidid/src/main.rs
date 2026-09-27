@@ -6,6 +6,7 @@ use clap::Parser;
 use nmidid::mounts::{MidirMounter, MountRegistry};
 use nmidid::ports::MidirPortProvider;
 use nmidid::pump::RtpConnector;
+use nmidid::server::PeerPolicy;
 use nmidid::{hotplug, server};
 use tracing::{Level, info};
 use tracing_subscriber::FmtSubscriber;
@@ -21,6 +22,16 @@ struct Args {
     /// How often to poll for local MIDI port changes (hot-plug), in seconds.
     #[arg(long, default_value = "5")]
     monitor_interval: u64,
+
+    /// Permit control connections from this uid (repeatable). The daemon's own
+    /// uid is always allowed. If neither --allow-uid nor --allow-gid is given,
+    /// peer-credential enforcement is off (socket file permissions apply). §1.1
+    #[arg(long)]
+    allow_uid: Vec<u32>,
+
+    /// Permit control connections from this gid (repeatable). §1.1
+    #[arg(long)]
+    allow_gid: Vec<u32>,
 
     /// Log level (trace, debug, info, warn, error).
     #[arg(short, long, default_value = "info")]
@@ -57,5 +68,6 @@ async fn main() -> Result<()> {
         nmidi_core::midi::start_port_monitor(Duration::from_secs(args.monitor_interval)).await;
     hotplug::spawn(port_rx, mounts.notifier());
 
-    server::run(&args.socket, ports, mounts).await
+    let peers = PeerPolicy::new(args.allow_uid, args.allow_gid);
+    server::run(&args.socket, ports, mounts, peers).await
 }

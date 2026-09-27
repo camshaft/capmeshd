@@ -22,6 +22,58 @@ use crate::protocol::{
     PARSE_ERROR, PROTOCOL_MAJOR, Request,
 };
 
+/// Socket peer-credential policy (CONTROL-PROTOCOL.md §1.1). The control socket
+/// is local-trust-only; a daemon refuses connections whose peer credentials fall
+/// outside the configured owner/group.
+///
+/// The daemon's own uid is always allowed (so an operator can't lock themselves
+/// out). If no allow-rules are configured the policy is **non-enforcing**
+/// (allows all, relying on the socket's `0o660` file permissions) — this keeps
+/// the default non-breaking until a deployment configures the shared group.
+#[derive(Debug, Clone)]
+pub struct PeerPolicy {
+    allow_uids: Vec<u32>,
+    allow_gids: Vec<u32>,
+    self_uid: u32,
+}
+
+impl PeerPolicy {
+    /// Build from configured allowed uids/gids, allowing the daemon's own uid.
+    pub fn new(allow_uids: Vec<u32>, allow_gids: Vec<u32>) -> Self {
+        // SAFETY: geteuid is always successful and has no preconditions.
+        let self_uid = unsafe { libc::geteuid() };
+        PeerPolicy {
+            allow_uids,
+            allow_gids,
+            self_uid,
+        }
+    }
+
+    /// Test constructor with an explicit daemon uid (avoids depending on the
+    /// runtime euid).
+    #[cfg(test)]
+    fn with_self_uid(allow_uids: Vec<u32>, allow_gids: Vec<u32>, self_uid: u32) -> Self {
+        PeerPolicy {
+            allow_uids,
+            allow_gids,
+            self_uid,
+        }
+    }
+
+    /// Whether any allow-rule is configured (enforcement is active).
+    pub fn enforcing(&self) -> bool {
+        !self.allow_uids.is_empty() || !self.allow_gids.is_empty()
+    }
+
+    /// Whether a peer with the given uid/gid may connect.
+    pub fn allows(&self, uid: u32, gid: u32) -> bool {
+        if !self.enforcing() {
+            return true;
+        }
+        uid == self.self_uid || self.allow_uids.contains(&uid) || self.allow_gids.contains(&gid)
+    }
+}
+
 /// Per-connection dispatch state. One `Session` exists per accepted connection;
 /// the `mounts` registry is shared daemon-wide across every connection.
 pub struct Session {
@@ -301,6 +353,7 @@ pub async fn run(
     path: impl AsRef<Path>,
     ports: Arc<dyn PortProvider>,
     mounts: Arc<MountRegistry>,
+    peers: PeerPolicy,
 ) -> Result<()> {
     let path = path.as_ref();
 
@@ -321,10 +374,35 @@ pub async fn run(
             .with_context(|| format!("setting permissions on {}", path.display()))?;
     }
 
-    info!("nmidid control socket listening on {}", path.display());
+    info!(
+        "nmidid control socket listening on {} (peer-cred enforcement: {})",
+        path.display(),
+        if peers.enforcing() { "on" } else { "off" }
+    );
 
     loop {
         let (stream, _addr) = listener.accept().await.context("accepting connection")?;
+
+        // Local-trust boundary (§1.1): refuse peers outside the configured
+        // owner/group.
+        match stream.peer_cred() {
+            Ok(cred) if peers.allows(cred.uid(), cred.gid()) => {}
+            Ok(cred) => {
+                warn!(
+                    "refused control connection from uid {} gid {} (not permitted)",
+                    cred.uid(),
+                    cred.gid()
+                );
+                continue;
+            }
+            Err(e) => {
+                // Fail closed while enforcing; otherwise proceed.
+                if peers.enforcing() {
+                    warn!("refused control connection: peer credentials unavailable: {e}");
+                    continue;
+                }
+            }
+        }
         debug!("control connection accepted");
         let ports = Arc::clone(&ports);
         let mounts = Arc::clone(&mounts);
@@ -419,6 +497,23 @@ mod tests {
     fn hello() -> Value {
         serde_json::json!({"jsonrpc":"2.0","id":1,"method":"hello",
             "params":{"protocol":"1","client":"capmeshd/0.1"}})
+    }
+
+    #[test]
+    fn peer_policy_non_enforcing_allows_all() {
+        let p = PeerPolicy::with_self_uid(vec![], vec![], 1000);
+        assert!(!p.enforcing());
+        assert!(p.allows(1234, 5678));
+    }
+
+    #[test]
+    fn peer_policy_enforcing_allows_self_uid_and_listed() {
+        let p = PeerPolicy::with_self_uid(vec![42], vec![7], 1000);
+        assert!(p.enforcing());
+        assert!(p.allows(1000, 999)); // daemon's own uid always allowed
+        assert!(p.allows(42, 999)); // listed uid
+        assert!(p.allows(0, 7)); // listed gid
+        assert!(!p.allows(5, 5)); // neither → refused
     }
 
     #[tokio::test]
