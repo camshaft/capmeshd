@@ -570,7 +570,6 @@ mod tests {
         let mounts = Arc::new(MountRegistry::new(
             Arc::new(NullMounter),
             Arc::new(NullConnector),
-            Arc::clone(&ports),
         ));
         let handle = tokio::spawn(async move {
             serve_connection(BufReader::new(sr), sw, ports, mounts)
@@ -712,7 +711,6 @@ mod tests {
         let mounts = Arc::new(MountRegistry::new(
             Arc::new(NullMounter),
             Arc::new(NullConnector),
-            Arc::clone(&ports),
         ));
 
         let (client, server) = tokio::io::duplex(64 * 1024);
@@ -779,14 +777,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mount_unknown_remote_port_is_no_such_port() {
+    async fn mount_accepts_a_remote_port_id_unknown_to_this_host() {
+        // `remote.port-id` names a port on the peer, not this host, so it is not
+        // validated against local ports — the mount proceeds to `connecting`.
         let mount = serde_json::json!({"jsonrpc":"2.0","id":2,"method":"mount","params":{
             "mount-id":"m1","role":"mirror-source",
             "local":{"virtual":true},
             "remote":{"addr":"192.168.1.23","port":5004,"port-id":"ghost-9"},
             "format":{"codec":"midi1"}}});
         let out = exchange(sample_ports(), &[hello(), mount]).await;
-        assert_eq!(out[1]["error"]["data"]["code"], "no-such-port");
+        assert_eq!(out[1]["result"]["state"], "connecting");
     }
 
     #[tokio::test]
@@ -805,7 +805,6 @@ mod tests {
         let mounts = Arc::new(MountRegistry::new(
             Arc::new(NullMounter),
             Arc::new(NullConnector),
-            Arc::clone(&ports),
         ));
         let handle = tokio::spawn(async move {
             serve_connection(BufReader::new(sr), sw, ports, mounts)
@@ -859,7 +858,6 @@ mod tests {
         let mounts = Arc::new(MountRegistry::new(
             Arc::new(NullMounter),
             Arc::new(NullConnector),
-            Arc::clone(&ports),
         ));
         // Enforcing, but the allow-list does NOT name us; the connection is
         // permitted only by the self-uid bypass (client is this process).
@@ -929,7 +927,6 @@ mod tests {
         let mounts = Arc::new(MountRegistry::new(
             Arc::new(NullMounter),
             Arc::new(NullConnector),
-            Arc::clone(&ports),
         ));
         let server_path = path.clone();
         let server = tokio::spawn(async move {

@@ -18,7 +18,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::Value;
 use tokio::sync::{Notify, broadcast};
 
-use crate::ports::PortProvider;
 use crate::protocol::{
     DaemonError, MountRole, MountSpec, MountState, MountStats, MountStatus, RemoteEndpoint,
 };
@@ -110,7 +109,6 @@ struct MountEntry {
 pub struct MountRegistry {
     mounter: Arc<dyn Mounter>,
     connector: Arc<dyn Connector>,
-    ports: Arc<dyn PortProvider>,
     mounts: Mutex<HashMap<String, MountEntry>>,
     /// Daemon-wide `mount-state` notification fan-out; each control connection
     /// subscribes a receiver (§5).
@@ -118,16 +116,11 @@ pub struct MountRegistry {
 }
 
 impl MountRegistry {
-    pub fn new(
-        mounter: Arc<dyn Mounter>,
-        connector: Arc<dyn Connector>,
-        ports: Arc<dyn PortProvider>,
-    ) -> Self {
+    pub fn new(mounter: Arc<dyn Mounter>, connector: Arc<dyn Connector>) -> Self {
         let (notifier, _) = broadcast::channel(NOTIFY_CAPACITY);
         MountRegistry {
             mounter,
             connector,
-            ports,
             mounts: Mutex::new(HashMap::new()),
             notifier,
         }
@@ -187,26 +180,11 @@ impl MountRegistry {
             ));
         }
 
-        // The remote source must name a real port on this daemon's peer view.
-        let known = self
-            .ports
-            .list_ports()
-            .map_err(|e| {
-                DaemonError::protocol(
-                    crate::protocol::DAEMON_DOMAIN,
-                    "internal",
-                    format!("failed to enumerate ports: {e}"),
-                )
-            })?
-            .into_iter()
-            .any(|p| p.port_id == spec.remote.port_id);
-        if !known {
-            return Err(DaemonError::domain(
-                "no-such-port",
-                format!("no port '{}' to mirror", spec.remote.port_id),
-            ));
-        }
-
+        // `remote.port_id` identifies a port on the *remote* peer, which this
+        // daemon cannot see — capmeshd validates it against the fetched remote
+        // descriptor before issuing. Here it is an opaque label (the pump keys
+        // the RTP session off `remote.addr`/`remote.port`), so we do not check it
+        // against this host's local ports.
         let display_name = spec
             .local
             .name
@@ -412,14 +390,7 @@ impl Connector for NullConnector {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{Format, LocalEndpoint, PortDescriptor};
-
-    struct StaticPorts(Vec<PortDescriptor>);
-    impl PortProvider for StaticPorts {
-        fn list_ports(&self) -> anyhow::Result<Vec<PortDescriptor>> {
-            Ok(self.0.clone())
-        }
-    }
+    use crate::protocol::{Format, LocalEndpoint};
 
     struct FakeMounter {
         supports_virtual: bool,
@@ -433,23 +404,10 @@ mod tests {
         }
     }
 
-    fn source_port(id: &str) -> PortDescriptor {
-        PortDescriptor {
-            port_id: id.to_string(),
-            kind: "stream".to_string(),
-            dir: Some("source".to_string()),
-            r#type: "midi".to_string(),
-            name: "Keystation 49e".to_string(),
-            virtualizable: true,
-            formats: vec![Format::midi1()],
-        }
-    }
-
     fn registry(supports_virtual: bool) -> MountRegistry {
         MountRegistry::new(
             Arc::new(FakeMounter { supports_virtual }),
             Arc::new(NullConnector),
-            Arc::new(StaticPorts(vec![source_port("source-0")])),
         )
     }
 
@@ -518,10 +476,14 @@ mod tests {
     }
 
     #[test]
-    fn unknown_remote_port_is_no_such_port() {
+    fn remote_port_id_is_opaque_not_validated_locally() {
+        // `remote.port_id` names a port on the peer, which this daemon cannot
+        // see, so a remote id unknown to this host is accepted (the mount
+        // proceeds to `connecting`); capmeshd validates it against the fetched
+        // remote descriptor before issuing.
         let reg = registry(true);
-        let err = reg.mount(spec("m1", "ghost-9", "midi1")).unwrap_err();
-        assert_eq!(err.code, "no-such-port");
+        let r = reg.mount(spec("m1", "a-remote-port-this-host-never-heard-of", "midi1"));
+        assert_eq!(r.unwrap()["state"], "connecting");
     }
 
     #[test]

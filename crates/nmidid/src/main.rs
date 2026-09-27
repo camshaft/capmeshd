@@ -62,11 +62,7 @@ async fn main() -> Result<()> {
     info!("Starting nmidid, control socket at {}", args.socket);
 
     let ports = Arc::new(MidirPortProvider);
-    let mounts = Arc::new(MountRegistry::new(
-        Arc::new(MidirMounter),
-        Arc::new(RtpConnector),
-        ports.clone(),
-    ));
+    let mounts = Arc::new(MountRegistry::new(Arc::new(MidirMounter), Arc::new(RtpConnector)));
 
     // Hot-plug notifications (§5, `hotplug-events`): watch local ports and emit
     // port-added/port-removed on the daemon's notification bus.
