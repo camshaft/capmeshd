@@ -12,6 +12,7 @@ use anyhow::{Context, Result};
 use serde_json::Value;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
+use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use crate::mounts::MountRegistry;
@@ -199,9 +200,12 @@ fn parse_major(v: &Value) -> Option<u32> {
 
 /// Drive the NDJSON/JSON-RPC framing for one connection over any reader/writer.
 ///
-/// Reads one JSON value per line, dispatches it, and writes the response as a
-/// single newline-terminated line. A malformed line yields a JSON-RPC parse
-/// error with a null id; the connection stays open.
+/// Requests are read one JSON value per line, dispatched, and answered; a
+/// malformed line yields a JSON-RPC parse error with a null id and the
+/// connection stays open. Concurrently, unsolicited `mount-state` notifications
+/// (§5) from the daemon's broadcast are written to the same connection. Reading
+/// and writing run as separate concurrent halves joined by a response channel,
+/// so a pending `read_line` is never cancelled by a notification arriving.
 pub async fn serve_connection<R, W>(
     mut reader: R,
     mut writer: W,
@@ -212,41 +216,78 @@ where
     R: AsyncBufRead + Unpin,
     W: AsyncWrite + Unpin,
 {
+    let mut notif_rx = mounts.subscribe();
     let mut session = Session::new(ports, mounts);
-    let mut line = String::new();
+    let (resp_tx, mut resp_rx) = mpsc::channel::<Value>(64);
 
-    loop {
-        line.clear();
-        let n = reader
-            .read_line(&mut line)
-            .await
-            .context("reading control line")?;
-        if n == 0 {
-            // EOF: peer closed the connection.
-            break;
+    // Reader half: parse + dispatch requests, forward responses to the writer.
+    // `move` so `resp_tx` is owned here and dropped when this half ends (EOF),
+    // which is what signals the writer half to finish.
+    let reader_half = async move {
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let n = reader
+                .read_line(&mut line)
+                .await
+                .context("reading control line")?;
+            if n == 0 {
+                break; // EOF: peer closed the connection.
+            }
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let response = match serde_json::from_str::<Request>(trimmed) {
+                Ok(req) => session.respond(req),
+                Err(e) => Some(protocol::error_response(
+                    Value::Null,
+                    &DaemonError::protocol(
+                        PARSE_ERROR,
+                        "parse-error",
+                        format!("invalid JSON: {e}"),
+                    ),
+                )),
+            };
+            if let Some(value) = response
+                && resp_tx.send(value).await.is_err()
+            {
+                break; // writer gone
+            }
         }
+        Ok::<(), anyhow::Error>(())
+        // `resp_tx` drops here, signalling the writer half to finish.
+    };
 
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        let response = match serde_json::from_str::<Request>(trimmed) {
-            Ok(req) => session.respond(req),
-            Err(e) => Some(protocol::error_response(
-                Value::Null,
-                &DaemonError::protocol(PARSE_ERROR, "parse-error", format!("invalid JSON: {e}")),
-            )),
-        };
-
-        if let Some(value) = response {
-            let mut buf = serde_json::to_vec(&value).context("serializing response")?;
+    // Writer half: interleave responses and unsolicited notifications, one JSON
+    // value per line. Both channel recvs are cancel-safe.
+    let writer_half = async move {
+        loop {
+            let value = tokio::select! {
+                biased;
+                resp = resp_rx.recv() => match resp {
+                    Some(v) => v,
+                    None => break, // reader half ended
+                },
+                notif = notif_rx.recv() => match notif {
+                    Ok(v) => v,
+                    // Lagged: we dropped some notifications under load; the peer
+                    // reconciles via mount-status. Closed: shouldn't happen while
+                    // the connection holds the registry. Either way, keep serving.
+                    Err(_) => continue,
+                },
+            };
+            let mut buf = serde_json::to_vec(&value).context("serializing message")?;
             buf.push(b'\n');
-            writer.write_all(&buf).await.context("writing response")?;
-            writer.flush().await.context("flushing response")?;
+            writer.write_all(&buf).await.context("writing message")?;
+            writer.flush().await.context("flushing message")?;
         }
-    }
+        Ok::<(), anyhow::Error>(())
+    };
 
+    let (reader_result, writer_result) = tokio::join!(reader_half, writer_half);
+    reader_result?;
+    writer_result?;
     Ok(())
 }
 
@@ -303,7 +344,9 @@ pub async fn run(
 mod tests {
     use super::*;
     use crate::mounts::{NullConnector, NullMounter};
-    use crate::protocol::{Format, PortDescriptor};
+    use crate::protocol::{
+        Format, LocalEndpoint, MountRole, MountSpec, PortDescriptor, RemoteEndpoint,
+    };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     struct StaticPorts(Vec<PortDescriptor>);
@@ -437,6 +480,78 @@ mod tests {
         assert_eq!(out[2]["result"]["mounts"][0]["state"], "connecting");
         assert!(out[3]["result"].is_object()); // unmount → {}
         assert_eq!(out[4]["result"]["mounts"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn mount_state_notifications_are_pushed_to_the_connection() {
+        let ports = sample_ports();
+        let mounts = Arc::new(MountRegistry::new(
+            Arc::new(NullMounter),
+            Arc::new(NullConnector),
+            Arc::clone(&ports),
+        ));
+
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let (sr, sw) = tokio::io::split(server);
+        let mounts_srv = Arc::clone(&mounts);
+        let handle = tokio::spawn(async move {
+            serve_connection(BufReader::new(sr), sw, ports, mounts_srv)
+                .await
+                .ok()
+        });
+
+        let (cr, mut cw) = tokio::io::split(client);
+        let mut cr = BufReader::new(cr);
+
+        async fn read_line_ok(cr: &mut (impl AsyncBufReadExt + Unpin), what: &str) -> Value {
+            let mut line = String::new();
+            let n =
+                tokio::time::timeout(std::time::Duration::from_secs(2), cr.read_line(&mut line))
+                    .await
+                    .unwrap_or_else(|_| panic!("timed out waiting for {what}"))
+                    .unwrap();
+            assert!(n > 0, "unexpected EOF waiting for {what}");
+            serde_json::from_str(&line).unwrap()
+        }
+
+        // hello — receiving the response proves the connection has subscribed to
+        // notifications (subscribe happens before the reader loop).
+        let mut hb = serde_json::to_vec(&hello()).unwrap();
+        hb.push(b'\n');
+        cw.write_all(&hb).await.unwrap();
+        let hello_resp = read_line_ok(&mut cr, "hello response").await;
+        assert_eq!(hello_resp["result"]["daemon"], DAEMON_ID);
+
+        let spec = MountSpec {
+            mount_id: "m1".to_string(),
+            role: MountRole::MirrorSource,
+            local: LocalEndpoint {
+                r#virtual: true,
+                name: None,
+            },
+            remote: RemoteEndpoint {
+                host: None,
+                addr: "192.168.1.23".to_string(),
+                port: 5004,
+                port_id: "source-0".to_string(),
+            },
+            format: Format::midi1(),
+        };
+
+        // A mount emits a `connecting` mount-state notification, pushed unsolicited.
+        mounts.mount(spec).unwrap();
+        let v = read_line_ok(&mut cr, "connecting notification").await;
+        assert_eq!(v["method"], "mount-state");
+        assert_eq!(v["params"]["mount-id"], "m1");
+        assert_eq!(v["params"]["state"], "connecting");
+
+        // Unmount emits a `torn-down` notification.
+        mounts.unmount("m1");
+        let v2 = read_line_ok(&mut cr, "torn-down notification").await;
+        assert_eq!(v2["params"]["state"], "torn-down");
+
+        drop(cw);
+        handle.abort();
     }
 
     #[tokio::test]

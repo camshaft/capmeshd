@@ -17,10 +17,12 @@ use std::time::{Duration, Instant};
 use nmidi_core::network::NetworkSockets;
 use nmidi_core::util::{generate_ssrc, generate_token, get_hostname};
 use nmidi_core::{APPLEMIDI_VERSION, AppleMidiPacket, RtpPacket};
+use serde_json::Value;
+use tokio::sync::broadcast;
 use tokio::task::AbortHandle;
 use tracing::{debug, info, warn};
 
-use crate::mounts::{Connector, MidiSink, now_rfc3339};
+use crate::mounts::{Connector, MidiSink, now_rfc3339, transition};
 use crate::protocol::{MountState, MountStatus, RemoteEndpoint};
 
 /// How long to wait for `InvitationAccepted` before retrying, and how many times.
@@ -36,21 +38,16 @@ impl Connector for RtpConnector {
         remote: RemoteEndpoint,
         sink: Box<dyn MidiSink>,
         status: Arc<Mutex<MountStatus>>,
+        notifier: broadcast::Sender<Value>,
     ) -> Option<AbortHandle> {
         let handle = tokio::spawn(async move {
-            if let Err(e) = run_pump(remote, sink, Arc::clone(&status)).await {
+            if let Err(e) = run_pump(remote, sink, Arc::clone(&status), notifier.clone()).await {
                 warn!("mount pump failed: {e}");
-                let mut s = status.lock().unwrap();
-                s.state = MountState::Failed;
-                s.detail = Some(format!("{e}"));
+                transition(&status, &notifier, MountState::Failed, Some(format!("{e}")));
             }
         });
         Some(handle.abort_handle())
     }
-}
-
-fn set_state(status: &Arc<Mutex<MountStatus>>, state: MountState) {
-    status.lock().unwrap().state = state;
 }
 
 /// Connect to the remote source and pump RTP-MIDI into `sink` until cancelled or
@@ -59,6 +56,7 @@ async fn run_pump(
     remote: RemoteEndpoint,
     sink: Box<dyn MidiSink>,
     status: Arc<Mutex<MountStatus>>,
+    notifier: broadcast::Sender<Value>,
 ) -> anyhow::Result<()> {
     // Connect by the IP (never a .local/.lan name) — capmeshd fills remote.addr
     // from the mDNS record.
@@ -108,7 +106,7 @@ async fn run_pump(
         "mount active: mirroring {} into local virtual port",
         control_addr
     );
-    set_state(&status, MountState::Active);
+    transition(&status, &notifier, MountState::Active, None);
 
     let started = Instant::now();
     loop {
@@ -149,7 +147,7 @@ async fn run_pump(
         ssrc,
     };
     let _ = sockets.send_control(&end, &control_addr).await;
-    set_state(&status, MountState::TornDown);
+    transition(&status, &notifier, MountState::TornDown, None);
     Ok(())
 }
 

@@ -15,12 +15,56 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use serde_json::Value;
+use tokio::sync::broadcast;
 use tokio::task::AbortHandle;
 
 use crate::ports::PortProvider;
 use crate::protocol::{
     DaemonError, MountRole, MountSpec, MountState, MountStats, MountStatus, RemoteEndpoint,
 };
+
+/// Depth of the per-daemon notification broadcast buffer. A slow control
+/// connection that lags beyond this drops intermediate notifications (it still
+/// gets the latest and can reconcile via `mount-status`).
+const NOTIFY_CAPACITY: usize = 64;
+
+/// Build the §5 `mount-state` notification (unsolicited, no `id`) for a status.
+pub(crate) fn mount_state_notification(status: &MountStatus) -> Value {
+    let mut params = serde_json::json!({
+        "mount-id": status.mount_id,
+        "state": status.state,
+        "stats": status.stats,
+    });
+    if let Some(detail) = &status.detail {
+        params["detail"] = Value::String(detail.clone());
+    }
+    serde_json::json!({"jsonrpc": "2.0", "method": "mount-state", "params": params})
+}
+
+/// Apply a state transition to a mount and emit a `mount-state` notification —
+/// but only if the state actually changed (or a new `detail` is supplied), so a
+/// steady stream of data does not spam identical notifications.
+pub(crate) fn transition(
+    status: &Arc<Mutex<MountStatus>>,
+    notifier: &broadcast::Sender<Value>,
+    new_state: MountState,
+    detail: Option<String>,
+) {
+    let notification = {
+        let mut s = status.lock().unwrap();
+        if s.state == new_state && detail.is_none() {
+            return;
+        }
+        s.state = new_state;
+        if detail.is_some() {
+            s.detail = detail;
+        }
+        mount_state_notification(&s)
+    };
+    // Err just means no control connection is currently subscribed.
+    let _ = notifier.send(notification);
+}
 
 /// A place to push decoded MIDI bytes — the local end of a mount. Owned by the
 /// mount's data-path task; dropping it releases the underlying endpoint (e.g.
@@ -50,6 +94,7 @@ pub trait Connector: Send + Sync {
         remote: RemoteEndpoint,
         sink: Box<dyn MidiSink>,
         status: Arc<Mutex<MountStatus>>,
+        notifier: broadcast::Sender<Value>,
     ) -> Option<AbortHandle>;
 }
 
@@ -66,6 +111,9 @@ pub struct MountRegistry {
     connector: Arc<dyn Connector>,
     ports: Arc<dyn PortProvider>,
     mounts: Mutex<HashMap<String, MountEntry>>,
+    /// Daemon-wide `mount-state` notification fan-out; each control connection
+    /// subscribes a receiver (§5).
+    notifier: broadcast::Sender<Value>,
 }
 
 impl MountRegistry {
@@ -74,12 +122,19 @@ impl MountRegistry {
         connector: Arc<dyn Connector>,
         ports: Arc<dyn PortProvider>,
     ) -> Self {
+        let (notifier, _) = broadcast::channel(NOTIFY_CAPACITY);
         MountRegistry {
             mounter,
             connector,
             ports,
             mounts: Mutex::new(HashMap::new()),
+            notifier,
         }
+    }
+
+    /// Subscribe to the daemon's `mount-state` notification stream.
+    pub fn subscribe(&self) -> broadcast::Receiver<Value> {
+        self.notifier.subscribe()
     }
 
     /// Establish a mount (§3.1). Idempotent on `mount-id`: a repeat returns the
@@ -167,10 +222,19 @@ impl MountRegistry {
         }));
         let result = serde_json::json!({ "mount-id": spec.mount_id, "state": "connecting" });
 
-        // Hand the data path off to the connector (spawns the pump task).
-        let abort = self
-            .connector
-            .start(spec.remote.clone(), sink, Arc::clone(&status));
+        // Announce the initial `connecting` state (§5).
+        let _ = self
+            .notifier
+            .send(mount_state_notification(&status.lock().unwrap()));
+
+        // Hand the data path off to the connector (spawns the pump task), which
+        // emits the subsequent active/failed/torn-down transitions.
+        let abort = self.connector.start(
+            spec.remote.clone(),
+            sink,
+            Arc::clone(&status),
+            self.notifier.clone(),
+        );
 
         self.mounts
             .lock()
@@ -187,6 +251,8 @@ impl MountRegistry {
             if let Some(abort) = entry.abort {
                 abort.abort();
             }
+            // Announce the teardown (§5) — the aborted task can no longer emit.
+            transition(&entry.status, &self.notifier, MountState::TornDown, None);
         }
         serde_json::json!({})
     }
@@ -309,6 +375,7 @@ impl Connector for NullConnector {
         _remote: RemoteEndpoint,
         _sink: Box<dyn MidiSink>,
         _status: Arc<Mutex<MountStatus>>,
+        _notifier: broadcast::Sender<Value>,
     ) -> Option<AbortHandle> {
         None
     }
@@ -449,5 +516,40 @@ mod tests {
             1
         );
         assert_eq!(reg.status(None)["mounts"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn mount_and_unmount_emit_mount_state_notifications() {
+        let reg = registry(true);
+        let mut rx = reg.subscribe();
+        reg.mount(spec("m1", "source-0", "midi1")).unwrap();
+        // A `connecting` notification (§5) is emitted on mount.
+        let n = rx.try_recv().expect("mount-state notification");
+        assert_eq!(n["method"], "mount-state");
+        assert_eq!(n["params"]["mount-id"], "m1");
+        assert_eq!(n["params"]["state"], "connecting");
+        assert!(n["params"]["stats"].is_object());
+
+        reg.unmount("m1");
+        let n = rx.try_recv().expect("torn-down notification");
+        assert_eq!(n["params"]["state"], "torn-down");
+        assert_eq!(n["params"]["mount-id"], "m1");
+    }
+
+    #[test]
+    fn transition_only_emits_on_actual_change() {
+        let (tx, mut rx) = broadcast::channel(8);
+        let status = Arc::new(Mutex::new(MountStatus {
+            mount_id: "m1".to_string(),
+            state: MountState::Connecting,
+            since: now_rfc3339(),
+            stats: MountStats::default(),
+            detail: None,
+        }));
+        transition(&status, &tx, MountState::Active, None);
+        assert_eq!(rx.try_recv().unwrap()["params"]["state"], "active");
+        // Same state again → no notification.
+        transition(&status, &tx, MountState::Active, None);
+        assert!(rx.try_recv().is_err());
     }
 }
