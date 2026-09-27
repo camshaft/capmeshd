@@ -11,6 +11,7 @@
 mod config;
 mod ctl;
 mod discovery;
+mod reconcile;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -18,6 +19,7 @@ use config::Config;
 use ctl::{CtlClient, Format, LocalEndpoint, MountRole, MountSpec, RemoteEndpoint};
 use discovery::{CapabilityAdvert, ServiceAdvertiser};
 use mdns_sd::ServiceEvent;
+use reconcile::Reconciler;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use tracing::{info, warn};
@@ -51,34 +53,7 @@ enum Cmd {
         socket: PathBuf,
     },
     /// Establish a mount on a daemon (§3): create/attach a p2p link to a remote port.
-    Mount {
-        #[arg(long)]
-        socket: PathBuf,
-        /// Remote peer host-id (from discovery).
-        #[arg(long)]
-        remote_host: String,
-        /// Remote peer IP — the address from the mDNS record (never a `.local`/`.lan` name).
-        #[arg(long)]
-        remote_addr: IpAddr,
-        /// Remote peer data-plane port.
-        #[arg(long)]
-        remote_port: u16,
-        /// Remote port-id to mount.
-        #[arg(long)]
-        remote_port_id: String,
-        /// Which end the daemon materializes: mirror-source | mirror-sink | link.
-        #[arg(long, default_value = "mirror-source")]
-        role: String,
-        /// Display name for the local virtual device (mirror roles).
-        #[arg(long)]
-        local_name: Option<String>,
-        /// Chosen wire-format codec.
-        #[arg(long, default_value = "midi1")]
-        codec: String,
-        /// Mount id (idempotency key); defaults to <remote-host>-<remote-port-id>.
-        #[arg(long)]
-        mount_id: Option<String>,
-    },
+    Mount(MountArgs),
     /// Tear a mount down (§3).
     Unmount {
         #[arg(long)]
@@ -94,6 +69,77 @@ enum Cmd {
         #[arg(long)]
         mount_id: Option<String>,
     },
+    /// Reconcile a desired mount against a daemon (DESIGN §6): issue it if absent/failed,
+    /// leave it if live. With --interval-secs > 0, run the reconcile loop.
+    Reconcile {
+        #[command(flatten)]
+        mount: MountArgs,
+        /// Poll interval in seconds; 0 = reconcile once and exit.
+        #[arg(long, default_value_t = 0)]
+        interval_secs: u64,
+    },
+}
+
+/// The inputs that describe one desired mount — shared by `mount` and `reconcile`.
+#[derive(clap::Args, Debug)]
+struct MountArgs {
+    /// Path to the daemon's Unix control socket (e.g. /run/nmidid.sock).
+    #[arg(long)]
+    socket: PathBuf,
+    /// Remote peer host-id (from discovery).
+    #[arg(long)]
+    remote_host: String,
+    /// Remote peer IP — the address from the mDNS record (never a `.local`/`.lan` name).
+    #[arg(long)]
+    remote_addr: IpAddr,
+    /// Remote peer data-plane port.
+    #[arg(long)]
+    remote_port: u16,
+    /// Remote port-id to mount.
+    #[arg(long)]
+    remote_port_id: String,
+    /// Which end the daemon materializes: mirror-source | mirror-sink | link.
+    #[arg(long, default_value = "mirror-source")]
+    role: String,
+    /// Display name for the local virtual device (mirror roles).
+    #[arg(long)]
+    local_name: Option<String>,
+    /// Chosen wire-format codec.
+    #[arg(long, default_value = "midi1")]
+    codec: String,
+    /// Mount id (idempotency key); defaults to <remote-host>-<remote-port-id>.
+    #[arg(long)]
+    mount_id: Option<String>,
+}
+
+impl MountArgs {
+    /// Build the `MountSpec` this describes (§3.1).
+    fn to_spec(&self) -> Result<MountSpec> {
+        let role = parse_role(&self.role)?;
+        let mount_id = self
+            .mount_id
+            .clone()
+            .unwrap_or_else(|| format!("{}-{}", self.remote_host, self.remote_port_id));
+        Ok(MountSpec {
+            mount_id,
+            role,
+            local: LocalEndpoint {
+                // Mirror roles materialize a local virtual endpoint; `link` uses a real port.
+                is_virtual: !matches!(role, MountRole::Link),
+                name: self.local_name.clone(),
+            },
+            remote: RemoteEndpoint {
+                host: self.remote_host.clone(),
+                addr: self.remote_addr,
+                port: self.remote_port,
+                port_id: self.remote_port_id.clone(),
+            },
+            format: Format {
+                codec: self.codec.clone(),
+                params: Default::default(),
+            },
+        })
+    }
 }
 
 #[tokio::main]
@@ -109,34 +155,15 @@ async fn main() -> Result<()> {
 
     match &args.cmd {
         Some(Cmd::ProbeCtl { socket }) => return probe_ctl(socket).await,
-        Some(Cmd::Mount {
-            socket,
-            remote_host,
-            remote_addr,
-            remote_port,
-            remote_port_id,
-            role,
-            local_name,
-            codec,
-            mount_id,
-        }) => {
-            return cmd_mount(
-                socket,
-                remote_host,
-                *remote_addr,
-                *remote_port,
-                remote_port_id,
-                role,
-                local_name.clone(),
-                codec,
-                mount_id.clone(),
-            )
-            .await;
-        }
+        Some(Cmd::Mount(m)) => return cmd_mount(m).await,
         Some(Cmd::Unmount { socket, mount_id }) => return cmd_unmount(socket, mount_id).await,
         Some(Cmd::MountStatus { socket, mount_id }) => {
             return cmd_mount_status(socket, mount_id.as_deref()).await;
         }
+        Some(Cmd::Reconcile {
+            mount,
+            interval_secs,
+        }) => return cmd_reconcile(mount, *interval_secs).await,
         None => {}
     }
 
@@ -293,43 +320,36 @@ fn parse_role(s: &str) -> Result<MountRole> {
 
 /// Connect + hello, then establish a mount (§3). This is the one-command path toward the
 /// M0 demo: wire a remote port into a local virtual endpoint.
-#[allow(clippy::too_many_arguments)]
-async fn cmd_mount(
-    socket: &Path,
-    remote_host: &str,
-    remote_addr: IpAddr,
-    remote_port: u16,
-    remote_port_id: &str,
-    role: &str,
-    local_name: Option<String>,
-    codec: &str,
-    mount_id: Option<String>,
-) -> Result<()> {
-    let role = parse_role(role)?;
-    let mount_id = mount_id.unwrap_or_else(|| format!("{remote_host}-{remote_port_id}"));
-    let spec = MountSpec {
-        mount_id,
-        role,
-        local: LocalEndpoint {
-            // Mirror roles materialize a local virtual endpoint; `link` uses a real port.
-            is_virtual: !matches!(role, MountRole::Link),
-            name: local_name,
-        },
-        remote: RemoteEndpoint {
-            host: remote_host.to_string(),
-            addr: remote_addr,
-            port: remote_port,
-            port_id: remote_port_id.to_string(),
-        },
-        format: Format {
-            codec: codec.to_string(),
-            params: Default::default(),
-        },
-    };
-
-    let mut client = connect_and_hello(socket).await?;
+async fn cmd_mount(m: &MountArgs) -> Result<()> {
+    let spec = m.to_spec()?;
+    let mut client = connect_and_hello(&m.socket).await?;
     let res = client.mount(&spec).await.context("mount")?;
     info!(mount_id = %res.mount_id, state = ?res.state, "mount established");
+    Ok(())
+}
+
+/// Reconcile a single desired mount against a daemon (DESIGN §6). With `interval_secs > 0`
+/// this runs the reconcile loop (converging + self-healing) until interrupted; otherwise it
+/// reconciles once and exits.
+async fn cmd_reconcile(m: &MountArgs, interval_secs: u64) -> Result<()> {
+    let reconciler = Reconciler::with_desired(vec![m.to_spec()?]);
+    let mut client = connect_and_hello(&m.socket).await?;
+
+    loop {
+        match reconciler.reconcile_once(&mut client).await {
+            Ok(plan) if plan.is_empty() => info!("reconcile: converged (no changes)"),
+            Ok(plan) => info!(
+                mounted = plan.to_mount.len(),
+                unmounted = plan.to_unmount.len(),
+                "reconcile: applied"
+            ),
+            Err(e) => warn!("reconcile pass failed: {e:#}"),
+        }
+        if interval_secs == 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
+    }
     Ok(())
 }
 
