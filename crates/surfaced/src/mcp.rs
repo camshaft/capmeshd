@@ -75,7 +75,8 @@ fn tools_list() -> Value {
         {
             "name": "send_item",
             "description": "Post a display item to a surface (created if new). `item` is one of: \
-    {\"type\":\"pdf\",\"url\":\"…\"}, {\"type\":\"text\",\"body\":\"…\"}, \
+    {\"type\":\"pdf\",\"url\":\"…\",\"page\":N?} (optional 1-based `page` deep-links into the PDF), \
+    {\"type\":\"text\",\"body\":\"…\"}, \
     {\"type\":\"link\",\"url\":\"…\",\"title\":\"…\"}, {\"type\":\"navigate\",\"url\":\"…\"}, \
     {\"type\":\"html\",\"markup\":\"…\"}, or {\"type\":\"script\",\"code\":\"…\"}. \
     `promote` (default true) also shows it in the main view.",
@@ -244,7 +245,7 @@ mod tests {
             "tools/call",
             json!({"name":"send_item","arguments":{
                 "surface-id":"phone",
-                "item":{"type":"pdf","url":"https://x/m.pdf"}}}),
+                "item":{"type":"pdf","url":"https://x/m.pdf","page":348}}}),
         );
         let out = dispatch(&store, &call).unwrap();
         assert!(out["result"]["isError"].as_bool() != Some(true));
@@ -279,12 +280,10 @@ mod tests {
             ),
         )
         .unwrap();
-        assert!(
-            li["result"]["content"][0]["text"]
-                .as_str()
-                .unwrap()
-                .contains("pdf")
-        );
+        // The pdf came through with its deep-link page (MCP carries the full item).
+        let items_text = li["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(items_text.contains("pdf"));
+        assert!(items_text.contains("\"page\": 348"));
     }
 
     #[test]
