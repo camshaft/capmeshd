@@ -10,6 +10,7 @@
 //! notifications land in following slices as `nmidid` grows them.
 
 use serde::{Deserialize, Serialize};
+use std::net::IpAddr;
 use std::path::Path;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
@@ -61,6 +62,105 @@ pub struct HelloResult {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct ListPortsResult {
     pub ports: Vec<PortDescriptor>,
+}
+
+/// Which end of a mount the daemon materializes (§3.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MountRole {
+    /// Create a local virtual **source** fed by the remote source (keyboard-shows-up case).
+    MirrorSource,
+    /// Create a local virtual **sink** that forwards to the remote sink.
+    MirrorSink,
+    /// Connect an existing local **real** port to the remote (no virtual endpoint).
+    Link,
+}
+
+/// The local endpoint the daemon owns/creates for a mount (§3.1).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LocalEndpoint {
+    /// Create a virtual endpoint (requires `port.virtualizable`).
+    #[serde(rename = "virtual", default)]
+    pub is_virtual: bool,
+    /// Display name for the virtual device.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+/// The remote peer a mount connects to, DIRECT peer-to-peer (§3.1). `addr` is typed as an
+/// [`IpAddr`] to enforce the connect-by-IP rule — a `.local`/`.lan` name won't deserialize.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RemoteEndpoint {
+    pub host: String,
+    /// ALWAYS the IP from the mDNS record (DESIGN §5), never a `.local`/`.lan` name.
+    pub addr: IpAddr,
+    pub port: u16,
+    #[serde(rename = "port-id")]
+    pub port_id: String,
+}
+
+/// A mount request carrying the negotiated format (§3.1). `mount-id` is the reconciler's
+/// idempotency key.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MountSpec {
+    #[serde(rename = "mount-id")]
+    pub mount_id: String,
+    pub role: MountRole,
+    pub local: LocalEndpoint,
+    pub remote: RemoteEndpoint,
+    /// The CHOSEN format — the result of negotiation (§4), a single format not a list.
+    pub format: Format,
+}
+
+/// A mount's lifecycle state (§3.2). The reconciler self-heals off these.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MountState {
+    Pending,
+    Connecting,
+    Active,
+    Degraded,
+    Failed,
+    TornDown,
+}
+
+/// Throughput/liveness counters for a live mount (§3.2).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct MountStats {
+    #[serde(rename = "bytes-in", default)]
+    pub bytes_in: u64,
+    #[serde(rename = "bytes-out", default)]
+    pub bytes_out: u64,
+    #[serde(rename = "last-event", default)]
+    pub last_event: Option<String>,
+}
+
+/// The status of one mount (§3.2).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct MountStatus {
+    #[serde(rename = "mount-id")]
+    pub mount_id: String,
+    pub state: MountState,
+    #[serde(default)]
+    pub since: Option<String>,
+    #[serde(default)]
+    pub stats: Option<MountStats>,
+    #[serde(default)]
+    pub detail: Option<String>,
+}
+
+/// `mount` result (§3): the established mount's id + current state.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct MountResult {
+    #[serde(rename = "mount-id")]
+    pub mount_id: String,
+    pub state: MountState,
+}
+
+/// `mount-status` result (§3): one or all live mounts.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct MountStatusResult {
+    pub mounts: Vec<MountStatus>,
 }
 
 /// The `data` object of a JSON-RPC error — carries the machine `code` (§6).
@@ -173,6 +273,33 @@ impl CtlClient {
         let value = self
             .call("describe-port", serde_json::json!({ "port-id": port_id }))
             .await?;
+        Ok(serde_json::from_value(value)?)
+    }
+
+    /// Establish a mount (§3). Idempotent on `spec.mount_id` — re-sending the same spec is
+    /// safe, which is what lets the reconciler converge desired-state.
+    pub async fn mount(&mut self, spec: &MountSpec) -> Result<MountResult, CtlError> {
+        let value = self.call("mount", spec).await?;
+        Ok(serde_json::from_value(value)?)
+    }
+
+    /// Tear a mount down (§3). Idempotent — an unknown `mount_id` is a successful no-op.
+    pub async fn unmount(&mut self, mount_id: &str) -> Result<(), CtlError> {
+        self.call("unmount", serde_json::json!({ "mount-id": mount_id }))
+            .await?;
+        Ok(())
+    }
+
+    /// One mount's status, or all live mounts when `mount_id` is `None` (§3).
+    pub async fn mount_status(
+        &mut self,
+        mount_id: Option<&str>,
+    ) -> Result<MountStatusResult, CtlError> {
+        let params = match mount_id {
+            Some(id) => serde_json::json!({ "mount-id": id }),
+            None => serde_json::json!({}),
+        };
+        let value = self.call("mount-status", params).await?;
         Ok(serde_json::from_value(value)?)
     }
 
@@ -361,5 +488,65 @@ mod tests {
 
         server.await.unwrap();
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn parses_and_reserializes_the_mount_spec_example() {
+        // The §3.1 MountSpec example.
+        let json = r#"{"mount-id":"b1f0","role":"mirror-source",
+            "local":{"virtual":true,"name":"laptop: Keystation 49e"},
+            "remote":{"host":"laptop","addr":"192.168.1.23","port":5004,"port-id":"kbd-0"},
+            "format":{"codec":"midi1"}}"#;
+        let spec: MountSpec = serde_json::from_str(json).unwrap();
+        assert_eq!(spec.mount_id, "b1f0");
+        assert_eq!(spec.role, MountRole::MirrorSource);
+        assert!(spec.local.is_virtual);
+        assert_eq!(spec.local.name.as_deref(), Some("laptop: Keystation 49e"));
+        assert_eq!(spec.remote.addr, "192.168.1.23".parse::<IpAddr>().unwrap());
+        assert_eq!(spec.remote.port, 5004);
+        assert_eq!(spec.remote.port_id, "kbd-0");
+        assert_eq!(spec.format.codec, "midi1");
+
+        // Re-serialization uses the on-wire hyphenated/renamed keys.
+        let v = serde_json::to_value(&spec).unwrap();
+        assert_eq!(v["mount-id"], "b1f0");
+        assert_eq!(v["role"], "mirror-source");
+        assert_eq!(v["local"]["virtual"], true);
+        assert_eq!(v["remote"]["port-id"], "kbd-0");
+        assert_eq!(v["remote"]["addr"], "192.168.1.23");
+    }
+
+    #[test]
+    fn parses_the_mount_status_example() {
+        // The §3.2 MountStatus example.
+        let json = r#"{"mount-id":"b1f0","state":"active","since":"2026-09-27T18:04:11Z",
+            "stats":{"bytes-in":10432,"bytes-out":0,"last-event":"2026-09-27T18:07:52Z"},
+            "detail":null}"#;
+        let st: MountStatus = serde_json::from_str(json).unwrap();
+        assert_eq!(st.mount_id, "b1f0");
+        assert_eq!(st.state, MountState::Active);
+        assert_eq!(st.since.as_deref(), Some("2026-09-27T18:04:11Z"));
+        let stats = st.stats.expect("stats present");
+        assert_eq!(stats.bytes_in, 10432);
+        assert_eq!(stats.bytes_out, 0);
+        assert_eq!(stats.last_event.as_deref(), Some("2026-09-27T18:07:52Z"));
+        assert!(st.detail.is_none());
+    }
+
+    #[test]
+    fn mount_state_kebab_round_trips() {
+        assert_eq!(
+            serde_json::to_value(MountState::TornDown).unwrap(),
+            "torn-down"
+        );
+        let s: MountState = serde_json::from_str("\"connecting\"").unwrap();
+        assert_eq!(s, MountState::Connecting);
+    }
+
+    #[test]
+    fn remote_endpoint_rejects_a_non_ip_addr() {
+        // Connect-by-IP (DESIGN §5): a `.local`/`.lan` name must not deserialize.
+        let json = r#"{"host":"laptop","addr":"keyboard.local","port":5004,"port-id":"kbd-0"}"#;
+        assert!(serde_json::from_str::<RemoteEndpoint>(json).is_err());
     }
 }

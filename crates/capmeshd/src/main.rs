@@ -15,9 +15,10 @@ mod discovery;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use config::Config;
-use ctl::CtlClient;
+use ctl::{CtlClient, Format, LocalEndpoint, MountRole, MountSpec, RemoteEndpoint};
 use discovery::{CapabilityAdvert, ServiceAdvertiser};
 use mdns_sd::ServiceEvent;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
@@ -49,6 +50,50 @@ enum Cmd {
         #[arg(long)]
         socket: PathBuf,
     },
+    /// Establish a mount on a daemon (§3): create/attach a p2p link to a remote port.
+    Mount {
+        #[arg(long)]
+        socket: PathBuf,
+        /// Remote peer host-id (from discovery).
+        #[arg(long)]
+        remote_host: String,
+        /// Remote peer IP — the address from the mDNS record (never a `.local`/`.lan` name).
+        #[arg(long)]
+        remote_addr: IpAddr,
+        /// Remote peer data-plane port.
+        #[arg(long)]
+        remote_port: u16,
+        /// Remote port-id to mount.
+        #[arg(long)]
+        remote_port_id: String,
+        /// Which end the daemon materializes: mirror-source | mirror-sink | link.
+        #[arg(long, default_value = "mirror-source")]
+        role: String,
+        /// Display name for the local virtual device (mirror roles).
+        #[arg(long)]
+        local_name: Option<String>,
+        /// Chosen wire-format codec.
+        #[arg(long, default_value = "midi1")]
+        codec: String,
+        /// Mount id (idempotency key); defaults to <remote-host>-<remote-port-id>.
+        #[arg(long)]
+        mount_id: Option<String>,
+    },
+    /// Tear a mount down (§3).
+    Unmount {
+        #[arg(long)]
+        socket: PathBuf,
+        #[arg(long)]
+        mount_id: String,
+    },
+    /// Print live mounts on a daemon (§3).
+    MountStatus {
+        #[arg(long)]
+        socket: PathBuf,
+        /// Restrict to one mount id.
+        #[arg(long)]
+        mount_id: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -62,8 +107,37 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
 
-    if let Some(Cmd::ProbeCtl { socket }) = &args.cmd {
-        return probe_ctl(socket).await;
+    match &args.cmd {
+        Some(Cmd::ProbeCtl { socket }) => return probe_ctl(socket).await,
+        Some(Cmd::Mount {
+            socket,
+            remote_host,
+            remote_addr,
+            remote_port,
+            remote_port_id,
+            role,
+            local_name,
+            codec,
+            mount_id,
+        }) => {
+            return cmd_mount(
+                socket,
+                remote_host,
+                *remote_addr,
+                *remote_port,
+                remote_port_id,
+                role,
+                local_name.clone(),
+                codec,
+                mount_id.clone(),
+            )
+            .await;
+        }
+        Some(Cmd::Unmount { socket, mount_id }) => return cmd_unmount(socket, mount_id).await,
+        Some(Cmd::MountStatus { socket, mount_id }) => {
+            return cmd_mount_status(socket, mount_id.as_deref()).await;
+        }
+        None => {}
     }
 
     // A missing config is not fatal at M0b — we run with defaults (hostname, no
@@ -206,4 +280,102 @@ async fn probe_ctl(socket: &Path) -> Result<()> {
         info!(port_id = %d.port_id, name = %d.name, "describe-port ok");
     }
     Ok(())
+}
+
+fn parse_role(s: &str) -> Result<MountRole> {
+    match s {
+        "mirror-source" => Ok(MountRole::MirrorSource),
+        "mirror-sink" => Ok(MountRole::MirrorSink),
+        "link" => Ok(MountRole::Link),
+        other => anyhow::bail!("unknown role `{other}` (mirror-source | mirror-sink | link)"),
+    }
+}
+
+/// Connect + hello, then establish a mount (§3). This is the one-command path toward the
+/// M0 demo: wire a remote port into a local virtual endpoint.
+#[allow(clippy::too_many_arguments)]
+async fn cmd_mount(
+    socket: &Path,
+    remote_host: &str,
+    remote_addr: IpAddr,
+    remote_port: u16,
+    remote_port_id: &str,
+    role: &str,
+    local_name: Option<String>,
+    codec: &str,
+    mount_id: Option<String>,
+) -> Result<()> {
+    let role = parse_role(role)?;
+    let mount_id = mount_id.unwrap_or_else(|| format!("{remote_host}-{remote_port_id}"));
+    let spec = MountSpec {
+        mount_id,
+        role,
+        local: LocalEndpoint {
+            // Mirror roles materialize a local virtual endpoint; `link` uses a real port.
+            is_virtual: !matches!(role, MountRole::Link),
+            name: local_name,
+        },
+        remote: RemoteEndpoint {
+            host: remote_host.to_string(),
+            addr: remote_addr,
+            port: remote_port,
+            port_id: remote_port_id.to_string(),
+        },
+        format: Format {
+            codec: codec.to_string(),
+            params: Default::default(),
+        },
+    };
+
+    let mut client = connect_and_hello(socket).await?;
+    let res = client.mount(&spec).await.context("mount")?;
+    info!(mount_id = %res.mount_id, state = ?res.state, "mount established");
+    Ok(())
+}
+
+/// Connect + hello, then tear a mount down (§3).
+async fn cmd_unmount(socket: &Path, mount_id: &str) -> Result<()> {
+    let mut client = connect_and_hello(socket).await?;
+    client.unmount(mount_id).await.context("unmount")?;
+    info!(%mount_id, "unmounted");
+    Ok(())
+}
+
+/// Connect + hello, then print live mounts (§3).
+async fn cmd_mount_status(socket: &Path, mount_id: Option<&str>) -> Result<()> {
+    let mut client = connect_and_hello(socket).await?;
+    let res = client
+        .mount_status(mount_id)
+        .await
+        .context("mount-status")?;
+    if res.mounts.is_empty() {
+        info!("no live mounts");
+    }
+    for m in &res.mounts {
+        let (bytes_in, bytes_out, last_event) = match &m.stats {
+            Some(s) => (s.bytes_in, s.bytes_out, s.last_event.clone()),
+            None => (0, 0, None),
+        };
+        info!(
+            mount_id = %m.mount_id,
+            state = ?m.state,
+            since = ?m.since,
+            bytes_in,
+            bytes_out,
+            last_event = ?last_event,
+            detail = ?m.detail,
+            "mount"
+        );
+    }
+    Ok(())
+}
+
+/// Open a `capmesh-ctl` connection and complete the mandatory `hello` handshake (§1.2).
+async fn connect_and_hello(socket: &Path) -> Result<CtlClient> {
+    let mut client = CtlClient::connect(socket)
+        .await
+        .with_context(|| format!("connect {}", socket.display()))?;
+    let hello = client.hello().await.context("hello handshake")?;
+    info!(daemon = %hello.daemon, protocol = %hello.protocol, "hello ok");
+    Ok(client)
 }
