@@ -26,7 +26,9 @@ main { flex: 1 1 auto; min-height: 0; position: relative; display: flex; overflo
 }
 #main iframe { width: 100%; height: 100%; border: 0; }
 #main .framewrap { position: relative; width: 100%; height: 100%; }
-#main .openlink { position: absolute; top: .5rem; right: .5rem; z-index: 2; font-size: .75rem; padding: .25rem .5rem; background: #000a; color: #fff; border-radius: .3rem; text-decoration: none; }
+/* Escape-hatch pill sits at the BOTTOM-right so it never covers the native PDF
+   viewer's top toolbar (page-nav / zoom / print / download / menu). */
+#main .openlink { position: absolute; bottom: .5rem; right: .5rem; z-index: 2; font-size: .75rem; padding: .25rem .5rem; background: #000a; color: #fff; border-radius: .3rem; text-decoration: none; }
 #main .openlink:hover { background: #000d; }
 #main .fallback { max-width: 34rem; }
 #main .fallback p { margin: 0 0 .6rem; }
