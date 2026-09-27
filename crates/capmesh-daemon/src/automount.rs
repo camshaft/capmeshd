@@ -10,7 +10,8 @@
 //! peer's data-plane port is conveyed).
 
 use crate::negotiate::{self, NoCommonFormat};
-use capmesh_ctl::{Format, MountRole, PortDescriptor};
+use capmesh_ctl::{Format, LocalEndpoint, MountRole, MountSpec, PortDescriptor, RemoteEndpoint};
+use std::net::IpAddr;
 
 /// The outcome of planning an auto-mount: which remote port, the role the local daemon
 /// materializes, and the negotiated format.
@@ -70,6 +71,37 @@ pub fn plan_mount(
         role,
         format,
     })
+}
+
+/// Assemble the full [`MountSpec`] (§3.1) from a [`MountPlan`] and the resolved remote
+/// coordinates. The remote data-plane `port` is resolved by the caller — kept out of the
+/// planner so this stays kind-agnostic (for MIDI/AppleMIDI the caller reads it from the peer's
+/// `_apple-midi._udp` record; DESIGN §5). Mirror roles create a local virtual endpoint named
+/// `local_name`; `link` binds an existing real local port, so no virtual endpoint.
+pub fn build_mount_spec(
+    plan: MountPlan,
+    mount_id: String,
+    remote_host: String,
+    remote_addr: IpAddr,
+    data_port: u16,
+    local_name: Option<String>,
+) -> MountSpec {
+    let is_virtual = matches!(plan.role, MountRole::MirrorSource | MountRole::MirrorSink);
+    MountSpec {
+        mount_id,
+        role: plan.role,
+        local: LocalEndpoint {
+            is_virtual,
+            name: local_name,
+        },
+        remote: RemoteEndpoint {
+            host: remote_host,
+            addr: remote_addr,
+            port: data_port,
+            port_id: plan.port_id,
+        },
+        format: plan.format,
+    }
 }
 
 #[cfg(test)]
@@ -163,5 +195,53 @@ mod tests {
         let err = plan_mount("mirror-local", None, None, None, &ports, &[fmt("midi1")])
             .unwrap_err();
         assert!(matches!(err, PlanError::NoCommonFormat(_)));
+    }
+
+    #[test]
+    fn build_mount_spec_mirror_source_is_virtual() {
+        let plan = MountPlan {
+            port_id: "kbd-0".into(),
+            role: MountRole::MirrorSource,
+            format: fmt("midi1"),
+        };
+        let spec = build_mount_spec(
+            plan,
+            "laptop-kbd-0".into(),
+            "laptop".into(),
+            "192.168.1.23".parse().unwrap(),
+            5004, // data-plane port the caller resolved (e.g. AppleMIDI control 5003 + 1)
+            Some("laptop: Keystation 49e".into()),
+        );
+        assert_eq!(spec.mount_id, "laptop-kbd-0");
+        assert_eq!(spec.role, MountRole::MirrorSource);
+        assert!(spec.local.is_virtual);
+        assert_eq!(spec.local.name.as_deref(), Some("laptop: Keystation 49e"));
+        assert_eq!(spec.remote.host, "laptop");
+        assert_eq!(
+            spec.remote.addr,
+            "192.168.1.23".parse::<std::net::IpAddr>().unwrap()
+        );
+        assert_eq!(spec.remote.port, 5004);
+        assert_eq!(spec.remote.port_id, "kbd-0");
+        assert_eq!(spec.format.codec, "midi1");
+    }
+
+    #[test]
+    fn build_mount_spec_link_is_not_virtual() {
+        let plan = MountPlan {
+            port_id: "p".into(),
+            role: MountRole::Link,
+            format: fmt("midi1"),
+        };
+        let spec = build_mount_spec(
+            plan,
+            "m".into(),
+            "h".into(),
+            "10.0.0.1".parse().unwrap(),
+            6000,
+            None,
+        );
+        assert!(!spec.local.is_virtual);
+        assert!(spec.local.name.is_none());
     }
 }
