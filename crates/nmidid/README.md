@@ -18,17 +18,27 @@ nmidid --socket /run/nmidid.sock --log-level info
 | `--monitor-interval <secs>` | `5` | How often to poll local MIDI ports for hot-plug (§5). |
 | `--allow-uid <uid>` | *(none)* | Permit connections from this uid (repeatable); own uid always allowed (§1.1). |
 | `--allow-gid <gid>` | *(none)* | Permit connections from this gid (repeatable) (§1.1). |
+| `--allow-group <name>` | *(none)* | Permit connections from this group name (repeatable), resolved to a gid at startup (§1.1). |
 | `--log-level <lvl>` | `info` | `trace`/`debug`/`info`/`warn`/`error`. |
 
-The control socket is local-trust-only. With no `--allow-uid`/`--allow-gid` given,
-peer-credential enforcement is **off** and only the socket file permissions
-(`0o660`) apply. Given either, nmidid reads each peer's socket credentials
-(`SO_PEERCRED`) on connect and refuses any uid/gid not on the allow-list (its own
-uid is always allowed); it fails closed if the credentials can't be read (§1.1).
+The control socket is local-trust-only. With none of `--allow-uid` / `--allow-gid`
+/ `--allow-group` given, peer-credential enforcement is **off** and only the
+socket file permissions (`0o660`) apply. Given any, nmidid reads each peer's
+socket credentials (`SO_PEERCRED`) on connect and refuses any peer whose uid and
+group set are not on the allow-list (its own uid is always allowed); it fails
+closed if the credentials can't be read (§1.1). The group check uses the peer's
+**full** group set — its primary gid plus supplementary groups (read from
+`/proc/<pid>/status`) — so authorizing a shared group works even when the client
+holds it as a supplementary group (e.g. a systemd `DynamicUser`).
+
+`--allow-group` resolves a group *name* to its gid from `/etc/group` at startup;
+an unresolved name is a fatal error (fail closed, not open). Prefer it to a raw
+gid, since an auto-allocated NixOS group has no gid known at evaluation time.
 
 The NixOS module `services.nmidid` (see the flake) runs it as a systemd unit and
-exposes `allowedUids` / `allowedGids` for the same policy — set a shared group in
-`allowedGids` to let capmeshd's client reach the socket while refusing others.
+exposes `allowedGroups` / `allowedUids` / `allowedGids` for the same policy — set
+`allowedGroups = [ "capmesh" ]` to let capmeshd's client reach the socket while
+refusing others.
 
 ### Control methods (capmeshd → daemon)
 

@@ -46,12 +46,29 @@ in
     allowedGids = lib.mkOption {
       type = lib.types.listOf lib.types.int;
       default = [ ];
-      example = lib.literalExpression "[ config.ids.gids.audio ]";
+      example = lib.literalExpression "[ 29 ]";
       description = ''
         Gids permitted to connect to the control socket, enforced via the peer's
-        socket credentials (CONTROL-PROTOCOL §1.1). Setting a shared group here is
-        the intended way to let capmeshd's client reach the socket while refusing
-        everyone else. Empty (with `allowedUids`) leaves enforcement off.
+        socket credentials (CONTROL-PROTOCOL §1.1). Prefer `allowedGroups` for the
+        shared-group model — an auto-allocated NixOS group has no gid known at
+        evaluation time. Empty (with `allowedUids`/`allowedGroups`) leaves
+        enforcement off.
+      '';
+    };
+
+    allowedGroups = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [ ];
+      example = lib.literalExpression ''[ "capmesh" ]'';
+      description = ''
+        Group NAMES permitted to connect to the control socket, resolved to gids
+        from `/etc/group` at daemon startup (CONTROL-PROTOCOL §1.1). This is the
+        recommended way to authorize capmeshd: set `[ "capmesh" ]` — the shared
+        group that `services.capmesh` declares and that capmeshd's client joins
+        via `SupplementaryGroups`. Coordinating on the name avoids pinning a gid.
+        The named group must exist (declared elsewhere); nmidid refuses to start
+        if it cannot be resolved. Empty leaves enforcement off (unless other
+        allow-lists are set).
       '';
     };
   };
@@ -66,6 +83,7 @@ in
           [ "${cfg.package}/bin/nmidid" "--socket" "${cfg.socket}" "--log-level" cfg.logLevel ]
           ++ lib.concatMap (uid: [ "--allow-uid" (toString uid) ]) cfg.allowedUids
           ++ lib.concatMap (gid: [ "--allow-gid" (toString gid) ]) cfg.allowedGids
+          ++ lib.concatMap (grp: [ "--allow-group" grp ]) cfg.allowedGroups
         );
         RuntimeDirectory = "nmidid";
         Restart = "on-failure";

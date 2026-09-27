@@ -112,6 +112,30 @@ fn parse_status_groups(status: &str) -> Vec<u32> {
         .unwrap_or_default()
 }
 
+/// Resolve a group name to its gid from `/etc/group`.
+///
+/// The shared-group trust model coordinates on a group *name* (default
+/// `capmesh`), not a gid — an auto-allocated NixOS group has no gid known at
+/// evaluation time, so the deployment authorizes the daemon by name and the
+/// daemon resolves it here at startup. NixOS materializes every declared group
+/// into `/etc/group`, so a name lookup there resolves the shared group without
+/// pinning a magic gid anywhere.
+pub fn resolve_group_gid(name: &str) -> Option<u32> {
+    let contents = std::fs::read_to_string("/etc/group").ok()?;
+    parse_group_gid(&contents, name)
+}
+
+/// Find `name`'s gid in `/etc/group`-formatted content (`name:passwd:gid:members`).
+fn parse_group_gid(group_file: &str, name: &str) -> Option<u32> {
+    group_file.lines().find_map(|line| {
+        let mut fields = line.split(':');
+        let gname = fields.next()?;
+        let _passwd = fields.next()?;
+        let gid = fields.next()?;
+        (gname == name).then(|| gid.parse().ok())?
+    })
+}
+
 /// Per-connection dispatch state. One `Session` exists per accepted connection;
 /// the `mounts` registry is shared daemon-wide across every connection.
 pub struct Session {
@@ -572,6 +596,15 @@ mod tests {
         assert_eq!(parse_status_groups(status), vec![7, 24]);
         assert_eq!(parse_status_groups("Groups:\t\n"), Vec::<u32>::new());
         assert_eq!(parse_status_groups("no groups line here\n"), Vec::<u32>::new());
+    }
+
+    #[test]
+    fn parse_group_gid_reads_etc_group() {
+        let g = "root:x:0:\ncapmesh:x:989:capmeshd\naudio:x:29:alice,bob\n";
+        assert_eq!(parse_group_gid(g, "capmesh"), Some(989));
+        assert_eq!(parse_group_gid(g, "root"), Some(0));
+        assert_eq!(parse_group_gid(g, "audio"), Some(29));
+        assert_eq!(parse_group_gid(g, "nope"), None);
     }
 
     #[tokio::test]

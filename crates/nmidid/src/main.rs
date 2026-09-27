@@ -33,6 +33,12 @@ struct Args {
     #[arg(long)]
     allow_gid: Vec<u32>,
 
+    /// Permit control connections from this group NAME (repeatable), resolved to
+    /// a gid from /etc/group at startup. The recommended way to authorize the
+    /// shared capmesh group without pinning a gid. §1.1
+    #[arg(long)]
+    allow_group: Vec<String>,
+
     /// Log level (trace, debug, info, warn, error).
     #[arg(short, long, default_value = "info")]
     log_level: String,
@@ -68,6 +74,21 @@ async fn main() -> Result<()> {
         nmidi_core::midi::start_port_monitor(Duration::from_secs(args.monitor_interval)).await;
     hotplug::spawn(port_rx, mounts.notifier());
 
-    let peers = PeerPolicy::new(args.allow_uid, args.allow_gid);
+    // Resolve any --allow-group names to gids and merge them into the gid
+    // allow-list. An unresolved group is a hard error rather than a silent
+    // drop: silently dropping the only allow-rule would fail *open* (enforcement
+    // off), so we fail closed and loud instead.
+    let mut allow_gids = args.allow_gid;
+    for name in &args.allow_group {
+        match server::resolve_group_gid(name) {
+            Some(gid) => {
+                info!("authorizing control group {name} (gid {gid})");
+                allow_gids.push(gid);
+            }
+            None => anyhow::bail!("--allow-group {name}: no such group in /etc/group"),
+        }
+    }
+
+    let peers = PeerPolicy::new(args.allow_uid, allow_gids);
     server::run(&args.socket, ports, mounts, peers).await
 }
