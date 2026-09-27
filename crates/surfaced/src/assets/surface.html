@@ -11,12 +11,20 @@
 </head>
 <body>
 <header>
+  <button id="menu" type="button" aria-label="Toggle inbox" aria-expanded="false">☰</button>
   <b>surface</b><span class="id" id="sid"></span>
   <span class="status" id="status">connecting…</span>
 </header>
 <main>
+  <!-- The selected item, centered — the primary content on a phone. -->
   <div id="main"><div class="empty">No item selected yet.</div></div>
-  <aside id="feed"><h2>inbox</h2><ul id="list"></ul></aside>
+  <!-- The inbox feed is an off-canvas drawer (the hamburger toggles it on
+       narrow screens; a wide screen shows it as a persistent sidebar). -->
+  <div id="backdrop" hidden></div>
+  <aside id="feed" aria-hidden="true">
+    <h2>inbox</h2>
+    <ul id="list"></ul>
+  </aside>
 </main>
 <script src="surface.js"></script>
 </body>

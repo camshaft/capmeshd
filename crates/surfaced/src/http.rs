@@ -374,6 +374,9 @@ mod tests {
         assert!(html.contains(r#"src="surface.js""#));
         assert!(html.contains(r#"<base href="/">"#));
         assert!(!html.contains("__BASE_HREF__"));
+        // Mobile layout: a hamburger toggle + the inbox feed as a drawer.
+        assert!(html.contains(r#"id="menu""#));
+        assert!(html.contains(r#"id="feed""#));
 
         let css = app
             .clone()
