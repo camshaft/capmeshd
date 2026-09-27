@@ -37,6 +37,13 @@
   });
   backdropEl.addEventListener("click", closeFeed);
 
+  // Clear all items on this surface (empties the inbox; SSE pushes the update).
+  var clearEl = document.getElementById("clear");
+  clearEl.addEventListener("click", function () {
+    if (!window.confirm("Clear all items on this surface?")) return;
+    fetch("s/" + encodeURIComponent(id) + "/clear" + tq, { method: "POST" });
+  });
+
   function summary(it) {
     switch (it.type) {
       case "navigate": return "navigate → " + it.url;

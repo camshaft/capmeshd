@@ -35,7 +35,9 @@ main { flex: 1 1 auto; min-height: 0; position: relative; display: flex; }
   box-shadow: -8px 0 24px #0003;
 }
 #feed.open { transform: translateX(0); }
-#feed h2 { font-size: .8rem; text-transform: uppercase; letter-spacing: .04em; opacity: .6; margin: .75rem; }
+#feed h2 { font-size: .8rem; text-transform: uppercase; letter-spacing: .04em; opacity: .6; margin: .75rem; display: flex; align-items: center; justify-content: space-between; }
+#clear { font: inherit; font-size: .7rem; text-transform: none; letter-spacing: 0; padding: .2rem .5rem; cursor: pointer; background: transparent; border: 1px solid var(--edge); border-radius: .3rem; color: inherit; opacity: .9; }
+#clear:hover { background: #8881; }
 #feed ul { list-style: none; margin: 0; padding: 0; }
 #feed li { padding: .7rem .75rem; border-bottom: 1px solid var(--edge); cursor: pointer; }
 #feed li:hover { background: #8881; }
