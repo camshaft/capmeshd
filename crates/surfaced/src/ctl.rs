@@ -106,6 +106,7 @@ impl Session {
             "list-surfaces" => self.handle_list_surfaces(),
             "clear-items" => self.handle_clear(params),
             "delete-surface" => self.handle_delete(params),
+            "set-token" => self.handle_set_token(params),
             other => Err(CtlError::protocol(
                 METHOD_NOT_FOUND,
                 "method-not-found",
@@ -214,6 +215,24 @@ impl Session {
         let id = surface_id(params)?;
         self.store.delete(&id); // idempotent: unknown surface is a no-op
         Ok(Value::Object(Map::new()))
+    }
+
+    fn handle_set_token(&self, params: &Value) -> Result<Value, CtlError> {
+        let id = surface_id(params)?;
+        // `attach-token`: a string sets/rotates it; absent or null clears it
+        // (reopening the surface). Local-trust socket only — never over HTTP.
+        let token = params
+            .get("attach-token")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        if self.store.set_token(&id, token) {
+            Ok(Value::Object(Map::new()))
+        } else {
+            Err(CtlError::domain(
+                "no-such-surface",
+                "unknown surface (create it first)",
+            ))
+        }
     }
 
     fn handle_list_items(&self, params: &Value) -> Result<Value, CtlError> {
@@ -454,6 +473,35 @@ mod tests {
         assert_eq!(out[3]["result"]["items"].as_array().unwrap().len(), 0);
         // After delete, the registry is empty.
         assert_eq!(out[5]["result"]["surfaces"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn set_token_rotates_and_clears() {
+        let store = Arc::new(SurfaceStore::in_memory());
+        // Create tokened, then rotate the token.
+        let create = serde_json::json!({"jsonrpc":"2.0","id":2,"method":"create-surface",
+            "params":{"surface-id":"s","attach-token":"t1"}});
+        let rotate = serde_json::json!({"jsonrpc":"2.0","id":3,"method":"set-token",
+            "params":{"surface-id":"s","attach-token":"t2"}});
+        let out = exchange(store.clone(), &[hello(), create, rotate]).await;
+        assert!(out[2]["result"].is_object());
+        // Old token now rejected, new one accepted, still not open.
+        assert!(!store.authorize_attach("s", Some("t1")));
+        assert!(store.authorize_attach("s", Some("t2")));
+        assert!(!store.authorize_attach("s", None));
+
+        // Clearing the token (no attach-token) reopens the surface.
+        let clear = serde_json::json!({"jsonrpc":"2.0","id":4,"method":"set-token",
+            "params":{"surface-id":"s"}});
+        let out2 = exchange(store.clone(), &[hello(), clear]).await;
+        assert!(out2[1]["result"].is_object());
+        assert!(store.authorize_attach("s", None));
+
+        // Setting a token on an unknown surface is a domain error.
+        let bad = serde_json::json!({"jsonrpc":"2.0","id":5,"method":"set-token",
+            "params":{"surface-id":"ghost","attach-token":"x"}});
+        let out3 = exchange(store.clone(), &[hello(), bad]).await;
+        assert_eq!(out3[1]["error"]["data"]["code"], "no-such-surface");
     }
 
     #[tokio::test]
