@@ -141,11 +141,12 @@ async fn run_pump(
         ssrc,
         name: name.clone(),
     };
+    // AppleMIDI orders the handshake: invite the control channel first; the data
+    // channel is invited only after the control invitation is accepted (below).
+    // A strict peer may ignore a data invitation that arrives before the control
+    // session exists.
     sockets.send_control(&invitation, &control_addr).await?;
-    sockets
-        .send_control_on_data(&invitation, &data_addr)
-        .await?;
-    debug!("sent AppleMIDI invitation to {control_addr} / {data_addr}");
+    debug!("sent AppleMIDI control invitation to {control_addr}");
 
     // Await InvitationAccepted (or a graceful cancel), resending on timeout.
     let mut attempts = 0;
@@ -169,15 +170,18 @@ async fn run_pump(
                         anyhow::bail!("no InvitationAccepted after {HANDSHAKE_ATTEMPTS} attempts");
                     }
                     sockets.send_control(&invitation, &control_addr).await?;
-                    sockets
-                        .send_control_on_data(&invitation, &data_addr)
-                        .await?;
                 }
             }
         }
     }
 
     if !cancelled {
+        // Control channel accepted — now invite the data channel (correct
+        // AppleMIDI order). Best-effort: we don't block on the data OK; MIDI
+        // arrives once the peer establishes its side.
+        let _ = sockets.send_control_on_data(&invitation, &data_addr).await;
+        debug!("sent AppleMIDI data invitation to {data_addr}");
+
         info!(
             "mount active: mirroring {} into local virtual port",
             control_addr
