@@ -5,5 +5,6 @@
 //! transport beyond the `capmesh-ctl` client; the capmeshd binary supplies the CLI, config,
 //! and discovery wiring around them.
 
+pub mod automount;
 pub mod negotiate;
 pub mod reconcile;

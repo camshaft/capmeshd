@@ -7,6 +7,7 @@ description = "capmesh control-plane core: the desired-mount reconciler and form
 
 [dependencies]
 capmesh-ctl = { path = "../capmesh-ctl" }
+thiserror.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]

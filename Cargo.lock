@@ -203,6 +203,7 @@ version = "0.1.0"
 dependencies = [
  "capmesh-ctl",
  "serde_json",
+ "thiserror",
  "tokio",
  "tracing",
 ]
