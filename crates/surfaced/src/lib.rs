@@ -12,13 +12,13 @@
 //! stateless plumbing and drives it over a control socket, while `surfaced` owns
 //! the HTTP/SSE serving, the inbox store, and attachment fan-out.
 //!
-//! This crate currently implements the HTTP/SSE server ([`http`]), the durable
-//! inbox store with on-disk persistence ([`inbox`]), the display-item model
-//! ([`item`]), and the same-origin attachment page ([`page`]) — the minimal push
-//! path that makes a surface visibly real end-to-end. The `surface-ctl` control
-//! socket, the MCP `send` tool, and per-surface attach tokens land in later
-//! increments.
+//! This crate implements the HTTP/SSE server ([`http`]), the durable inbox store
+//! with on-disk persistence ([`inbox`]), the display-item model ([`item`]), the
+//! same-origin attachment page ([`page`]), and the `surface-ctl` control socket
+//! ([`ctl`]) that capmeshd drives over a local Unix socket. The MCP `send` tool
+//! and per-surface attach tokens land in later increments.
 
+pub mod ctl;
 pub mod http;
 pub mod inbox;
 pub mod item;

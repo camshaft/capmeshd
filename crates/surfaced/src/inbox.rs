@@ -232,6 +232,18 @@ impl SurfaceStore {
         state.view(self.cap)
     }
 
+    /// Ensure a surface exists (creating it if absent), optionally setting its
+    /// title. Backs the control-socket `create-surface` method.
+    pub fn ensure(&self, id: &str, title: Option<String>) {
+        let mut map = self.inner.lock().expect("store lock");
+        let state = map
+            .entry(id.to_string())
+            .or_insert_with(|| SurfaceState::new(id.to_string()));
+        if let Some(t) = title {
+            state.title = t;
+        }
+    }
+
     /// Subscribe to a surface's live events, returning the current snapshot and
     /// a receiver. The subscription is registered before the snapshot is taken
     /// (both under the store lock), so no push can slip between them.
