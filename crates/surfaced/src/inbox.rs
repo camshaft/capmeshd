@@ -183,10 +183,21 @@ impl SurfaceStore {
                 .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
     }
 
-    fn log_path(&self, id: &str) -> Option<PathBuf> {
+    /// Path of a per-surface state file `<id>.<ext>` under the state dir. Returns
+    /// `None` when there is no state dir, or — defense-in-depth — when the id is
+    /// not path-safe, so a bad id can never escape the state dir on a write even
+    /// if a caller forgot to validate it (every network entry point already does).
+    fn state_file(&self, id: &str, ext: &str) -> Option<PathBuf> {
+        if !Self::valid_id(id) {
+            return None;
+        }
         self.state_dir
             .as_ref()
-            .map(|d| d.join(format!("{id}.jsonl")))
+            .map(|d| d.join(format!("{id}.{ext}")))
+    }
+
+    fn log_path(&self, id: &str) -> Option<PathBuf> {
+        self.state_file(id, "jsonl")
     }
 
     /// Path of the per-surface view sidecar. The item log is append-only and only
@@ -194,7 +205,7 @@ impl SurfaceStore {
     /// express) is persisted separately here. Its extension is not `jsonl`, so
     /// replay never mistakes it for the item log.
     fn view_path(&self, id: &str) -> Option<PathBuf> {
-        self.state_dir.as_ref().map(|d| d.join(format!("{id}.view")))
+        self.state_file(id, "view")
     }
 
     /// Persist the current main view for a surface, so a selection survives a
@@ -217,9 +228,7 @@ impl SurfaceStore {
     /// Path of the per-surface attach-token sidecar (extension not `jsonl`, so
     /// replay ignores it as an item log).
     fn token_path(&self, id: &str) -> Option<PathBuf> {
-        self.state_dir
-            .as_ref()
-            .map(|d| d.join(format!("{id}.token")))
+        self.state_file(id, "token")
     }
 
     /// Persist a surface's attach token so a protected surface stays protected
@@ -249,9 +258,7 @@ impl SurfaceStore {
     /// Path of the per-surface title sidecar (extension not `jsonl`, so replay
     /// ignores it as an item log).
     fn title_path(&self, id: &str) -> Option<PathBuf> {
-        self.state_dir
-            .as_ref()
-            .map(|d| d.join(format!("{id}.title")))
+        self.state_file(id, "title")
     }
 
     /// Persist a surface's title so a friendly name survives a restart (in memory
@@ -760,6 +767,29 @@ mod tests {
         assert!(!SurfaceStore::valid_id(".."));
         assert!(!SurfaceStore::valid_id("a/b"));
         assert!(!SurfaceStore::valid_id("../etc/passwd"));
+    }
+
+    #[test]
+    fn store_never_writes_outside_the_state_dir_for_a_bad_id() {
+        // state dir is nested one level down; a `../` traversal from it would
+        // land in `root/` (still inside the tempdir, so this test can't litter
+        // the real filesystem even if the guard regresses).
+        let root = tempfile::tempdir().unwrap();
+        let state = root.path().join("state");
+        std::fs::create_dir(&state).unwrap();
+        let store = SurfaceStore::with_state_dir(&state).unwrap();
+
+        // Directly drive the store with a traversal id (bypassing the entry-point
+        // validation) — the store's own path guard must refuse to write.
+        store.push("../escape", text("x"), true);
+        store.ensure("../escape", Some("t".into()), Some("tok".into()));
+        store.set_token("../escape", Some("tok2".into()));
+
+        // Nothing escaped the state dir (no `root/escape.*`).
+        for ext in ["jsonl", "view", "token", "title"] {
+            let escaped = root.path().join(format!("escape.{ext}"));
+            assert!(!escaped.exists(), "traversal wrote {}", escaped.display());
+        }
     }
 
     #[test]
