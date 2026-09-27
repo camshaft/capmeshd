@@ -1,0 +1,25 @@
+//! `surfaced` — the browser **surface** data-plane daemon (DESIGN §10.1).
+//!
+//! A *surface* is a durable, addressable, arbitrarily-scriptable display sink on
+//! the mesh: "aim a browser at it and it becomes a screen you can push to." The
+//! logical surface lives here in `surfaced` and holds all state; a browser tab is
+//! an ephemeral *attachment* pointed at `/s/{id}`, so a surface persists whether
+//! or not a browser is open. A surface **is a persistent inbox** — every push
+//! appends a display item to a durable, ordered, bounded log, and the tab renders
+//! a main view (the head of the inbox) plus a visible feed (its history).
+//!
+//! `surfaced` is a first-party data-plane daemon like `nmidid`: capmeshd stays
+//! stateless plumbing and drives it over a control socket, while `surfaced` owns
+//! the HTTP/SSE serving, the inbox store, and attachment fan-out.
+//!
+//! This crate currently implements the HTTP/SSE server ([`http`]), the durable
+//! inbox store with on-disk persistence ([`inbox`]), the display-item model
+//! ([`item`]), and the same-origin attachment page ([`page`]) — the minimal push
+//! path that makes a surface visibly real end-to-end. The `surface-ctl` control
+//! socket, the MCP `send` tool, and per-surface attach tokens land in later
+//! increments.
+
+pub mod http;
+pub mod inbox;
+pub mod item;
+pub mod page;
