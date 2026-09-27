@@ -11,6 +11,7 @@
 mod config;
 mod ctl;
 mod discovery;
+mod negotiate;
 mod reconcile;
 
 use anyhow::{Context, Result};
@@ -69,6 +70,33 @@ enum Cmd {
         /// Only show capabilities on this host.
         #[arg(long)]
         host: Option<String>,
+    },
+    /// Connect a remote source to a local mount, negotiating the format first (§4, §7).
+    Connect {
+        #[arg(long)]
+        socket: PathBuf,
+        #[arg(long)]
+        remote_host: String,
+        /// Remote peer IP from the mDNS record (never a `.local`/`.lan` name).
+        #[arg(long)]
+        remote_addr: IpAddr,
+        #[arg(long)]
+        remote_port: u16,
+        #[arg(long)]
+        remote_port_id: String,
+        #[arg(long, default_value = "mirror-source")]
+        role: String,
+        #[arg(long)]
+        local_name: Option<String>,
+        /// Local codecs in preference order (the consuming side); defaults to [midi1].
+        #[arg(long = "local-codec")]
+        local_codecs: Vec<String>,
+        /// The remote source's advertised codecs; defaults to [midi1]. (Until the mesh
+        /// descriptor fetch lands, the remote formats are supplied here.)
+        #[arg(long = "remote-codec")]
+        remote_codecs: Vec<String>,
+        #[arg(long)]
+        mount_id: Option<String>,
     },
     /// Establish a mount on a daemon (§3): create/attach a p2p link to a remote port.
     Mount(MountArgs),
@@ -188,6 +216,32 @@ async fn main() -> Result<()> {
                 kind.as_deref(),
                 dir.as_deref(),
                 host.as_deref(),
+            )
+            .await;
+        }
+        Some(Cmd::Connect {
+            socket,
+            remote_host,
+            remote_addr,
+            remote_port,
+            remote_port_id,
+            role,
+            local_name,
+            local_codecs,
+            remote_codecs,
+            mount_id,
+        }) => {
+            return cmd_connect(
+                socket,
+                remote_host,
+                *remote_addr,
+                *remote_port,
+                remote_port_id,
+                role,
+                local_name.clone(),
+                local_codecs,
+                remote_codecs,
+                mount_id.clone(),
             )
             .await;
         }
@@ -500,6 +554,74 @@ async fn cmd_mount(m: &MountArgs) -> Result<()> {
     let mut client = connect_and_hello(&m.socket).await?;
     let res = client.mount(&spec).await.context("mount")?;
     info!(mount_id = %res.mount_id, state = ?res.state, "mount established");
+    Ok(())
+}
+
+/// Codec names → `Format`s, defaulting to `[midi1]` when none are given.
+fn codecs_to_formats(codecs: &[String]) -> Vec<Format> {
+    let names = if codecs.is_empty() {
+        &["midi1".to_string()][..]
+    } else {
+        codecs
+    };
+    names
+        .iter()
+        .map(|c| Format {
+            codec: c.clone(),
+            params: Default::default(),
+        })
+        .collect()
+}
+
+/// Connect a remote source to a local mount, negotiating the format first (§4 → §7). The
+/// local side is the consumer, so its preference order ranks; on no common format the
+/// connect is refused with both sides listed (§4.1 step 4).
+#[allow(clippy::too_many_arguments)]
+async fn cmd_connect(
+    socket: &Path,
+    remote_host: &str,
+    remote_addr: IpAddr,
+    remote_port: u16,
+    remote_port_id: &str,
+    role: &str,
+    local_name: Option<String>,
+    local_codecs: &[String],
+    remote_codecs: &[String],
+    mount_id: Option<String>,
+) -> Result<()> {
+    let role = parse_role(role)?;
+    let local = codecs_to_formats(local_codecs);
+    let remote = codecs_to_formats(remote_codecs);
+    let format = negotiate::negotiate(&local, &remote).map_err(|nc| {
+        let names = |fs: &[Format]| fs.iter().map(|f| f.codec.clone()).collect::<Vec<_>>();
+        anyhow::anyhow!(
+            "no common format (§4): local {:?}, remote {:?}",
+            names(&nc.consumer),
+            names(&nc.producer)
+        )
+    })?;
+    info!(codec = %format.codec, "negotiated format");
+
+    let mount_id = mount_id.unwrap_or_else(|| format!("{remote_host}-{remote_port_id}"));
+    let spec = MountSpec {
+        mount_id,
+        role,
+        local: LocalEndpoint {
+            is_virtual: !matches!(role, MountRole::Link),
+            name: local_name,
+        },
+        remote: RemoteEndpoint {
+            host: remote_host.to_string(),
+            addr: remote_addr,
+            port: remote_port,
+            port_id: remote_port_id.to_string(),
+        },
+        format,
+    };
+
+    let mut client = connect_and_hello(socket).await?;
+    let res = client.mount(&spec).await.context("mount")?;
+    info!(mount_id = %res.mount_id, state = ?res.state, "connected");
     Ok(())
 }
 
