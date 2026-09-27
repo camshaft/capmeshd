@@ -300,7 +300,13 @@ a stray/third-party advert is never auto-wired).
 Thin MCP server (Rust; `rmcp` / official SDK), **Streamable HTTP** transport (long-running daemon,
 matches Home Assistant's proven pattern) + stdio for local dev. Runs as a mesh client (§2).
 
-- **Tools**
+capmeshd's MCP surface is **control plane + service discovery only** — it wires and inspects mounts;
+it never carries or pushes data. Moving data (pushing a display item to a surface, streaming MIDI)
+is the **data-plane daemon's** job, and each data daemon exposes its own data verbs on its own MCP.
+So the surface item-push verb lives on `surfaced`'s embedded MCP (`send_item`, alongside
+`list_surfaces` / `list_items` — see §10.1), **not** here.
+
+- **Tools** (all control-plane)
   - `discover(kind?, dir?, host?)` → capabilities (id, kind, dir, host, summary).
   - `describe(capability-id)` → full typed descriptor + current mounts.
   - `connect(source-id, sink-id, lifetime=temp|permanent, ttl?, transport?)` → mount-id.
@@ -308,8 +314,6 @@ matches Home Assistant's proven pattern) + stdio for local dev. Runs as a mesh c
   - `status(mount-id? | host? | all)` → live health/throughput/last-seen.
   - `invoke(capability-id, method, params)` → escape hatch for `control-api` kinds (Moonraker
     `printer.*`, PrusaLink endpoints).
-  - `send(surface-id, item)` → push a display item to a `surface` sink (§10.1): `{navigate|pdf|text|
-    link|html|script, ...}`. The "voice agent, put this PDF manual page on my phone" verb.
 - **Resources** — `capmesh://topology` (current graph snapshot), `capmesh://host/<id>` (read-only
   live state).
 - **Prompts** — worked examples ("connect the studio keyboard to the SuperCollider host temporarily").
@@ -432,9 +436,13 @@ dotfiles-managed host, so it can't carry the cluster key — while keeping the s
 trusted, mesh-advertised device. Path to a stronger per-device pairing later.
 
 **Data-plane daemon:** `surfaced` is a first-party daemon (like `nmidid`) — it speaks an extended
-`capmesh-ctl` (`surface-ctl`: `create-surface` / `send-item` / `set-view` / `list-items` / attach
-lifecycle) over the local control socket; capmeshd's `surface` adapter drives it. `surfaced` owns
-the HTTP/WS serving, the inbox store, and attachment fan-out; capmeshd stays stateless plumbing.
+`capmesh-ctl` (`surface-ctl`: `create-surface` / `list-surfaces` / `send-item` / `set-view` /
+`list-items` / attach lifecycle) over the local control socket; capmeshd's `surface` adapter drives
+it for **control/discovery** (`list-surfaces` is the adapter's discovery verb). Pushing items is a
+data-plane action, so `surfaced` also hosts its **own** embedded MCP server (`list_surfaces` /
+`list_items` / `send_item`) that agents call to push — the push verb is not on capmeshd's MCP (§7).
+`surfaced` owns the HTTP/WS serving, the inbox store, attachment fan-out, and its data-plane MCP;
+capmeshd stays stateless plumbing.
 
 ---
 
@@ -473,7 +481,8 @@ discovers and wires MIDI mounts over the mesh with no bespoke glue.
 **M2.5 — Browser surface (agent-facing; operator-prioritized).** Build `surfaced` (§10.1): the
 HTTP/WS server, the durable per-surface **inbox store** + on-disk persistence, the attachment page
 (main view + visible inbox feed), `surface-ctl` over the control socket, capmeshd's `surface`
-adapter, the MCP `send` tool, per-surface token attach, and the `services.capmesh.advertise.surface`
+adapter (control/discovery only), `surfaced`'s own embedded MCP `send_item` tool (data-plane push),
+per-surface token attach, and the `services.capmesh.advertise.surface`
 NixOS bit. **Exit:** a voice/agent pushes a **PDF manual page to the phone surface** and it appears
 (and stays in the phone's inbox, visible later even after the tab was closed). *This capability is
 independent of the media legs; it can land right after the MCP server rather than waiting for M3–M5.*
