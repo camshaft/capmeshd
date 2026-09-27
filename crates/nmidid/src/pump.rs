@@ -87,6 +87,11 @@ async fn run_pump(
     loop {
         match tokio::time::timeout(HANDSHAKE_TIMEOUT, sockets.recv_control()).await {
             Ok(Ok((AppleMidiPacket::InvitationAccepted { .. }, _))) => break,
+            Ok(Ok((AppleMidiPacket::InvitationRejected { .. }, _))) => {
+                // The remote explicitly declined; retrying would only spin to
+                // timeout, so fail fast with a clear cause.
+                anyhow::bail!("remote rejected the invitation");
+            }
             Ok(Ok(_)) => continue, // other control packet before accept; keep waiting
             Ok(Err(e)) => debug!("control recv during handshake: {e}"),
             Err(_) => {
@@ -314,6 +319,64 @@ mod tests {
         assert!(s.stats.bytes_in >= 3);
         drop(s);
         pump.abort();
+    }
+
+    /// A remote that explicitly rejects the invitation must fail the mount
+    /// *fast* — within the handshake, not by spinning to the multi-attempt
+    /// timeout — and carry a rejection detail.
+    #[tokio::test]
+    async fn pump_rejection_fails_fast_with_detail() {
+        use tokio::net::UdpSocket;
+
+        let fake_ctl = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let fake_ctl_port = fake_ctl.local_addr().unwrap().port();
+
+        // Fake peer: reply to the invitation with an explicit "NO".
+        tokio::spawn(async move {
+            let mut buf = [0u8; 2048];
+            let (n, from) = fake_ctl.recv_from(&mut buf).await.unwrap();
+            if let Ok(AppleMidiPacket::Invitation { token, ssrc, .. }) =
+                AppleMidiPacket::parse(&buf[..n])
+            {
+                let reject = AppleMidiPacket::InvitationRejected {
+                    version: APPLEMIDI_VERSION,
+                    token,
+                    ssrc,
+                    name: "fake-peer".to_string(),
+                };
+                fake_ctl.send_to(&reject.to_bytes(), from).await.unwrap();
+            }
+        });
+
+        let (notifier, mut rx) = broadcast::channel(8);
+        let status = connecting_status();
+        let remote = RemoteEndpoint {
+            host: None,
+            addr: "127.0.0.1".to_string(),
+            port: fake_ctl_port,
+            port_id: "source-0".to_string(),
+        };
+
+        RtpConnector.start(
+            remote,
+            Box::new(RecordingSink::new()),
+            Arc::clone(&status),
+            notifier,
+        );
+
+        // A 2s bound is well under the 3×5s handshake timeout, so passing proves
+        // the rejection short-circuits the retry loop.
+        let notification = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("failed notification within timeout (should not spin to handshake timeout)")
+            .expect("notification received");
+        assert_eq!(notification["params"]["state"], "failed");
+        let detail = notification["params"]["detail"].as_str().unwrap_or("");
+        assert!(
+            detail.contains("rejected"),
+            "detail should mention rejection, got: {detail}"
+        );
+        assert_eq!(status.lock().unwrap().state, MountState::Failed);
     }
 
     /// When the pump can't establish the session, the mount must transition to
