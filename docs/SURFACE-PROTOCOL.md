@@ -226,7 +226,8 @@ the **same** store, so:
 - `create-surface` (title + attach token), `send-item` (all item types, `promote`),
   `set-view`, `list-items`, `list-surfaces`, `clear-items`, `delete-surface`, `set-token`.
 - Durable per-surface inbox (on-disk NDJSON, replayed on restart + compacted), bounded in memory.
-  The main-view selection persists across restart (a per-surface sidecar).
+  A surface's config also survives restart via per-surface sidecars: main-view selection, attach
+  token (a protected surface stays protected), and title.
 - SSE fan-out of pushes/view-changes to attached tabs, plus a live attach count.
 - An **embedded MCP server** (§8) — the agent-facing data-plane API.
 
