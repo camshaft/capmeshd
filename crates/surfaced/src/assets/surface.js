@@ -56,6 +56,20 @@
     }
   }
 
+  // A full-bleed iframe "stage" that fills the main view. ALL rich item content
+  // renders inside one of these — never injected into this page's DOM — so an
+  // item can never corrupt the surface's own chrome (header/drawer/feed), leak
+  // <style> into it, or break layout with unbalanced markup.
+  function stage(sandbox) {
+    var f = document.createElement("iframe");
+    f.className = "stage";
+    // `sandbox` is always set; the flags differ by item kind (see callers).
+    f.setAttribute("sandbox", sandbox);
+    // Referrer hygiene for third-party embeds.
+    f.setAttribute("referrerpolicy", "no-referrer");
+    return f;
+  }
+
   // Render one display item into the main view.
   function renderMain(it) {
     mainEl.innerHTML = "";
@@ -63,11 +77,31 @@
     switch (it.type) {
       case "navigate":
       case "pdf": {
-        // Third-party content: sandboxed iframe, no access to this origin.
-        var f = document.createElement("iframe");
-        f.setAttribute("sandbox", "allow-scripts allow-popups allow-forms");
+        // A third-party URL (site or PDF). It keeps its OWN origin (allow-same-origin
+        // is safe here because the content is cross-origin — it still cannot touch
+        // this page), which is what lets the browser's PDF viewer render inline and
+        // real sites work; allow-downloads covers a "save" from the viewer.
+        var f = stage("allow-scripts allow-same-origin allow-popups allow-forms allow-downloads");
         f.src = it.url;
         mainEl.appendChild(f);
+        break;
+      }
+      case "html": {
+        // Trusted markup, but rendered in an ISOLATED opaque-origin iframe (no
+        // allow-same-origin) so it is fully contained: its scripts/styles run only
+        // inside the stage and cannot reach or corrupt the surface UI.
+        var fh = stage("allow-scripts allow-popups allow-forms");
+        fh.srcdoc = it.markup || "";
+        mainEl.appendChild(fh);
+        break;
+      }
+      case "script": {
+        // Trusted JS, run inside the isolated stage (not this page). CDATA-style
+        // guard keeps a stray "</script>" in the code from escaping the element.
+        var code = String(it.code || "").replace(/<\/(script)/gi, "<\\/$1");
+        var fs = stage("allow-scripts allow-popups allow-forms");
+        fs.srcdoc = '<!doctype html><meta charset="utf-8"><body><script>' + code + "<\/script>";
+        mainEl.appendChild(fs);
         break;
       }
       case "text": {
@@ -81,18 +115,6 @@
         a.href = it.url; a.target = "_blank"; a.rel = "noopener noreferrer";
         a.textContent = it.title || it.url;
         mainEl.appendChild(a);
-        break;
-      }
-      case "html": {
-        // Same-origin, trusted (DESIGN §8): render our own markup directly.
-        mainEl.innerHTML = it.markup || "";
-        break;
-      }
-      case "script": {
-        // Trusted scripting escape hatch: run in the surface page.
-        var s = document.createElement("script");
-        s.textContent = it.code || "";
-        mainEl.appendChild(s);
         break;
       }
     }
