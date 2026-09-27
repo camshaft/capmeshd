@@ -377,6 +377,20 @@ The module runs `capmeshd`, relies on the already-enabled Avahi (and can publish
 `_moonraker._tcp` record Moonraker omits), opens the right firewall ports, and installs
 `permanentMounts` into desired-state. `colmena apply --on @printer` pushes to every tagged host.
 
+**Enabling the local-socket trust boundary (§8).** `services.capmesh` places capmeshd's process in
+a shared `capmesh` group (`SupplementaryGroups`, keeping the `DynamicUser` sandbox) and declares the
+group. To turn peer-credential enforcement on for a data-plane daemon, authorize that group **by
+name** — for `nmidid`:
+
+```nix
+services.nmidid.allowedGroups = [ config.services.capmesh.group ];   # default "capmesh" on both sides
+```
+
+The daemon resolves each name to a gid from `/etc/group` at startup (an unresolved name is a fatal,
+fail-closed start error) and matches the connecting peer's **full** group set, so the DynamicUser
+capmeshd client is admitted while a co-resident non-`capmesh` process is refused — with no numeric
+gid pinned anywhere. Enforcement defaults **off** (empty `allowedGroups`), so it is opt-in per host.
+
 Hosts today: Linux `gateway` / `green-machine` / `i7-machine`; macOS `camerons-mini` /
 `camerons-work-mbp`. **The mesh is cross-OS from day one** — the MIDI plugin creates virtual ports
 on both ALSA (Linux) and CoreMIDI (macOS) via `midir::create_virtual` (unsupported on Windows; not

@@ -154,8 +154,9 @@ in
         (DESIGN §8). capmeshd's (DynamicUser) process joins this group via SupplementaryGroups,
         and a data-plane daemon (e.g. nmidid) admits only peers in it via SO_PEERCRED. The group
         is declared here so it exists on the host; authorize it BY NAME on the data-plane daemon
-        in the deployment (e.g. nmidid's allow-group option) to turn peer-cred enforcement on. The
-        group name is the coordination point — an auto-allocated group has no eval-time gid to pin.
+        in the deployment (e.g. `services.nmidid.allowedGroups = [ config.services.capmesh.group ]`)
+        to turn peer-cred enforcement on. The group name is the coordination point — an
+        auto-allocated group has no eval-time gid to pin.
       '';
     };
 
