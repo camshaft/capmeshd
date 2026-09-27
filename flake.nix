@@ -32,15 +32,45 @@
               mainProgram = "capmeshd";
             };
           };
+
+          # The MIDI data-plane daemon crate. Scoped to `-p nmidid`; midir links ALSA on
+          # Linux and the CoreMIDI/CoreFoundation frameworks on macOS (pkg-config resolves
+          # alsa.pc). doCheck runs the pure dispatch/framing unit tests in the sandbox.
+          nmidid = pkgs.rustPlatform.buildRustPackage {
+            pname = "nmidid";
+            version = "0.1.0";
+            src = self;
+            cargoLock.lockFile = ./Cargo.lock;
+            cargoBuildFlags = [ "-p" "nmidid" ];
+            cargoTestFlags = [ "-p" "nmidid" ];
+            nativeBuildInputs = [ pkgs.pkg-config ];
+            buildInputs = pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [ pkgs.alsa-lib ]
+              ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isDarwin [ pkgs.apple-sdk ];
+            meta = {
+              description = "MIDI data-plane daemon — serves the capmesh-ctl control socket";
+              license = pkgs.lib.licenses.mit;
+              mainProgram = "nmidid";
+            };
+          };
         in
         {
           packages.default = capmeshd;
           packages.capmeshd = capmeshd;
+          packages.nmidid = nmidid;
 
           checks.clippy = capmeshd.overrideAttrs (old: {
             pname = "${old.pname}-clippy";
             nativeBuildInputs = (old.nativeBuildInputs or [ ]) ++ [ pkgs.clippy ];
             buildPhase = "cargo clippy -p capmeshd --all-targets --release -- -D warnings";
+            installPhase = "touch $out";
+            doCheck = false;
+          });
+
+          # nmidid's own gate coverage: clippy over the daemon crate (owned by v-nmidid).
+          checks.nmidid-clippy = nmidid.overrideAttrs (old: {
+            pname = "${old.pname}-clippy";
+            nativeBuildInputs = (old.nativeBuildInputs or [ ]) ++ [ pkgs.clippy ];
+            buildPhase = "cargo clippy -p nmidid --all-targets --release -- -D warnings";
             installPhase = "touch $out";
             doCheck = false;
           });
@@ -87,5 +117,6 @@
     perSystem // {
       nixosModules.default = import ./nix/module.nix { inherit self; };
       nixosModules.capmesh = self.nixosModules.default;
+      nixosModules.nmidid = import ./nix/nmidid-module.nix { inherit self; };
     };
 }
