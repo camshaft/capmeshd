@@ -123,6 +123,20 @@ pub struct RtpPacket {
     pub commands: Vec<MidiCommand>,
 }
 
+/// Number of data bytes that follow a MIDI status byte.
+fn data_bytes_for_status(status: u8) -> usize {
+    match status & 0xF0 {
+        0x80 | 0x90 | 0xA0 | 0xB0 | 0xE0 => 2,
+        0xC0 | 0xD0 => 1,
+        0xF0 => match status {
+            0xF1 | 0xF3 => 1,
+            0xF2 => 2,
+            _ => 0,
+        },
+        _ => 0,
+    }
+}
+
 impl RtpPacket {
     pub fn new(ssrc: u32, sequence: u16, timestamp: u32) -> Self {
         Self {
@@ -195,11 +209,12 @@ impl RtpPacket {
 
         let mut cmd_cursor = Cursor::new(cmd_slice);
         let mut first = true;
+        let mut running_status: Option<u8> = None;
 
         while (cmd_cursor.position() as usize) < cmd_slice.len() {
             let cmd_start = cmd_cursor.position();
 
-            let delta_time = if first && omit_first_delta {
+            let mut delta_time = if first && omit_first_delta {
                 0
             } else {
                 match Self::read_variable_length(&mut cmd_cursor) {
@@ -208,44 +223,48 @@ impl RtpPacket {
                 }
             };
 
-            let status = match cmd_cursor.read_u8() {
+            let status_or_data = match cmd_cursor.read_u8() {
                 Ok(b) => b,
                 Err(_) => break,
             };
 
-            // Heuristic: some senders omit the delta even with Z=0. If we see a non-status
-            // byte (<0x80) where status should be, reinterpret as delta=0 and treat that byte as status.
-            let (delta_time, status) = if status < 0x80 {
-                // rewind and re-read as if delta was zero
-                cmd_cursor.set_position(cmd_start);
-                let status = match cmd_cursor.read_u8() {
-                    Ok(b) => b,
-                    Err(_) => break,
-                };
-                (0, status)
+            // Running status (MIDI 1.0 / RFC 6295): a command may omit its status
+            // byte and reuse the previous one, in which case this byte is already
+            // the first data byte. A byte >= 0x80 is a new status: channel messages
+            // set the running status, System Common (0xF0..=0xF7) cancels it, and
+            // System Real-Time (0xF8..=0xFF) leaves it unchanged.
+            let (status, mut midi_data) = if status_or_data >= 0x80 {
+                match status_or_data {
+                    0xF8..=0xFF => {}
+                    0xF0..=0xF7 => running_status = None,
+                    _ => running_status = Some(status_or_data),
+                }
+                (status_or_data, vec![status_or_data])
+            } else if let Some(rs) = running_status {
+                (rs, vec![rs, status_or_data])
             } else {
-                (delta_time, status)
+                // No running status to reuse and a non-status byte where a status
+                // was expected: the delta reader swallowed a status byte that a
+                // sender declared (Z flag) but did not actually precede with a
+                // delta. Rewind and re-read the first byte as the status, delta 0.
+                cmd_cursor.set_position(cmd_start);
+                match cmd_cursor.read_u8() {
+                    Ok(b) if b >= 0x80 => {
+                        delta_time = 0;
+                        running_status = Some(b);
+                        (b, vec![b])
+                    }
+                    _ => break,
+                }
             };
 
-            let mut midi_data = vec![status];
-            if status >= 0x80 {
-                let data_len = match status & 0xF0 {
-                    0x80 | 0x90 | 0xA0 | 0xB0 | 0xE0 => 2,
-                    0xC0 | 0xD0 => 1,
-                    0xF0 => match status {
-                        0xF1 | 0xF3 => 1,
-                        0xF2 => 2,
-                        _ => 0,
-                    },
-                    _ => 0,
-                };
-
-                for _ in 0..data_len {
-                    if let Ok(b) = cmd_cursor.read_u8() {
-                        midi_data.push(b);
-                    } else {
-                        break;
-                    }
+            // Append any remaining data bytes for this status (the running-status
+            // path already consumed the first one).
+            let data_len = data_bytes_for_status(status);
+            while midi_data.len() - 1 < data_len {
+                match cmd_cursor.read_u8() {
+                    Ok(b) => midi_data.push(b),
+                    Err(_) => break,
                 }
             }
 
@@ -445,6 +464,47 @@ mod tests {
         // Verify third command
         assert_eq!(parsed.commands[2].delta_time, 5);
         assert_eq!(parsed.commands[2].data, vec![0x80, 0x3C, 0x00]);
+    }
+
+    #[test]
+    fn data_bytes_for_status_covers_the_message_types() {
+        assert_eq!(data_bytes_for_status(0x90), 2); // note on
+        assert_eq!(data_bytes_for_status(0x80), 2); // note off
+        assert_eq!(data_bytes_for_status(0xB0), 2); // control change
+        assert_eq!(data_bytes_for_status(0xC0), 1); // program change
+        assert_eq!(data_bytes_for_status(0xD0), 1); // channel pressure
+        assert_eq!(data_bytes_for_status(0xE0), 2); // pitch bend
+        assert_eq!(data_bytes_for_status(0xF2), 2); // song position
+        assert_eq!(data_bytes_for_status(0xF8), 0); // clock (real-time)
+    }
+
+    #[test]
+    fn test_parses_running_status_stream() {
+        // A note stream that reuses the 0x90 status: first note carries the
+        // status, the next two omit it (running status). Short header, Z=0.
+        let mut payload = BytesMut::new();
+        // command list: [0x90 3C 64] [delta=0][3E 64] [delta=0][40 64] = 9 bytes
+        payload.put_u8(0x09); // B=0, Z=0, len=9
+        payload.put_slice(&[0x90, 0x3C, 0x64]); // note on C4 (first, delta omitted)
+        payload.put_slice(&[0x00, 0x3E, 0x64]); // running: note on D4
+        payload.put_slice(&[0x00, 0x40, 0x64]); // running: note on E4
+
+        let header = RtpHeader {
+            sequence: 1,
+            timestamp: 10,
+            ssrc: 0xAABBCCDD,
+            ..Default::default()
+        };
+        let mut buf = BytesMut::new();
+        header.write_to(&mut buf);
+        buf.put(payload);
+
+        let parsed = RtpPacket::parse(&buf.freeze()).unwrap();
+        assert_eq!(parsed.commands.len(), 3);
+        assert_eq!(parsed.commands[0].data, vec![0x90, 0x3C, 0x64]);
+        // The status byte is re-materialized for the running-status commands.
+        assert_eq!(parsed.commands[1].data, vec![0x90, 0x3E, 0x64]);
+        assert_eq!(parsed.commands[2].data, vec![0x90, 0x40, 0x64]);
     }
 
     #[test]
