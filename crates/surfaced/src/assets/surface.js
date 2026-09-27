@@ -70,6 +70,27 @@
     return f;
   }
 
+  // A small "open in new tab" anchor (an escape hatch over an embedded frame).
+  function openLink(url, label) {
+    var a = document.createElement("a");
+    a.className = "openlink";
+    a.href = url; a.target = "_blank"; a.rel = "noopener noreferrer";
+    a.textContent = label;
+    return a;
+  }
+
+  // A centered panel shown when content can't be embedded (e.g. mixed content):
+  // an explanation plus a prominent open-in-new-tab link.
+  function externalFallback(url, message) {
+    var d = document.createElement("div");
+    d.className = "fallback";
+    var p = document.createElement("p");
+    p.textContent = message;
+    d.appendChild(p);
+    d.appendChild(openLink(url, url));
+    return d;
+  }
+
   // Render one display item into the main view.
   function renderMain(it) {
     mainEl.innerHTML = "";
@@ -77,13 +98,25 @@
     switch (it.type) {
       case "navigate":
       case "pdf": {
+        var url = it.url || "";
+        // A browser silently refuses to load an http:// URL inside an https page
+        // (mixed content). Rather than show a doomed blank frame, surface it.
+        if (location.protocol === "https:" && /^http:\/\//i.test(url)) {
+          mainEl.appendChild(externalFallback(url,
+            "This item's URL is http:// and a secure (https) page will not load it inline (mixed content). Open it directly:"));
+          break;
+        }
         // A third-party URL (site or PDF). It keeps its OWN origin (allow-same-origin
         // is safe here because the content is cross-origin — it still cannot touch
         // this page), which is what lets the browser's PDF viewer render inline and
         // real sites work; allow-downloads covers a "save" from the viewer.
+        var wrap = document.createElement("div");
+        wrap.className = "framewrap";
         var f = stage("allow-scripts allow-same-origin allow-popups allow-forms allow-downloads");
-        f.src = it.url;
-        mainEl.appendChild(f);
+        f.src = url;
+        wrap.appendChild(f);
+        wrap.appendChild(openLink(url, "open ↗")); // always an escape hatch
+        mainEl.appendChild(wrap);
         break;
       }
       case "html": {
