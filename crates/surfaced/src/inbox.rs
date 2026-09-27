@@ -52,6 +52,8 @@ pub struct SurfaceView {
     pub id: String,
     pub title: String,
     pub current_view: Option<String>,
+    /// Live browser attachments (open SSE streams) right now.
+    pub attach_count: usize,
     pub items: Vec<InboxItem>,
 }
 
@@ -62,6 +64,8 @@ pub struct SurfaceSummary {
     pub id: String,
     pub title: String,
     pub item_count: usize,
+    /// Live browser attachments (open SSE streams) right now.
+    pub attach_count: usize,
     pub current_view: Option<String>,
 }
 
@@ -103,6 +107,8 @@ impl SurfaceState {
             id: self.id.clone(),
             title: self.title.clone(),
             current_view: self.current_view.clone(),
+            // Live attachments = active broadcast receivers (one per open SSE stream).
+            attach_count: self.tx.receiver_count(),
             items,
         }
     }
@@ -296,6 +302,7 @@ impl SurfaceStore {
                 id: s.id.clone(),
                 title: s.title.clone(),
                 item_count: s.items.len(),
+                attach_count: s.tx.receiver_count(),
                 current_view: s.current_view.clone(),
             })
             .collect();
@@ -660,5 +667,17 @@ mod tests {
         assert!(!dir.path().join("s.jsonl").exists());
         assert!(store.list_surfaces().is_empty());
         assert!(!store.delete("s"));
+    }
+
+    #[test]
+    fn attach_count_tracks_live_subscribers() {
+        let store = SurfaceStore::in_memory();
+        store.ensure("s", None, None);
+        assert_eq!(store.snapshot("s").attach_count, 0);
+        let (_view, rx) = store.subscribe("s");
+        assert_eq!(store.snapshot("s").attach_count, 1);
+        assert_eq!(store.list_surfaces()[0].attach_count, 1);
+        drop(rx);
+        assert_eq!(store.snapshot("s").attach_count, 0);
     }
 }
