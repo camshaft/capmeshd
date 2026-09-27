@@ -9,6 +9,10 @@ description = "MIDI data-plane daemon — serves the capmesh-ctl control socket"
 name = "nmidid"
 path = "src/main.rs"
 
+[[bin]]
+name = "nmidi-fake-source"
+path = "src/bin/fake_source.rs"
+
 [lib]
 name = "nmidid"
 path = "src/lib.rs"
