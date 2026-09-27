@@ -13,6 +13,8 @@
   // carry that token onto the SSE + view subrequests so they authorize too.
   var token = new URLSearchParams(location.search).get("token");
   var tq = token ? ("?token=" + encodeURIComponent(token)) : "";
+  // An item id in the URL hash deep-links to that item; honored once on load.
+  var wantHash = decodeURIComponent((location.hash || "").replace(/^#/, ""));
   var state = { items: [], view: null };
   var mainEl = document.getElementById("main");
   var listEl = document.getElementById("list");
@@ -166,12 +168,10 @@
       li.appendChild(sum); li.appendChild(meta);
       (function (itemId) {
         li.addEventListener("click", function () {
-          // Relative URL: resolves against <base href>, so it works under a
-          // reverse-proxy sub-path (e.g. /surfaced/) as well as at the root.
-          fetch("s/" + encodeURIComponent(id) + "/view" + tq, {
-            method: "POST", headers: { "content-type": "application/json" },
-            body: JSON.stringify({ "item-id": itemId })
-          });
+          // Select locally RIGHT NOW (don't wait on the server round-trip or the
+          // SSE echo — a buffering reverse proxy can delay those), then sync the
+          // choice to the daemon so it broadcasts to any other attached tab.
+          select(itemId, true);
           // Selecting an item closes the drawer so the item shows centered.
           closeFeed();
         });
@@ -185,19 +185,66 @@
     return null;
   }
 
+  function render() { renderMain(currentItem()); renderFeed(); }
+
+  // Reflect the selected item in the URL as a #hash so the link is shareable and
+  // deep-linkable. replaceState (not push) keeps the address current without
+  // stacking a history entry per click; a plain assignment would also scroll.
+  function updateUrl() {
+    var target = state.view
+      ? (location.pathname + location.search + "#" + encodeURIComponent(state.view))
+      : (location.pathname + location.search);
+    try { history.replaceState(null, "", target); } catch (_) {}
+  }
+
+  // Select an item: update the view locally and the URL immediately; when the
+  // selection came from a user action (push), also tell the daemon so it echoes
+  // to other tabs. Server-driven selections (SSE) call this with push=false.
+  function select(itemId, push) {
+    state.view = itemId || null;
+    render();
+    updateUrl();
+    if (push && itemId) {
+      // Relative URL: resolves against <base href>, so it works under a
+      // reverse-proxy sub-path (e.g. /surfaced/) as well as at the root.
+      fetch("s/" + encodeURIComponent(id) + "/view" + tq, {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ "item-id": itemId })
+      });
+    }
+  }
+
+  function hasItem(itemId) {
+    for (var i = 0; i < state.items.length; i++) if (state.items[i].id === itemId) return true;
+    return false;
+  }
+
   function onEvent(ev) {
     if (ev.kind === "snapshot") {
       state.items = ev.surface.items || [];
       state.view = ev.surface["current-view"] || null;
+      // First snapshot: if the URL names an existing item, deep-link to it
+      // (overriding the server's remembered view). Honored once.
+      if (wantHash) {
+        if (hasItem(wantHash)) state.view = wantHash;
+        wantHash = "";
+      }
     } else if (ev.kind === "item") {
       state.items.push(ev.item);
       if (ev.item.promote) state.view = ev.item.id;
     } else if (ev.kind === "view") {
       state.view = ev["current-view"] || null;
     }
-    renderMain(currentItem());
-    renderFeed();
+    render();
+    updateUrl();
   }
+
+  // If the URL hash changes (back/forward, a manually edited or shared link
+  // opened in this tab), follow it to that item and sync the selection.
+  window.addEventListener("hashchange", function () {
+    var h = decodeURIComponent((location.hash || "").replace(/^#/, ""));
+    if (h && h !== state.view && hasItem(h)) select(h, true);
+  });
 
   // Relative URL (resolves against <base href>) — reverse-proxy sub-path safe.
   var src = new EventSource("s/" + encodeURIComponent(id) + "/events" + tq);
