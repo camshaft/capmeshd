@@ -9,6 +9,10 @@
   var m = location.pathname.match(/\/s\/([^\/]+)/);
   var id = m ? decodeURIComponent(m[1]) : "";
   document.getElementById("sid").textContent = id;
+  // A token-protected surface (DESIGN §10.1) is opened at …/s/<id>?token=<t>;
+  // carry that token onto the SSE + view subrequests so they authorize too.
+  var token = new URLSearchParams(location.search).get("token");
+  var tq = token ? ("?token=" + encodeURIComponent(token)) : "";
   var state = { items: [], view: null };
   var mainEl = document.getElementById("main");
   var listEl = document.getElementById("list");
@@ -83,7 +87,7 @@
         li.addEventListener("click", function () {
           // Relative URL: resolves against <base href>, so it works under a
           // reverse-proxy sub-path (e.g. /surfaced/) as well as at the root.
-          fetch("s/" + encodeURIComponent(id) + "/view", {
+          fetch("s/" + encodeURIComponent(id) + "/view" + tq, {
             method: "POST", headers: { "content-type": "application/json" },
             body: JSON.stringify({ "item-id": itemId })
           });
@@ -113,7 +117,7 @@
   }
 
   // Relative URL (resolves against <base href>) — reverse-proxy sub-path safe.
-  var src = new EventSource("s/" + encodeURIComponent(id) + "/events");
+  var src = new EventSource("s/" + encodeURIComponent(id) + "/events" + tq);
   src.onopen = function () { statusEl.textContent = "live"; };
   src.onerror = function () { statusEl.textContent = "reconnecting…"; };
   src.onmessage = function (e) { try { onEvent(JSON.parse(e.data)); } catch (_) {} };

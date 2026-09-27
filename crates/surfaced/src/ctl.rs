@@ -142,7 +142,13 @@ impl Session {
             .get("title")
             .and_then(Value::as_str)
             .map(str::to_string);
-        self.store.ensure(&id, title);
+        // Attach token (DESIGN §10.1): only settable over the local-trust control
+        // socket, never over HTTP. When set, HTTP attachment requires it.
+        let attach_token = params
+            .get("attach-token")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        self.store.ensure(&id, title, attach_token);
         Ok(serde_json::json!({ "id": id }))
     }
 
