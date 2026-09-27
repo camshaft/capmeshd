@@ -302,7 +302,7 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mounts::NullMounter;
+    use crate::mounts::{NullConnector, NullMounter};
     use crate::protocol::{Format, PortDescriptor};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -345,6 +345,7 @@ mod tests {
         let (sr, sw) = tokio::io::split(server);
         let mounts = Arc::new(MountRegistry::new(
             Arc::new(NullMounter),
+            Arc::new(NullConnector),
             Arc::clone(&ports),
         ));
         let handle = tokio::spawn(async move {
@@ -464,6 +465,7 @@ mod tests {
         let ports = sample_ports();
         let mounts = Arc::new(MountRegistry::new(
             Arc::new(NullMounter),
+            Arc::new(NullConnector),
             Arc::clone(&ports),
         ));
         let handle = tokio::spawn(async move {

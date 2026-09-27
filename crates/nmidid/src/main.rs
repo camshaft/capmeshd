@@ -4,6 +4,7 @@ use anyhow::Result;
 use clap::Parser;
 use nmidid::mounts::{MidirMounter, MountRegistry};
 use nmidid::ports::MidirPortProvider;
+use nmidid::pump::RtpConnector;
 use nmidid::server;
 use tracing::{Level, info};
 use tracing_subscriber::FmtSubscriber;
@@ -39,6 +40,10 @@ async fn main() -> Result<()> {
     info!("Starting nmidid, control socket at {}", args.socket);
 
     let ports = Arc::new(MidirPortProvider);
-    let mounts = Arc::new(MountRegistry::new(Arc::new(MidirMounter), ports.clone()));
+    let mounts = Arc::new(MountRegistry::new(
+        Arc::new(MidirMounter),
+        Arc::new(RtpConnector),
+        ports.clone(),
+    ));
     server::run(&args.socket, ports, mounts).await
 }
