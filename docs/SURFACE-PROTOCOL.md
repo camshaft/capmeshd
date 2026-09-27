@@ -231,6 +231,9 @@ the **same** store, so:
   token (a protected surface stays protected), and title.
 - SSE fan-out of pushes/view-changes to attached tabs, plus a live attach count.
 - An **embedded MCP server** (§8) — the agent-facing data-plane API.
+- `GET /` — a health + build probe: `{service, status, version, assets:{js, css}}`. The `assets`
+  fingerprints match the page's `?v=<hash>` asset URLs, so a deploy is verifiable (`curl …/` and
+  compare the `js` hash) rather than guessed.
 
 Later: attach-lifecycle notifications (daemon → capmeshd, e.g. pushing the attach count).
 
