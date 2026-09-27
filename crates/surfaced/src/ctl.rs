@@ -103,6 +103,7 @@ impl Session {
             "send-item" => self.handle_send_item(params),
             "set-view" => self.handle_set_view(params),
             "list-items" => self.handle_list_items(params),
+            "list-surfaces" => self.handle_list_surfaces(),
             other => Err(CtlError::protocol(
                 METHOD_NOT_FOUND,
                 "method-not-found",
@@ -191,6 +192,14 @@ impl Session {
                 "unknown surface or item-id",
             )),
         }
+    }
+
+    fn handle_list_surfaces(&self) -> Result<Value, CtlError> {
+        // Service discovery: which surfaces this daemon offers. A control-plane
+        // op (capmeshd is control + discovery); content push stays data-plane.
+        let surfaces = serde_json::to_value(self.store.list_surfaces())
+            .unwrap_or_else(|_| Value::Array(Vec::new()));
+        Ok(serde_json::json!({ "surfaces": surfaces }))
     }
 
     fn handle_list_items(&self, params: &Value) -> Result<Value, CtlError> {
@@ -400,6 +409,20 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0]["item"]["type"], "pdf");
         assert_eq!(view["current-view"], items[0]["id"]);
+    }
+
+    #[tokio::test]
+    async fn list_surfaces_reports_registered_surfaces() {
+        let store = Arc::new(SurfaceStore::in_memory());
+        let create = serde_json::json!({"jsonrpc":"2.0","id":2,"method":"create-surface",
+            "params":{"surface-id":"phone","title":"Phone"}});
+        let list = serde_json::json!({"jsonrpc":"2.0","id":3,"method":"list-surfaces","params":{}});
+        let out = exchange(store, &[hello(), create, list]).await;
+        let surfaces = out[2]["result"]["surfaces"].as_array().unwrap();
+        assert_eq!(surfaces.len(), 1);
+        assert_eq!(surfaces[0]["id"], "phone");
+        assert_eq!(surfaces[0]["title"], "Phone");
+        assert_eq!(surfaces[0]["item-count"], 0);
     }
 
     #[tokio::test]
