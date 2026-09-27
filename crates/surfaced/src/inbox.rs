@@ -65,6 +65,10 @@ struct SurfaceState {
     /// this surface requires it; `None` means the surface is open. Set via the
     /// (local-trust) control socket, never over HTTP.
     attach_token: Option<String>,
+    /// Lines appended to the on-disk log since the last compaction. When it
+    /// crosses the cap, the log is rewritten to just the retained window so it
+    /// does not grow unbounded (the inbox is bounded — DESIGN §10.1).
+    appends_since_compaction: usize,
     tx: broadcast::Sender<SurfaceEvent>,
 }
 
@@ -77,6 +81,7 @@ impl SurfaceState {
             items: VecDeque::new(),
             current_view: None,
             attach_token: None,
+            appends_since_compaction: 0,
             tx,
         }
     }
@@ -228,6 +233,39 @@ impl SurfaceStore {
         }
     }
 
+    /// Rewrite a surface's on-disk log to exactly `items` (the retained window),
+    /// atomically via a temp file + rename, so the append-only log does not grow
+    /// unbounded. A crash mid-rewrite leaves either the old log or a stray `.tmp`
+    /// (ignored on replay — its extension is not `jsonl`). Called under the store
+    /// lock, so no append can interleave and be lost.
+    fn compact_log(&self, id: &str, items: &VecDeque<InboxItem>) {
+        let Some(path) = self.log_path(id) else {
+            return;
+        };
+        let mut buf = Vec::new();
+        for entry in items {
+            match serde_json::to_vec(entry) {
+                Ok(v) => {
+                    buf.extend_from_slice(&v);
+                    buf.push(b'\n');
+                }
+                Err(e) => {
+                    warn!("serializing inbox item during compaction of '{id}': {e}");
+                    return;
+                }
+            }
+        }
+        let tmp = path.with_extension("tmp");
+        if let Err(e) = std::fs::write(&tmp, &buf) {
+            warn!("writing compaction temp {}: {e}", tmp.display());
+            return;
+        }
+        if let Err(e) = std::fs::rename(&tmp, &path) {
+            warn!("renaming compaction temp to {}: {e}", path.display());
+            let _ = std::fs::remove_file(&tmp);
+        }
+    }
+
     /// Get a read-only snapshot, creating the surface if it does not exist.
     pub fn snapshot(&self, id: &str) -> SurfaceView {
         let mut map = self.inner.lock().expect("store lock");
@@ -286,12 +324,22 @@ impl SurfaceStore {
             promote,
             item,
         };
-        self.append_log(id, &entry);
         let mut map = self.inner.lock().expect("store lock");
         let state = map
             .entry(id.to_string())
             .or_insert_with(|| SurfaceState::new(id.to_string()));
         state.push(entry.clone(), self.cap);
+        // Persist under the lock (serialized with compaction, so an append can
+        // never be lost to a concurrent rewrite).
+        self.append_log(id, &entry);
+        state.appends_since_compaction += 1;
+        // Compact once we have appended a capful of lines: the file then holds at
+        // most ~2×cap lines between compactions, and exactly the retained window
+        // after each (which is what a fresh replay would load anyway).
+        if self.state_dir.is_some() && state.appends_since_compaction >= self.cap {
+            self.compact_log(id, &state.items);
+            state.appends_since_compaction = 0;
+        }
         Pushed {
             entry,
             tx: state.tx.clone(),
@@ -494,5 +542,30 @@ mod tests {
         assert_eq!(snap.items.len(), 3);
         assert_eq!(snap.items[0].item, text("m2"));
         assert_eq!(read_log(dir.path(), "s").unwrap().len(), 5);
+    }
+
+    #[test]
+    fn on_disk_log_is_compacted_and_still_replays_correctly() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = SurfaceStore::with_state_dir(dir.path()).unwrap();
+        store.cap = 3;
+        // Far more pushes than the cap: without compaction the log would be 50
+        // lines; compaction bounds it to ~2×cap.
+        for i in 0..50 {
+            store.push("s", text(&format!("m{i}")), false);
+        }
+        let lines = read_log(dir.path(), "s").unwrap().len();
+        assert!(lines <= 2 * store.cap, "log not compacted: {lines} lines");
+
+        // The in-memory window stays bounded to the cap, newest first-class.
+        let snap = store.snapshot("s");
+        assert_eq!(snap.items.len(), 3);
+        assert_eq!(snap.items.last().unwrap().item, text("m49"));
+
+        // A fresh store replays the compacted log and preserves the newest item.
+        let reborn = SurfaceStore::with_state_dir(dir.path()).unwrap();
+        let rsnap = reborn.snapshot("s");
+        assert_eq!(rsnap.items.len(), lines);
+        assert_eq!(rsnap.items.last().unwrap().item, text("m49"));
     }
 }
