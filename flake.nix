@@ -23,9 +23,10 @@
             # midir and needs its own buildInputs in packages.nmidid). Adding such a
             # member no longer turns `nix flake check` red here.
             cargoBuildFlags = [ "-p" "capmeshd" ];
-            cargoTestFlags = [ "-p" "capmeshd" ];
-            # doCheck (default true) runs `cargo test -p capmeshd` in the sandbox — the
-            # discovery TXT-schema and config-parser unit tests are pure, no network.
+            cargoTestFlags = [ "-p" "capmeshd" "-p" "capmesh-discovery" ];
+            # doCheck (default true) runs `cargo test` for capmeshd and its extracted
+            # `capmesh-discovery` library in the sandbox — the discovery TXT-schema and
+            # config-parser unit tests are pure, no network.
             meta = {
               description = "LAN capability mesh: stateless control-plane daemon (MIDI-first)";
               license = pkgs.lib.licenses.mit;
@@ -80,7 +81,8 @@
           checks.clippy = capmeshd.overrideAttrs (old: {
             pname = "${old.pname}-clippy";
             nativeBuildInputs = (old.nativeBuildInputs or [ ]) ++ [ pkgs.clippy ];
-            buildPhase = "cargo clippy -p capmeshd --all-targets --release -- -D warnings";
+            # Lint capmeshd and its extracted capmesh-discovery library together.
+            buildPhase = "cargo clippy -p capmeshd -p capmesh-discovery --all-targets --release -- -D warnings";
             installPhase = "touch $out";
             doCheck = false;
           });

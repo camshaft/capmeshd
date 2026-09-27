@@ -10,6 +10,7 @@ name = "capmeshd"
 path = "src/main.rs"
 
 [dependencies]
+capmesh-discovery = { path = "../capmesh-discovery" }
 tokio.workspace = true
 mdns-sd.workspace = true
 serde.workspace = true
