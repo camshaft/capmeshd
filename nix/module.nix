@@ -146,6 +146,18 @@ in
       description = "Path to the cluster credential (DESIGN §8 trust boundary).";
     };
 
+    group = lib.mkOption {
+      type = lib.types.str;
+      default = "capmesh";
+      description = ''
+        Shared local group that gates access to first-party data-plane control sockets
+        (DESIGN §8). capmeshd's (DynamicUser) process joins this group via SupplementaryGroups,
+        and a data-plane daemon (e.g. nmidid) admits only peers in it via SO_PEERCRED. The group
+        is declared here so it exists on the host; point `services.nmidid.allowedGids` at
+        `config.users.groups.<this>.gid` in the deployment to turn peer-cred enforcement on.
+      '';
+    };
+
     advertise = lib.mkOption {
       type = lib.types.attrsOf advertiseModule;
       default = { };
@@ -166,6 +178,10 @@ in
   config = lib.mkIf cfg.enable {
     environment.etc."capmesh/capmesh.toml".source = configFile;
 
+    # The shared local trust-boundary group (DESIGN §8). Declared with no explicit gid so it
+    # merges cleanly when a data-plane daemon module (e.g. services.nmidid) declares it too.
+    users.groups.${cfg.group} = { };
+
     systemd.services.capmesh = {
       description = "capmesh capability-mesh control plane";
       wantedBy = [ "multi-user.target" ];
@@ -175,7 +191,10 @@ in
         ExecStart = "${cfg.package}/bin/capmeshd --config /etc/capmesh/capmesh.toml";
         Restart = "on-failure";
         RestartSec = 2;
+        # Keep the DynamicUser sandbox; join the shared capmesh group so the data-plane
+        # daemon's SO_PEERCRED gid check (DESIGN §8) admits this client once enforcement is on.
         DynamicUser = true;
+        SupplementaryGroups = [ cfg.group ];
       };
     };
   };

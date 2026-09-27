@@ -335,6 +335,12 @@ The trust boundary is **exactly the set of hosts managed by `dotfiles`** — cle
 - **mDNS discovery is convenient-but-untrusted.** Third-party advertisements (`_octoprint._tcp`,
   Cast, a stray daemon) may be *seen* in `discover` but are **never auto-wired** — wiring an
   untrusted source requires an explicit operator opt-in.
+- **The local control socket is gated by a shared group.** A data-plane daemon reads the connecting
+  peer's OS credentials (`SO_PEERCRED`) and admits only its own uid plus members of a shared, stable
+  `capmesh` group; capmeshd's process (kept under `DynamicUser`) joins that group via
+  `SupplementaryGroups`. This keeps a co-resident non-capmesh process off the control socket even
+  behind the `0o660` socket perms. Enforcement is opt-in per host — the deployment points the
+  daemon's allowed-gids at `config.users.groups.capmesh.gid` (§9) — and defaults off (non-breaking).
 - **Path to mTLS/WireGuard** underlay later with no protocol change (the descriptor-fetch and
   control channel are designed to carry it).
 
