@@ -6,9 +6,11 @@
 //! driving the mount `connecting → active` and accumulating `bytes-in`. This is
 //! the piece that makes a remote keyboard actually play a local instrument.
 //!
-//! Timestamp-accurate scheduling (full AppleMIDI clock sync) is a refinement:
-//! today we respond to the remote's clock-sync probes minimally and forward
-//! MIDI as it arrives, which is correct for live play.
+//! Packets are gated by RTP sequence number ([`SeqGate`]) so a reordered or
+//! duplicated datagram never replays already-played MIDI; the rest forward as
+//! they arrive. Timestamp-accurate scheduling (full AppleMIDI clock sync) is a
+//! refinement: today we respond to the remote's clock-sync probes minimally,
+//! which is correct for live play.
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -28,6 +30,29 @@ use crate::protocol::{MountState, MountStatus, RemoteEndpoint};
 /// How long to wait for `InvitationAccepted` before retrying, and how many times.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const HANDSHAKE_ATTEMPTS: u32 = 3;
+
+/// Drops stale or duplicate RTP packets by sequence number, so a reordered or
+/// retransmitted datagram never replays MIDI that has already been played (a
+/// replayed note-on/off would double-trigger the instrument).
+#[derive(Default)]
+struct SeqGate {
+    last: Option<u16>,
+}
+
+impl SeqGate {
+    /// Admit `seq` if it is the first packet of the session, or newer than the
+    /// last admitted one under 16-bit wraparound (RFC 1982 serial arithmetic:
+    /// the shorter direction around the ring is "newer").
+    fn admit(&mut self, seq: u16) -> bool {
+        let newer = self
+            .last
+            .is_none_or(|l| seq != l && seq.wrapping_sub(l) < 0x8000);
+        if newer {
+            self.last = Some(seq);
+        }
+        newer
+    }
+}
 
 /// Production connector: spawns the AppleMIDI handshake + RTP-MIDI pump.
 pub struct RtpConnector;
@@ -114,10 +139,17 @@ async fn run_pump(
     transition(&status, &notifier, MountState::Active, None);
 
     let started = Instant::now();
+    let mut gate = SeqGate::default();
     loop {
         tokio::select! {
             data = sockets.recv_data() => match data {
-                Ok((packet, _)) => forward_rtp(&packet, sink.as_ref(), &status),
+                Ok((packet, _)) => {
+                    if gate.admit(packet.header.sequence) {
+                        forward_rtp(&packet, sink.as_ref(), &status);
+                    } else {
+                        debug!("dropping stale/duplicate RTP packet seq {}", packet.header.sequence);
+                    }
+                }
                 Err(e) => debug!("data recv error: {e}"),
             },
             control = sockets.recv_control() => match control {
@@ -232,6 +264,25 @@ mod tests {
         assert_eq!(s.state, MountState::Active);
         assert_eq!(s.stats.bytes_in, 6);
         assert!(s.stats.last_event.is_some());
+    }
+
+    #[test]
+    fn seq_gate_admits_first_and_newer_drops_stale_and_dupes() {
+        let mut g = SeqGate::default();
+        assert!(g.admit(100)); // first packet always admitted
+        assert!(g.admit(101)); // strictly newer
+        assert!(!g.admit(101)); // duplicate dropped
+        assert!(!g.admit(50)); // stale (out-of-order older) dropped
+        assert!(g.admit(102)); // resume forward progress
+    }
+
+    #[test]
+    fn seq_gate_handles_16bit_wraparound() {
+        let mut g = SeqGate::default();
+        assert!(g.admit(65535));
+        assert!(g.admit(0)); // 0 is one past 65535 → newer across the wrap
+        assert!(g.admit(1));
+        assert!(!g.admit(65535)); // now behind by 2 → stale
     }
 
     #[test]
