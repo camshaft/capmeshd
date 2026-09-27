@@ -173,8 +173,16 @@
                   })
                 ];
               };
+              # The capmeshd service must join the shared trust-boundary group (DESIGN §8)
+              # while keeping the DynamicUser sandbox, and the group must be declared.
+              supGroups = toString (sys.config.systemd.services.capmesh.serviceConfig.SupplementaryGroups or [ ]);
+              dynUser = pkgs.lib.boolToString (sys.config.systemd.services.capmesh.serviceConfig.DynamicUser or false);
+              hasGroup = pkgs.lib.boolToString (sys.config.users.groups ? capmesh);
             in
-            pkgs.runCommand "capmesh-module-render" { } ''
+            pkgs.runCommand "capmesh-module-render"
+              {
+                inherit supGroups dynUser hasGroup;
+              } ''
               cp ${sys.config.environment.etc."capmesh/capmesh.toml".source} rendered.toml
               cat rendered.toml
               grep -q 'host-id = "check-host"' rendered.toml
@@ -183,6 +191,11 @@
               grep -q '\[\[permanent-mount\]\]' rendered.toml
               grep -q 'port-id = "kbd-0"' rendered.toml
               grep -q 'addr = "192.168.1.23"' rendered.toml
+              # §8 trust boundary: capmesh group joined, group declared, sandbox kept.
+              printf 'SupplementaryGroups=%s DynamicUser=%s hasGroup=%s\n' "$supGroups" "$dynUser" "$hasGroup"
+              [ "$supGroups" = "capmesh" ]
+              [ "$dynUser" = "true" ]
+              [ "$hasGroup" = "true" ]
               cp rendered.toml $out
             '';
 
