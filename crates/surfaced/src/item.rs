@@ -1,0 +1,71 @@
+//! The display-item model — what a `send` pushes to a surface (DESIGN §10.1).
+//!
+//! A [`DisplayItem`] is the payload the MCP `send` verb and the control-socket
+//! `send-item` carry. It is internally tagged by `type` so the wire form is the
+//! `{navigate|pdf|text|link|html|script, ...}` shape the design fixes. Each push
+//! becomes an [`InboxItem`]: a display item plus its identity, timestamp, and
+//! whether it also promotes to the surface's main view.
+
+use serde::{Deserialize, Serialize};
+
+/// A single thing pushed to a surface for display (DESIGN §10.1 built-in types).
+///
+/// `navigate`/`pdf` render a third-party URL inside a sandboxed iframe (untrusted
+/// web content is contained, never injected). `html`/`script` are same-origin to
+/// `surfaced` and fully trusted — safe because `send` is trust-boundary-gated
+/// (DESIGN §8): only cluster-authenticated hosts may push.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+pub enum DisplayItem {
+    /// An iframe pointed at a third-party URL (one thing among many).
+    Navigate { url: String },
+    /// A PDF viewer (the "put this manual page on my phone" case).
+    Pdf { url: String },
+    /// A plain-text note.
+    Text { body: String },
+    /// A clickable link, optionally titled.
+    Link {
+        url: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+    },
+    /// Arbitrary same-origin DOM we control.
+    Html { markup: String },
+    /// Arbitrary JS run in the surface page — the full scripting escape hatch.
+    Script { code: String },
+}
+
+impl DisplayItem {
+    /// A short, human-readable label for the inbox feed (never renders the raw
+    /// body/markup/code — just names the item).
+    pub fn summary(&self) -> String {
+        match self {
+            DisplayItem::Navigate { url } => format!("navigate → {url}"),
+            DisplayItem::Pdf { url } => format!("pdf → {url}"),
+            DisplayItem::Text { body } => {
+                let head: String = body.chars().take(60).collect();
+                format!("text: {head}")
+            }
+            DisplayItem::Link { url, title } => match title {
+                Some(t) => format!("link: {t} ({url})"),
+                None => format!("link: {url}"),
+            },
+            DisplayItem::Html { .. } => "html".to_string(),
+            DisplayItem::Script { .. } => "script".to_string(),
+        }
+    }
+}
+
+/// One entry in a surface's durable, ordered inbox: a display item with its
+/// identity, push time (unix millis), and whether it promoted to the main view.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InboxItem {
+    /// Stable id assigned at push (a v4 UUID); the main-view selector key.
+    pub id: String,
+    /// Push time, unix epoch milliseconds.
+    pub ts: u64,
+    /// Whether this push also promoted to the main view (§10.1).
+    pub promote: bool,
+    /// The pushed display item.
+    pub item: DisplayItem,
+}

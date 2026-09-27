@@ -1,0 +1,30 @@
+[package]
+name = "surfaced"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Browser surface data-plane daemon — durable, scriptable display sinks on the mesh"
+
+[[bin]]
+name = "surfaced"
+path = "src/main.rs"
+
+[lib]
+name = "surfaced"
+path = "src/lib.rs"
+
+[dependencies]
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+axum = "0.8"
+tokio-stream = { version = "0.1", features = ["sync"] }
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+tempfile = "3"
