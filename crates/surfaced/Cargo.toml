@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "Browser surface data-plane daemon — durable, scriptable display sinks on the mesh"
+readme = "README.md"
 
 [[bin]]
 name = "surfaced"
