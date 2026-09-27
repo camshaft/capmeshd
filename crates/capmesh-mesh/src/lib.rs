@@ -147,6 +147,69 @@ pub mod server {
         out.extend_from_slice(body);
         out
     }
+
+    /// Supplies the live snapshot of the host's capability descriptors for each request — a
+    /// read-only projection built on demand (MESH-PROTOCOL §4). capmeshd implements this over
+    /// its `capmesh-ctl` clients; keeping it a trait lets `capmesh-mesh` stay transport-only.
+    pub trait CapabilityProvider: Send + Sync {
+        /// The capabilities this host currently exposes.
+        fn caps(&self) -> impl std::future::Future<Output = Vec<CapabilityDescriptor>> + Send;
+    }
+
+    /// Serve the mesh control endpoint on `listener` until it errors: accept a connection,
+    /// answer one `GET /caps` / `GET /caps/<id>` from the provider's live snapshot, and close.
+    /// Each connection is handled in its own task so a slow client cannot block the endpoint.
+    pub async fn serve<P>(listener: tokio::net::TcpListener, provider: std::sync::Arc<P>)
+    where
+        P: CapabilityProvider + 'static,
+    {
+        loop {
+            let (stream, _peer) = match listener.accept().await {
+                Ok(pair) => pair,
+                Err(e) => {
+                    tracing::warn!("mesh endpoint accept failed: {e}");
+                    continue;
+                }
+            };
+            let provider = std::sync::Arc::clone(&provider);
+            tokio::spawn(async move {
+                if let Err(e) = handle_conn(stream, provider.as_ref()).await {
+                    tracing::debug!("mesh endpoint connection error: {e}");
+                }
+            });
+        }
+    }
+
+    /// Read one request, route it against a fresh provider snapshot, and write the response.
+    async fn handle_conn<P: CapabilityProvider>(
+        mut stream: tokio::net::TcpStream,
+        provider: &P,
+    ) -> std::io::Result<()> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // Read the request head until the blank line (a GET has no body), bounded so a peer
+        // cannot stream unbounded bytes at the endpoint.
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 1024];
+        loop {
+            let n = stream.read(&mut chunk).await?;
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            if super::find(&buf, b"\r\n\r\n").is_some() || buf.len() > 16 * 1024 {
+                break;
+            }
+        }
+
+        let (status, body) = match parse_get_path(&buf) {
+            Some(path) => route(&path, &provider.caps().await),
+            None => (400, error_body("bad-request")),
+        };
+        stream.write_all(&http_response(status, &body)).await?;
+        stream.flush().await?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -280,6 +343,49 @@ mod server_tests {
         assert!(text.contains("Content-Length: 11\r\n"));
         assert!(text.contains("Connection: close\r\n"));
         assert!(text.ends_with(r#"{"caps":[]}"#));
+    }
+
+    /// The full `serve` accept loop answers a `fetch_capability` over loopback TCP — the
+    /// browsing half hits the serving half end-to-end through the real endpoint.
+    #[tokio::test]
+    async fn serve_answers_a_fetch() {
+        use std::net::Ipv4Addr;
+        use std::sync::Arc;
+        use tokio::net::TcpListener;
+
+        struct Fixed(Vec<CapabilityDescriptor>);
+        impl CapabilityProvider for Fixed {
+            async fn caps(&self) -> Vec<CapabilityDescriptor> {
+                self.0.clone()
+            }
+        }
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let provider = Arc::new(Fixed(vec![cap("green-machine-midi", "midi")]));
+        tokio::spawn(async move { serve(listener, provider).await });
+
+        // /caps/<id>
+        let one = super::fetch_capability(
+            Ipv4Addr::LOCALHOST.into(),
+            port,
+            "/caps/green-machine-midi",
+        )
+        .await
+        .unwrap();
+        assert_eq!(one.id, "green-machine-midi");
+
+        // /caps
+        let all = super::fetch_all(Ipv4Addr::LOCALHOST.into(), port)
+            .await
+            .unwrap();
+        assert_eq!(all.caps.len(), 1);
+
+        // unknown id → 404 → Http error
+        let err = super::fetch_capability(Ipv4Addr::LOCALHOST.into(), port, "/caps/nope")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, super::MeshError::Http { status: 404 }));
     }
 
     /// The server core frames a response the client half parses back (end-to-end over
