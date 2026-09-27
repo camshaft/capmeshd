@@ -372,6 +372,93 @@ mod tests {
         pump.abort();
     }
 
+    /// The pump answers the remote's clock-sync probe: a `CK0` must be met with
+    /// a `CK1` that echoes `timestamp1` — the keep-alive a live AppleMIDI
+    /// session relies on to stay up.
+    #[tokio::test]
+    async fn pump_answers_clock_sync_ck0_with_ck1() {
+        use tokio::net::UdpSocket;
+
+        let fake_ctl = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let fake_ctl_port = fake_ctl.local_addr().unwrap().port();
+
+        let ck1 = Arc::new(Mutex::new(None::<AppleMidiPacket>));
+        let ck1_w = Arc::clone(&ck1);
+        tokio::spawn(async move {
+            let mut buf = [0u8; 2048];
+            // Accept the invitation.
+            let (n, from) = fake_ctl.recv_from(&mut buf).await.unwrap();
+            let AppleMidiPacket::Invitation { token, ssrc, .. } =
+                AppleMidiPacket::parse(&buf[..n]).unwrap()
+            else {
+                return;
+            };
+            let accept = AppleMidiPacket::InvitationAccepted {
+                version: APPLEMIDI_VERSION,
+                token,
+                ssrc,
+                name: "fake-peer".to_string(),
+            };
+            fake_ctl.send_to(&accept.to_bytes(), from).await.unwrap();
+
+            // Probe with CK0 and capture the CK1 reply.
+            let ck0 = AppleMidiPacket::Synchronization {
+                ssrc,
+                count: 0,
+                timestamp1: 0xDEAD_BEEF,
+                timestamp2: 0,
+                timestamp3: 0,
+            };
+            fake_ctl.send_to(&ck0.to_bytes(), from).await.unwrap();
+            loop {
+                let (n, _) = fake_ctl.recv_from(&mut buf).await.unwrap();
+                if let Ok(p @ AppleMidiPacket::Synchronization { .. }) =
+                    AppleMidiPacket::parse(&buf[..n])
+                {
+                    *ck1_w.lock().unwrap() = Some(p);
+                    break;
+                }
+            }
+        });
+
+        let status = connecting_status();
+        let (notifier, _rx) = broadcast::channel(8);
+        let remote = RemoteEndpoint {
+            host: None,
+            addr: "127.0.0.1".to_string(),
+            port: fake_ctl_port,
+            port_id: "source-0".to_string(),
+        };
+        let pump = tokio::spawn(run_pump(
+            remote,
+            Box::new(RecordingSink::new()),
+            Arc::clone(&status),
+            notifier,
+        ));
+
+        let reply = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(p) = ck1.lock().unwrap().clone() {
+                    break p;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("received a CK1 reply within timeout");
+
+        match reply {
+            AppleMidiPacket::Synchronization {
+                count, timestamp1, ..
+            } => {
+                assert_eq!(count, 1, "reply must be CK1");
+                assert_eq!(timestamp1, 0xDEAD_BEEF, "CK1 echoes the CK0 timestamp1");
+            }
+            other => panic!("expected Synchronization, got {other:?}"),
+        }
+        pump.abort();
+    }
+
     /// A remote that explicitly rejects the invitation must fail the mount
     /// *fast* — within the handshake, not by spinning to the multi-attempt
     /// timeout — and carry a rejection detail.
