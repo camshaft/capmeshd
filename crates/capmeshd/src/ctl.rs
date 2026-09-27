@@ -163,6 +163,72 @@ pub struct MountStatusResult {
     pub mounts: Vec<MountStatus>,
 }
 
+/// An unsolicited daemon→client notification (§5). capmeshd re-advertises / re-reconciles
+/// on these — this is what powers self-heal and auto-mount without polling.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Notification {
+    /// A device appeared (hot-plug) — gated behind the `hotplug-events` capability.
+    PortAdded(PortDescriptor),
+    /// A device went away → dependent mounts should be torn down.
+    PortRemoved { port_id: String },
+    /// A mount changed state (§3.2) — the reconciler self-heals off this.
+    MountState {
+        mount_id: String,
+        state: MountState,
+        detail: Option<String>,
+        stats: Option<MountStats>,
+    },
+    /// A notification method this client version does not model (forward-compat).
+    Other { method: String },
+}
+
+impl Notification {
+    /// Parse a notification from its `method` + `params` (§5).
+    fn from_method(method: &str, params: serde_json::Value) -> Result<Self, serde_json::Error> {
+        Ok(match method {
+            "port-added" => {
+                #[derive(Deserialize)]
+                struct P {
+                    port: PortDescriptor,
+                }
+                Notification::PortAdded(serde_json::from_value::<P>(params)?.port)
+            }
+            "port-removed" => {
+                #[derive(Deserialize)]
+                struct P {
+                    #[serde(rename = "port-id")]
+                    port_id: String,
+                }
+                Notification::PortRemoved {
+                    port_id: serde_json::from_value::<P>(params)?.port_id,
+                }
+            }
+            "mount-state" => {
+                #[derive(Deserialize)]
+                struct P {
+                    #[serde(rename = "mount-id")]
+                    mount_id: String,
+                    state: MountState,
+                    #[serde(default)]
+                    detail: Option<String>,
+                    #[serde(default)]
+                    stats: Option<MountStats>,
+                }
+                let p: P = serde_json::from_value(params)?;
+                Notification::MountState {
+                    mount_id: p.mount_id,
+                    state: p.state,
+                    detail: p.detail,
+                    stats: p.stats,
+                }
+            }
+            other => Notification::Other {
+                method: other.to_string(),
+            },
+        })
+    }
+}
+
 /// The `data` object of a JSON-RPC error — carries the machine `code` (§6).
 #[derive(Debug, Clone, Deserialize)]
 struct RpcErrorData {
@@ -327,7 +393,8 @@ impl CtlClient {
         self.read_response().await
     }
 
-    async fn read_response(&mut self) -> Result<serde_json::Value, CtlError> {
+    /// Read the next non-empty JSON frame (one NDJSON line) from the socket.
+    async fn read_line_value(&mut self) -> Result<serde_json::Value, CtlError> {
         loop {
             self.line.clear();
             let n = self.reader.read_line(&mut self.line).await?;
@@ -338,7 +405,13 @@ impl CtlClient {
             if trimmed.is_empty() {
                 continue;
             }
-            let value: serde_json::Value = serde_json::from_str(trimmed)?;
+            return Ok(serde_json::from_str(trimmed)?);
+        }
+    }
+
+    async fn read_response(&mut self) -> Result<serde_json::Value, CtlError> {
+        loop {
+            let value = self.read_line_value().await?;
             // A daemon→client notification (a `method`, no `id`) — skip; not our reply.
             if value.get("method").is_some() && value.get("id").is_none() {
                 continue;
@@ -355,6 +428,24 @@ impl CtlClient {
                 });
             }
             return Ok(resp.result.unwrap_or(serde_json::Value::Null));
+        }
+    }
+
+    /// Await the next unsolicited daemon→client notification (§5). Skips response frames
+    /// (no request is outstanding in the listen phase). This is what the reconciler reacts
+    /// to instead of polling `mount-status` once the daemon emits mount-state / hotplug.
+    pub async fn next_notification(&mut self) -> Result<Notification, CtlError> {
+        loop {
+            let value = self.read_line_value().await?;
+            let method = match value.get("method").and_then(|m| m.as_str()) {
+                Some(m) => m.to_string(),
+                None => continue, // a response with no outstanding request — ignore
+            };
+            let params = value
+                .get("params")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            return Ok(Notification::from_method(&method, params)?);
         }
     }
 }
@@ -548,5 +639,89 @@ mod tests {
         // Connect-by-IP (DESIGN §5): a `.local`/`.lan` name must not deserialize.
         let json = r#"{"host":"laptop","addr":"keyboard.local","port":5004,"port-id":"kbd-0"}"#;
         assert!(serde_json::from_str::<RemoteEndpoint>(json).is_err());
+    }
+
+    #[test]
+    fn parses_notification_variants() {
+        let ms = Notification::from_method(
+            "mount-state",
+            serde_json::json!({"mount-id":"m1","state":"active",
+                "stats":{"bytes-in":42,"bytes-out":0},"detail":null}),
+        )
+        .unwrap();
+        match ms {
+            Notification::MountState {
+                mount_id,
+                state,
+                stats,
+                ..
+            } => {
+                assert_eq!(mount_id, "m1");
+                assert_eq!(state, MountState::Active);
+                assert_eq!(stats.unwrap().bytes_in, 42);
+            }
+            other => panic!("expected MountState, got {other:?}"),
+        }
+
+        let pr = Notification::from_method("port-removed", serde_json::json!({"port-id":"kbd-0"}))
+            .unwrap();
+        assert_eq!(
+            pr,
+            Notification::PortRemoved {
+                port_id: "kbd-0".into()
+            }
+        );
+
+        let unknown = Notification::from_method("something-new", serde_json::json!({})).unwrap();
+        assert_eq!(
+            unknown,
+            Notification::Other {
+                method: "something-new".into()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn next_notification_reads_a_mount_state_over_a_socket() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader as TokioBufReader};
+        use tokio::net::UnixListener;
+
+        let path = std::env::temp_dir().join(format!(
+            "capmesh-notif-{}-{}.sock",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (r, mut w) = stream.into_split();
+            let mut lines = TokioBufReader::new(r).lines();
+            // hello
+            let _ = lines.next_line().await.unwrap().unwrap();
+            w.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocol\":\"1\",\"daemon\":\"nmidid/0.1\",\"capabilities\":[]}}\n").await.unwrap();
+            // then an unsolicited mount-state notification (no id)
+            w.write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"mount-state\",\"params\":{\"mount-id\":\"m1\",\"state\":\"active\"}}\n").await.unwrap();
+        });
+
+        let mut client = CtlClient::connect(&path).await.unwrap();
+        client.hello().await.unwrap();
+        let n = client.next_notification().await.unwrap();
+        assert_eq!(
+            n,
+            Notification::MountState {
+                mount_id: "m1".into(),
+                state: MountState::Active,
+                detail: None,
+                stats: None,
+            }
+        );
+
+        server.await.unwrap();
+        let _ = std::fs::remove_file(&path);
     }
 }
