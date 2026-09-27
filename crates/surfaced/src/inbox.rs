@@ -182,6 +182,31 @@ impl SurfaceStore {
             .map(|d| d.join(format!("{id}.jsonl")))
     }
 
+    /// Path of the per-surface view sidecar. The item log is append-only and only
+    /// records item pushes, so the main-view selection (which the item log cannot
+    /// express) is persisted separately here. Its extension is not `jsonl`, so
+    /// replay never mistakes it for the item log.
+    fn view_path(&self, id: &str) -> Option<PathBuf> {
+        self.state_dir.as_ref().map(|d| d.join(format!("{id}.view")))
+    }
+
+    /// Persist the current main view for a surface, so a selection survives a
+    /// restart (the item log alone would replay the last *promoted* item). Best
+    /// effort: a write failure is logged, not fatal.
+    fn write_view(&self, id: &str, current_view: Option<&str>) {
+        let Some(path) = self.view_path(id) else {
+            return;
+        };
+        match serde_json::to_vec(&current_view) {
+            Ok(buf) => {
+                if let Err(e) = std::fs::write(&path, &buf) {
+                    warn!("writing view sidecar {}: {e}", path.display());
+                }
+            }
+            Err(e) => warn!("serializing view for '{id}': {e}"),
+        }
+    }
+
     /// Load every `<id>.jsonl` log under the state dir into memory.
     fn replay(&mut self) -> Result<()> {
         let Some(dir) = self.state_dir.clone() else {
@@ -215,6 +240,21 @@ impl SurfaceStore {
                     Ok(item) => state.push(item, cap),
                     Err(e) => warn!("skipping malformed log line in {}: {e}", path.display()),
                 }
+            }
+            // The item log replays the last *promoted* item as the view; a saved
+            // sidecar (an explicit selection) overrides it. Honor `null` (no
+            // selection) as recorded; ignore a selection whose item has since
+            // fallen out of the retained window, keeping the log-derived view.
+            // (Read via the local `dir` — `map` holds a `&mut self.inner` here.)
+            let saved_view = std::fs::read_to_string(dir.join(format!("{id}.view")))
+                .ok()
+                .and_then(|t| serde_json::from_str::<Option<String>>(t.trim()).ok());
+            match saved_view {
+                Some(Some(item_id)) if state.items.iter().any(|i| i.id == item_id) => {
+                    state.current_view = Some(item_id);
+                }
+                Some(None) => state.current_view = None,
+                _ => {}
             }
             debug!("replayed surface '{id}' with {} items", state.items.len());
             map.insert(id.to_string(), state);
@@ -346,6 +386,8 @@ impl SurfaceStore {
         {
             warn!("truncating log {}: {e}", path.display());
         }
+        // The inbox is empty, so the view is none — persist that.
+        self.write_view(id, None);
         let _ = state.tx.send(SurfaceEvent::Snapshot {
             surface: state.view(self.cap),
         });
@@ -363,6 +405,14 @@ impl SurfaceStore {
             && let Err(e) = std::fs::remove_file(&path)
         {
             warn!("removing log {}: {e}", path.display());
+        }
+        // Drop the view sidecar too, so a re-created surface of the same id does
+        // not inherit the deleted surface's selection.
+        if let Some(path) = self.view_path(id)
+            && path.exists()
+            && let Err(e) = std::fs::remove_file(&path)
+        {
+            warn!("removing view sidecar {}: {e}", path.display());
         }
         removed
     }
@@ -413,6 +463,11 @@ impl SurfaceStore {
             self.compact_log(id, &state.items);
             state.appends_since_compaction = 0;
         }
+        // A promoting push moved the main view; persist it so a restart restores
+        // this item as the view rather than reverting to the last promoted one.
+        if promote {
+            self.write_view(id, state.current_view.as_deref());
+        }
         Pushed {
             entry,
             tx: state.tx.clone(),
@@ -420,8 +475,9 @@ impl SurfaceStore {
     }
 
     /// Set the main view to `item_id` (which must name an existing item), or to
-    /// none. Returns `true` if applied. Not persisted across restart in this
-    /// increment (the log replays the last promoted item as the view).
+    /// none. Returns the broadcast handle if applied. The selection is persisted
+    /// to the view sidecar, so it survives a restart (rather than reverting to
+    /// the last promoted item, which is all the item log can express).
     pub fn set_view(
         &self,
         id: &str,
@@ -437,6 +493,7 @@ impl SurfaceStore {
         } else {
             state.current_view = None;
         }
+        self.write_view(id, state.current_view.as_deref());
         Some(state.tx.clone())
     }
 }
@@ -601,6 +658,40 @@ mod tests {
         assert_eq!(snap.items[2].item, text("three"));
         // The main view is the last promoted item after replay.
         assert_eq!(snap.current_view, Some(snap.items[2].id.clone()));
+    }
+
+    #[test]
+    fn set_view_selection_survives_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+        let first_id;
+        {
+            let store = SurfaceStore::with_state_dir(&path).unwrap();
+            let a = store.push("phone", text("one"), true);
+            first_id = a.entry.id.clone();
+            store.push("phone", text("two"), true);
+            // Explicitly select the FIRST (older, non-promoted-latest) item.
+            assert!(store.set_view("phone", Some(&first_id)).is_some());
+        }
+        // A fresh store restores the explicit selection, not the last promoted one.
+        let reborn = SurfaceStore::with_state_dir(&path).unwrap();
+        assert_eq!(reborn.snapshot("phone").current_view, Some(first_id));
+    }
+
+    #[test]
+    fn explicit_none_view_survives_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+        {
+            let store = SurfaceStore::with_state_dir(&path).unwrap();
+            store.push("phone", text("one"), true);
+            // Deselect: the view is none even though an item exists.
+            assert!(store.set_view("phone", None).is_some());
+        }
+        let reborn = SurfaceStore::with_state_dir(&path).unwrap();
+        let snap = reborn.snapshot("phone");
+        assert_eq!(snap.items.len(), 1);
+        assert_eq!(snap.current_view, None);
     }
 
     #[test]
