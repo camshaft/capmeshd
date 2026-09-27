@@ -338,9 +338,13 @@ The trust boundary is **exactly the set of hosts managed by `dotfiles`** — cle
 - **The local control socket is gated by a shared group.** A data-plane daemon reads the connecting
   peer's OS credentials (`SO_PEERCRED`) and admits only its own uid plus members of a shared, stable
   `capmesh` group; capmeshd's process (kept under `DynamicUser`) joins that group via
-  `SupplementaryGroups`. This keeps a co-resident non-capmesh process off the control socket even
-  behind the `0o660` socket perms. Enforcement is opt-in per host — the deployment points the
-  daemon's allowed-gids at `config.users.groups.capmesh.gid` (§9) — and defaults off (non-breaking).
+  `SupplementaryGroups`. Because `capmesh` is a *supplementary* group on the DynamicUser (whose
+  primary gid is the transient dynamic one), the daemon matches the peer's **full** group set, not
+  just its primary gid. This keeps a co-resident non-capmesh process off the control socket even
+  behind the `0o660` socket perms. The group is authorized **by name** — an auto-allocated group's
+  gid is not known at module-eval time, so the deployment enables enforcement by naming the shared
+  group on the daemon (§9), never by pinning a numeric gid. Enforcement is opt-in per host and
+  defaults off (non-breaking).
 - **Path to mTLS/WireGuard** underlay later with no protocol change (the descriptor-fetch and
   control channel are designed to carry it).
 
