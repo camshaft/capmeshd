@@ -242,8 +242,22 @@ fn unauthorized() -> Response {
     (StatusCode::UNAUTHORIZED, "attach token required\n").into_response()
 }
 
-async fn health() -> &'static str {
-    "surfaced: ok\n"
+/// Health + build probe. Returns 200 with the running version and the current
+/// asset fingerprints, so a deploy can be verified without guessing: `curl …/`
+/// and check `assets.js` matches the built frontend's hash (the fingerprint that
+/// drives the page's `?v=` cache-busting). This is the answer to "did my redeploy
+/// actually take?".
+async fn health() -> Response {
+    Json(json!({
+        "service": "surfaced",
+        "status": "ok",
+        "version": env!("CARGO_PKG_VERSION"),
+        "assets": {
+            "js": asset_hash(SURFACE_JS),
+            "css": asset_hash(SURFACE_CSS),
+        },
+    }))
+    .into_response()
 }
 
 async fn page(
@@ -498,6 +512,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["status"], "ok");
+        assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
+        // The reported js fingerprint matches the served asset (deploy-verifiable).
+        assert_eq!(v["assets"]["js"], asset_hash(SURFACE_JS));
     }
 
     #[tokio::test]
