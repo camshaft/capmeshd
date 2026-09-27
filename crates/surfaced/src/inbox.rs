@@ -55,6 +55,16 @@ pub struct SurfaceView {
     pub items: Vec<InboxItem>,
 }
 
+/// A one-line summary of a surface for listings (the MCP `list_surfaces` tool).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct SurfaceSummary {
+    pub id: String,
+    pub title: String,
+    pub item_count: usize,
+    pub current_view: Option<String>,
+}
+
 /// In-memory + broadcast state for one surface.
 struct SurfaceState {
     id: String,
@@ -273,6 +283,24 @@ impl SurfaceStore {
             .entry(id.to_string())
             .or_insert_with(|| SurfaceState::new(id.to_string()));
         state.view(self.cap)
+    }
+
+    /// List every registered surface as a summary, sorted by id. Backs the MCP
+    /// `list_surfaces` tool (and any registry view). `item-count` is the retained
+    /// in-memory window.
+    pub fn list_surfaces(&self) -> Vec<SurfaceSummary> {
+        let map = self.inner.lock().expect("store lock");
+        let mut out: Vec<SurfaceSummary> = map
+            .values()
+            .map(|s| SurfaceSummary {
+                id: s.id.clone(),
+                title: s.title.clone(),
+                item_count: s.items.len(),
+                current_view: s.current_view.clone(),
+            })
+            .collect();
+        out.sort_by(|a, b| a.id.cmp(&b.id));
+        out
     }
 
     /// Ensure a surface exists (creating it if absent), optionally setting its

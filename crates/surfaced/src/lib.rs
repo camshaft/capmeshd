@@ -14,12 +14,14 @@
 //!
 //! This crate implements the HTTP/SSE server ([`http`]), the durable inbox store
 //! with on-disk persistence ([`inbox`]), the display-item model ([`item`]), the
-//! same-origin attachment page ([`page`]), and the `surface-ctl` control socket
-//! ([`ctl`]) that capmeshd drives over a local Unix socket. The MCP `send` tool
-//! and per-surface attach tokens land in later increments.
+//! same-origin attachment page ([`page`]), the `surface-ctl` control socket
+//! ([`ctl`]) that capmeshd drives over a local Unix socket, per-surface attach
+//! tokens (in [`inbox`]/[`http`]), and an embedded MCP server ([`mcp`]) so an
+//! agent can post items to surfaces and list them.
 
 pub mod ctl;
 pub mod http;
 pub mod inbox;
 pub mod item;
+pub mod mcp;
 pub mod page;

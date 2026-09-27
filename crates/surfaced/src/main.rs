@@ -36,6 +36,11 @@ struct Args {
     #[arg(short = 's', long, env = "SURFACED_SOCKET")]
     socket: Option<String>,
 
+    /// Bearer token required on the `/mcp` agent endpoint. Omit to leave `/mcp`
+    /// open (trust the LAN or a reverse proxy). Also read from SURFACED_MCP_TOKEN.
+    #[arg(short = 'm', long, env = "SURFACED_MCP_TOKEN")]
+    mcp_token: Option<String>,
+
     /// Log level (trace, debug, info, warn, error).
     #[arg(short, long, default_value = "info")]
     log_level: String,
@@ -68,7 +73,12 @@ async fn main() -> Result<()> {
     };
 
     let ctl_store = Arc::clone(&store);
-    let app = router_with_base(store, &args.base_path);
+    let app = router_with_base(store, &args.base_path, args.mcp_token.clone());
+    if args.mcp_token.is_some() {
+        info!("surfaced MCP endpoint at /mcp (bearer-token gated)");
+    } else {
+        info!("surfaced MCP endpoint at /mcp (open — no --mcp-token)");
+    }
     let listener = tokio::net::TcpListener::bind(args.http_addr)
         .await
         .with_context(|| format!("binding {}", args.http_addr))?;
