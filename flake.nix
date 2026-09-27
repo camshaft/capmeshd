@@ -23,11 +23,11 @@
             # midir and needs its own buildInputs in packages.nmidid). Adding such a
             # member no longer turns `nix flake check` red here.
             cargoBuildFlags = [ "-p" "capmeshd" ];
-            cargoTestFlags = [ "-p" "capmeshd" "-p" "capmesh-discovery" "-p" "capmesh-model" "-p" "capmesh-ctl" "-p" "capmesh-daemon" ];
-            # doCheck (default true) runs `cargo test` for capmeshd and its extracted
-            # capmesh-{discovery,model,ctl,daemon} libraries in the sandbox — the discovery
-            # TXT-schema, ctl model-parse + socket round-trips, reconciler/negotiation, and
-            # config-parser tests are self-contained.
+            cargoTestFlags = [ "-p" "capmeshd" "-p" "capmesh-discovery" "-p" "capmesh-model" "-p" "capmesh-ctl" "-p" "capmesh-daemon" "-p" "capmesh-mesh" ];
+            # doCheck (default true) runs `cargo test` for capmeshd and its capmesh-{discovery,
+            # model,ctl,daemon,mesh} libraries in the sandbox — the discovery TXT-schema, ctl
+            # model-parse + socket round-trips, reconciler/negotiation, mesh HTTP fetch (loopback
+            # TCP), and config-parser tests are self-contained.
             meta = {
               description = "LAN capability mesh: stateless control-plane daemon (MIDI-first)";
               license = pkgs.lib.licenses.mit;
@@ -82,8 +82,8 @@
           checks.clippy = capmeshd.overrideAttrs (old: {
             pname = "${old.pname}-clippy";
             nativeBuildInputs = (old.nativeBuildInputs or [ ]) ++ [ pkgs.clippy ];
-            # Lint capmeshd and its extracted capmesh-{discovery,model,ctl,daemon} libraries together.
-            buildPhase = "cargo clippy -p capmeshd -p capmesh-discovery -p capmesh-model -p capmesh-ctl -p capmesh-daemon --all-targets --release -- -D warnings";
+            # Lint capmeshd and its capmesh-{discovery,model,ctl,daemon,mesh} libraries together.
+            buildPhase = "cargo clippy -p capmeshd -p capmesh-discovery -p capmesh-model -p capmesh-ctl -p capmesh-daemon -p capmesh-mesh --all-targets --release -- -D warnings";
             installPhase = "touch $out";
             doCheck = false;
           });
