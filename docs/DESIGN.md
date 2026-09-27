@@ -108,6 +108,41 @@ A **mount** is a directed edge *(source cap on host A) → (sink cap on host B)*
 (temp+TTL or permanent) and transport params. The set of desired mounts is **declarative state**
 the daemons reconcile. This is what makes it IFTTT-like and lets permanent mounts survive reboots.
 
+### 3.1 Unified typed ports (source / sink / rpc)
+
+The data-plane concepts **are unified** — borrowing PipeWire's proven node/port/link shape,
+mesh-wide. A capability is a **node** exposing typed **ports**. Each port has:
+
+- a **port kind**: **`stream`** (a typed byte/event stream — midi/audio/video) or **`rpc`** (a
+  request/response control handle — e.g. Moonraker); and
+- for `stream` ports, a **direction**: **`source`** (produces) or **`sink`** (consumes).
+
+A **mount is a type-compatible link** between ports: a `stream` source links only to a `stream`
+sink of a compatible type (MIDI↔MIDI, an audio format both accept, …); type mismatch is refused at
+`connect`. This one model spans every streaming kind and lets the agent/auto-mount reason
+generically ("wire every `midi` source to …") without per-kind special cases.
+
+**The honest caveat — not everything is a stream.** A **control-API is request/response, not a
+source/sink**. So `control-api` capabilities expose an **`rpc` port**: mounting one materializes a
+proxied *handle* (the sink can `invoke` methods), rather than establishing a streaming link. `rpc`
+lives under the same node/port umbrella so discovery, mounts, and the MCP surface stay uniform —
+Moonraker is not forced to pretend to be a stream.
+
+### 3.2 Virtual endpoints (why a remote device "just shows up" locally)
+
+A transport that can **materialize a local virtual endpoint** declares that capability in its
+descriptor (`virtualizable: true`). Then a mount doesn't just move bytes — it makes the remote port
+**appear as a native local device**:
+
+- Mounting a remote **`stream` source** → the local data-plane daemon creates a **local virtual
+  source** that native apps read from as if the device were plugged in here (the operator's
+  virtual-MIDI-input case: a remote keyboard shows up as a local MIDI input).
+- Mounting a remote **`stream` sink** → a **local virtual sink** apps write to.
+
+The daemon (e.g. `nmidid` via `midir::create_virtual`) bridges the virtual endpoint ↔ the remote
+real device over the transport. capmeshd only *asks* for the virtual endpoint over the control
+socket; the daemon owns creating and pumping it.
+
 ---
 
 ## 4. The plugin system — capmeshd drives data-plane daemons over control sockets
@@ -153,9 +188,10 @@ trait CapabilityPlugin {
 
 **Two flavors of control socket, both behind the same trait — this is the key generality:**
 
-- **Daemons with a native control protocol** (audio/screen/printer): the plugin speaks the existing
-  protocol directly — `pw-cli`/libpipewire for PipeWire, `wayvncctl` JSON-IPC or Sunshine for
-  screen, Moonraker WebSocket JSON-RPC / PrusaLink HTTP for the printer. No new daemon to write.
+- **Daemons with a native control protocol** (audio/screen/printer): the plugin speaks whatever the
+  service already exposes — as rich as a WebSocket JSON-RPC or **as thin as a CLI invocation** —
+  `pw-cli`/libpipewire for PipeWire, `wayvncctl` JSON-IPC or Sunshine for screen, Moonraker WebSocket
+  JSON-RPC / PrusaLink HTTP for the printer. No new daemon to write; the mesh hides the differences.
 - **Daemons we extend to speak a *capmesh control protocol*** (MIDI): **nmidi is extended into a
   data-plane daemon (`nmidid`) that exposes a control socket** — "create a virtual ALSA/CoreMIDI
   port and connect RTP-MIDI to `<peer addr>`" / "tear it down" — and owns the AppleMIDI handshake +
@@ -233,6 +269,27 @@ protocol is one in-process adapter module. No adapter → no advertisement for t
 - **Connect flow (sink-initiated):** agent calls `connect(source-cap, sink-host)` → sink's
   `capmeshd` looks the source up via discovery, fetches its descriptor, negotiates a transport both
   support, invokes the kind's plugin `mount(...)`, and records the mount in desired-state.
+
+### 6.1 Auto-mount subscriptions (plug-n-play, zero commands)
+
+A host may declare **auto-mount selectors** — the reconciler *derives* desired mounts from live
+discovery instead of only from explicit `connect` calls. This is the plug-n-play magic:
+
+```toml
+# any MIDI source that appears on the mesh → mirror it here as a local virtual MIDI input
+[[automount]]
+match  = { kind = "midi", port = "stream", dir = "source" }   # selector over the typed model (§3.1)
+action = "mirror-local"                                        # materialize a local virtual endpoint (§3.2)
+lifetime = "while-advertised"                                  # torn down when the advert vanishes
+```
+
+The reconciler watches mDNS `_capmesh._tcp` events; a new advertisement matching a selector is
+**automatically added to desired-state** (and removed when it disappears). So: plug a MIDI keyboard
+into the laptop → the laptop advertises a `midi` `stream`/`source` capability → the desktop's
+selector fires → `nmidid` materializes a local virtual MIDI input fed by the keyboard, with no
+command issued. Unplug → the advertisement drops → the mount tears down. Selectors are per-host,
+opt-in, and gated by the §8 trust boundary (only cluster-authenticated advertisements auto-mount;
+a stray/third-party advert is never auto-wired).
 
 ---
 
@@ -343,11 +400,13 @@ M0 runs as **two coordinated workstreams** (two build verticals):
 - **Exit / demo:** a **physical MIDI device plugged into one host plays a SuperCollider instance on
   another host** (cross-OS CoreMIDI↔ALSA), wired from one command. This is the operator's milestone.
 
-**M1 — Extract the generic abstraction.** Refactor capmeshd into `capmesh-discovery` (generalized
-advertiser/browse over `_capmesh._tcp` + descriptor fetch), `capmesh-model` (capability descriptor +
-mount types), `capmesh-daemon` (reconcile loop + the in-process `CapabilityPlugin` adapter trait).
-MIDI is the first adapter. **Exit:** MIDI works unchanged through the generic daemon; a new kind = one
-adapter module + a §4.1 config entry.
+**M1 — Extract the generic abstraction + auto-mount.** Refactor capmeshd into `capmesh-discovery`
+(generalized advertiser/browse over `_capmesh._tcp` + descriptor fetch), `capmesh-model` (the typed
+node/port model §3.1 + descriptor + mount types), `capmesh-daemon` (reconcile loop + the in-process
+`CapabilityPlugin` adapter trait). MIDI is the first adapter. Add **auto-mount selectors** (§6.1):
+the reconciler derives desired mounts from discovery events. **Exit (the headline demo):** *plug a
+MIDI keyboard into the laptop and it appears, unasked, as a virtual MIDI input on the desktop* — and
+disappears when unplugged. A new kind = one adapter module + a §4.1 config entry.
 
 **M2 — MCP server.** Wrap the control API in the §7 MCP server (Streamable HTTP). **Exit:** an agent
 discovers and wires MIDI mounts over the mesh with no bespoke glue.
@@ -378,6 +437,9 @@ pure-IoT slice.
 | D4 | Security v1 | open LAN / **cluster key via age** / mTLS now | **cluster key via age** (§8), mTLS path later |
 | D5 | nmidi relationship | wrap standalone / **generalize into capmesh crates** | **generalize** (§4, §11-M1) |
 | D6 | Discovery transport | central registry / **mDNS + descriptor pointer** | **mDNS + descriptor pointer** (§5) |
+| D7 | Data-plane model | per-kind bespoke / **unified typed ports (`stream` source/sink + `rpc`)** | **unified typed ports** (§3.1) — control-APIs are `rpc` handles, not fake streams |
+| D8 | Virtual endpoints | mount = bytes only / **transports may materialize local virtual endpoints** | **virtual endpoints** (§3.2) — remote device shows up as a native local device |
+| D9 | Auto-mount | explicit connect only / **declarative discovery-driven selectors** | **auto-mount selectors** (§6.1), per-host opt-in, trust-gated — lands in M1 |
 
 ---
 
