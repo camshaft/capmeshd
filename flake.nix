@@ -120,6 +120,7 @@
                       address = "0.0.0.0";
                       port = 8787;
                       basePath = "/surfaced";
+                      socket = "/run/surfaced/surfaced.sock";
                       openFirewall = true;
                     };
                   })
@@ -133,6 +134,7 @@
               grep -q -- '--http-addr 0.0.0.0:8787' exec
               grep -q -- '--state-dir /var/lib/surfaced' exec
               grep -q -- '--base-path /surfaced' exec
+              grep -q -- '--socket /run/surfaced/surfaced.sock' exec
               cp exec $out
             '';
 
