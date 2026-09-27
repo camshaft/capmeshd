@@ -20,7 +20,7 @@ use std::sync::Arc;
 use axum::{
     Json, Router,
     extract::{Path, State},
-    http::StatusCode,
+    http::{StatusCode, header},
     response::{
         Html, IntoResponse, Response, Sse,
         sse::{Event, KeepAlive},
@@ -31,17 +31,37 @@ use serde_json::json;
 use tokio_stream::{StreamExt, wrappers::BroadcastStream};
 
 use crate::inbox::{PushRequest, SurfaceEvent, SurfaceStore, ViewRequest, broadcast_view};
-use crate::page::SURFACE_PAGE;
+use crate::page::{SURFACE_CSS, SURFACE_HTML, SURFACE_JS};
 
 /// Build the surface HTTP router over a shared [`SurfaceStore`].
 pub fn router(store: Arc<SurfaceStore>) -> Router {
     Router::new()
         .route("/", get(health))
+        .route("/surface.css", get(css))
+        .route("/surface.js", get(js))
         .route("/s/{id}", get(page))
         .route("/s/{id}/events", get(events))
         .route("/s/{id}/items", get(list_items).post(push_item))
         .route("/s/{id}/view", post(set_view))
         .with_state(store)
+}
+
+/// Serve the page stylesheet (linked from the HTML shell).
+async fn css() -> Response {
+    (
+        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
+        SURFACE_CSS,
+    )
+        .into_response()
+}
+
+/// Serve the page logic (linked from the HTML shell).
+async fn js() -> Response {
+    (
+        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        SURFACE_JS,
+    )
+        .into_response()
 }
 
 fn bad_id() -> Response {
@@ -56,7 +76,7 @@ async fn page(Path(id): Path<String>) -> Response {
     if !SurfaceStore::valid_id(&id) {
         return bad_id();
     }
-    Html(SURFACE_PAGE).into_response()
+    Html(SURFACE_HTML).into_response()
 }
 
 async fn list_items(Path(id): Path<String>, State(store): State<Arc<SurfaceStore>>) -> Response {
@@ -206,5 +226,59 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn page_and_assets_serve_with_expected_content_types() {
+        let store = Arc::new(SurfaceStore::in_memory());
+        let app = router(store);
+
+        // The HTML shell links the split-out asset routes.
+        let page = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/s/phone")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.status(), StatusCode::OK);
+        let html = to_bytes(page.into_body(), usize::MAX).await.unwrap();
+        let html = String::from_utf8(html.to_vec()).unwrap();
+        assert!(html.contains(r#"href="/surface.css""#));
+        assert!(html.contains(r#"src="/surface.js""#));
+
+        let css = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/surface.css")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(css.status(), StatusCode::OK);
+        assert_eq!(
+            css.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/css; charset=utf-8"
+        );
+
+        let js = app
+            .oneshot(
+                Request::builder()
+                    .uri("/surface.js")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(js.status(), StatusCode::OK);
+        assert_eq!(
+            js.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/javascript; charset=utf-8"
+        );
     }
 }
