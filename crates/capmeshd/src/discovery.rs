@@ -88,6 +88,14 @@ impl CapabilityAdvert {
     pub fn instance_name(&self) -> String {
         format!("{}-{}-{}", self.host, self.cap, self.id)
     }
+
+    /// Whether this advert matches an optional `discover(kind?, dir?, host?)` selector (§7):
+    /// each `Some` filter must equal the corresponding field; `None` filters match anything.
+    pub fn matches(&self, kind: Option<&str>, dir: Option<&str>, host: Option<&str>) -> bool {
+        kind.is_none_or(|k| self.cap == k)
+            && dir.is_none_or(|d| self.dir == d)
+            && host.is_none_or(|h| self.host == h)
+    }
 }
 
 /// Manages capmesh mDNS advertisements. Generalized from nmidi's `ServiceAdvertiser`.
@@ -229,5 +237,16 @@ mod tests {
     fn instance_name_is_unique_per_capability() {
         let a = sample();
         assert_eq!(a.instance_name(), "green-machine-midi-b1f0-uuid");
+    }
+
+    #[test]
+    fn matches_applies_optional_filters() {
+        let a = sample(); // cap=midi, dir=source, host=green-machine
+        assert!(a.matches(None, None, None)); // no filters → any
+        assert!(a.matches(Some("midi"), Some("source"), Some("green-machine")));
+        assert!(a.matches(Some("midi"), None, None));
+        assert!(!a.matches(Some("audio"), None, None)); // wrong kind
+        assert!(!a.matches(None, Some("sink"), None)); // wrong dir
+        assert!(!a.matches(None, None, Some("other-host"))); // wrong host
     }
 }
