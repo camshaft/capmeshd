@@ -16,9 +16,19 @@ nmidid --socket /run/nmidid.sock --log-level info
 |---|---|---|
 | `--socket <path>` | `/run/nmidid.sock` | Unix control socket to bind (§1). |
 | `--monitor-interval <secs>` | `5` | How often to poll local MIDI ports for hot-plug (§5). |
+| `--allow-uid <uid>` | *(none)* | Permit connections from this uid (repeatable); own uid always allowed (§1.1). |
+| `--allow-gid <gid>` | *(none)* | Permit connections from this gid (repeatable) (§1.1). |
 | `--log-level <lvl>` | `info` | `trace`/`debug`/`info`/`warn`/`error`. |
 
-The NixOS module `services.nmidid` (see the flake) runs it as a systemd unit.
+The control socket is local-trust-only. With no `--allow-uid`/`--allow-gid` given,
+peer-credential enforcement is **off** and only the socket file permissions
+(`0o660`) apply. Given either, nmidid reads each peer's socket credentials
+(`SO_PEERCRED`) on connect and refuses any uid/gid not on the allow-list (its own
+uid is always allowed); it fails closed if the credentials can't be read (§1.1).
+
+The NixOS module `services.nmidid` (see the flake) runs it as a systemd unit and
+exposes `allowedUids` / `allowedGids` for the same policy — set a shared group in
+`allowedGids` to let capmeshd's client reach the socket while refusing others.
 
 ### Control methods (capmeshd → daemon)
 

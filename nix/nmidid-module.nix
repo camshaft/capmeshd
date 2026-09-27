@@ -30,6 +30,30 @@ in
       default = "info";
       description = "Log verbosity.";
     };
+
+    allowedUids = lib.mkOption {
+      type = lib.types.listOf lib.types.int;
+      default = [ ];
+      example = lib.literalExpression "[ 1000 ]";
+      description = ''
+        Uids permitted to connect to the control socket, enforced via the peer's
+        socket credentials (CONTROL-PROTOCOL §1.1). The daemon's own uid is always
+        allowed. When both this and `allowedGids` are empty, peer-credential
+        enforcement is off and only the socket file permissions apply.
+      '';
+    };
+
+    allowedGids = lib.mkOption {
+      type = lib.types.listOf lib.types.int;
+      default = [ ];
+      example = lib.literalExpression "[ config.ids.gids.audio ]";
+      description = ''
+        Gids permitted to connect to the control socket, enforced via the peer's
+        socket credentials (CONTROL-PROTOCOL §1.1). Setting a shared group here is
+        the intended way to let capmeshd's client reach the socket while refusing
+        everyone else. Empty (with `allowedUids`) leaves enforcement off.
+      '';
+    };
   };
 
   config = lib.mkIf cfg.enable {
@@ -38,7 +62,11 @@ in
       wantedBy = [ "multi-user.target" ];
       after = [ "sound.target" ];
       serviceConfig = {
-        ExecStart = "${cfg.package}/bin/nmidid --socket ${cfg.socket} --log-level ${cfg.logLevel}";
+        ExecStart = lib.concatStringsSep " " (
+          [ "${cfg.package}/bin/nmidid" "--socket" "${cfg.socket}" "--log-level" cfg.logLevel ]
+          ++ lib.concatMap (uid: [ "--allow-uid" (toString uid) ]) cfg.allowedUids
+          ++ lib.concatMap (gid: [ "--allow-gid" (toString gid) ]) cfg.allowedGids
+        );
         RuntimeDirectory = "nmidid";
         Restart = "on-failure";
         RestartSec = 2;
