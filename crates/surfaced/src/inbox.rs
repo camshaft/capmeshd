@@ -214,6 +214,38 @@ impl SurfaceStore {
         }
     }
 
+    /// Path of the per-surface attach-token sidecar (extension not `jsonl`, so
+    /// replay ignores it as an item log).
+    fn token_path(&self, id: &str) -> Option<PathBuf> {
+        self.state_dir
+            .as_ref()
+            .map(|d| d.join(format!("{id}.token")))
+    }
+
+    /// Persist a surface's attach token so a protected surface stays protected
+    /// across a restart (in memory only, it would silently reopen). `None`
+    /// removes the sidecar (an open surface leaves nothing on disk). Best effort.
+    fn write_token(&self, id: &str, token: Option<&str>) {
+        let Some(path) = self.token_path(id) else {
+            return;
+        };
+        match token {
+            Some(t) => {
+                if let Err(e) = std::fs::write(&path, t.as_bytes()) {
+                    warn!("writing token sidecar {}: {e}", path.display());
+                }
+            }
+            // Cleared: remove the sidecar rather than leave an empty/stale token.
+            None => {
+                if path.exists()
+                    && let Err(e) = std::fs::remove_file(&path)
+                {
+                    warn!("removing token sidecar {}: {e}", path.display());
+                }
+            }
+        }
+    }
+
     /// Load every `<id>.jsonl` log under the state dir into memory.
     fn replay(&mut self) -> Result<()> {
         let Some(dir) = self.state_dir.clone() else {
@@ -262,6 +294,11 @@ impl SurfaceStore {
                 }
                 Some(None) => state.current_view = None,
                 _ => {}
+            }
+            // Restore the attach token so a protected surface stays protected
+            // across a restart (its presence, not contents, is the key fact).
+            if let Ok(tok) = std::fs::read_to_string(dir.join(format!("{id}.token"))) {
+                state.attach_token = Some(tok);
             }
             debug!("replayed surface '{id}' with {} items", state.items.len());
             map.insert(id.to_string(), state);
@@ -370,6 +407,7 @@ impl SurfaceStore {
         }
         if attach_token.is_some() {
             state.attach_token = attach_token;
+            self.write_token(id, state.attach_token.as_deref());
         }
     }
 
@@ -421,6 +459,9 @@ impl SurfaceStore {
         {
             warn!("removing view sidecar {}: {e}", path.display());
         }
+        // And the token sidecar, so a re-created surface of the same id is open
+        // (not silently protected by the deleted surface's token).
+        self.write_token(id, None);
         removed
     }
 
@@ -441,6 +482,7 @@ impl SurfaceStore {
         match map.get_mut(id) {
             Some(state) => {
                 state.attach_token = token;
+                self.write_token(id, state.attach_token.as_deref());
                 true
             }
             None => false,
@@ -693,6 +735,38 @@ mod tests {
         assert_eq!(v["kind"], "view");
         assert_eq!(v["current-view"], "abc");
         assert!(v.get("current_view").is_none(), "must not use snake_case key");
+    }
+
+    #[test]
+    fn attach_token_survives_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+        {
+            let store = SurfaceStore::with_state_dir(&path).unwrap();
+            store.ensure("s", None, Some("secret".to_string()));
+            store.push("s", text("hi"), true);
+        }
+        // A fresh store keeps the surface protected — it must NOT silently reopen.
+        let reborn = SurfaceStore::with_state_dir(&path).unwrap();
+        assert!(!reborn.authorize_attach("s", None), "must stay protected");
+        assert!(!reborn.authorize_attach("s", Some("wrong")));
+        assert!(reborn.authorize_attach("s", Some("secret")));
+    }
+
+    #[test]
+    fn cleared_token_does_not_persist() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+        {
+            let store = SurfaceStore::with_state_dir(&path).unwrap();
+            store.ensure("s", None, Some("secret".to_string()));
+            store.push("s", text("hi"), true);
+            // Reopen the surface: the token sidecar should be gone.
+            assert!(store.set_token("s", None));
+        }
+        assert!(!path.join("s.token").exists(), "token sidecar should be removed");
+        let reborn = SurfaceStore::with_state_dir(&path).unwrap();
+        assert!(reborn.authorize_attach("s", None), "should be open after clear");
     }
 
     #[test]
