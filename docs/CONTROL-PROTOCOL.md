@@ -217,6 +217,7 @@ JSON-RPC `error` with a machine code in `data.code`:
 | `virtual-unsupported` | `local.virtual:true` on a non-`virtualizable` port |
 | `peer-unreachable` | the daemon could not reach `remote.addr:port` |
 | `busy` | the port/device is exclusively held |
+| `role-unsupported` | `mount` names a `role` (§3.1) the daemon does not implement |
 
 ```jsonc
 {"jsonrpc":"2.0","id":7,"error":{"code":-32001,"message":"no common format",
