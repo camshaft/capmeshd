@@ -71,8 +71,18 @@ pub fn router_with_base(
     mcp_token: Option<String>,
 ) -> Router {
     let base = normalize_base(base_path);
-    let page_html: Arc<str> =
-        Arc::from(SURFACE_HTML.replace("__BASE_HREF__", &html_base_href(&base)));
+    // Fingerprint the assets by content and reference them as `surface.js?v=<hash>`
+    // in the (always-fresh) HTML. The asset URL then changes exactly when its
+    // bytes change, so a redeploy is picked up immediately even though the assets
+    // themselves are served with a long immutable cache (see `css`/`js`).
+    let css_href = format!("surface.css?v={}", asset_hash(SURFACE_CSS));
+    let js_src = format!("surface.js?v={}", asset_hash(SURFACE_JS));
+    let page_html: Arc<str> = Arc::from(
+        SURFACE_HTML
+            .replace("__BASE_HREF__", &html_base_href(&base))
+            .replace("__CSS_HREF__", &css_href)
+            .replace("__JS_SRC__", &js_src),
+    );
     let inner = Router::new()
         .route("/", get(health))
         .route("/surface.css", get(css))
@@ -134,6 +144,20 @@ fn normalize_base(raw: &str) -> String {
     }
 }
 
+/// A content fingerprint for cache-busting an asset URL (`?v=<hash>`): FNV-1a
+/// over the asset bytes. Dependency-free and fully deterministic (unlike
+/// `DefaultHasher`, whose output is a std-internal detail), so the same content
+/// always yields the same hash across builds and toolchains — the URL changes
+/// exactly when the bytes change, letting the asset itself cache long-term.
+fn asset_hash(content: &str) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325; // FNV offset basis
+    for b in content.as_bytes() {
+        hash ^= u64::from(*b);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3); // FNV prime
+    }
+    format!("{hash:016x}")
+}
+
 /// The `<base href>` value for a normalized prefix — always ends in `/` so the
 /// page's relative URLs resolve directly under it (`/` for the root mount).
 fn html_base_href(base: &str) -> String {
@@ -144,10 +168,18 @@ fn html_base_href(base: &str) -> String {
     }
 }
 
+/// Cache directive for the fingerprinted assets: the URL carries a content hash
+/// (`?v=<hash>`), so the bytes at a given URL never change — cache them for a
+/// year and skip revalidation. A content change yields a new URL, not a stale hit.
+const ASSET_CACHE: &str = "public, max-age=31536000, immutable";
+
 /// Serve the page stylesheet (linked from the HTML shell).
 async fn css() -> Response {
     (
-        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
+        [
+            (header::CONTENT_TYPE, "text/css; charset=utf-8"),
+            (header::CACHE_CONTROL, ASSET_CACHE),
+        ],
         SURFACE_CSS,
     )
         .into_response()
@@ -156,7 +188,10 @@ async fn css() -> Response {
 /// Serve the page logic (linked from the HTML shell).
 async fn js() -> Response {
     (
-        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        [
+            (header::CONTENT_TYPE, "text/javascript; charset=utf-8"),
+            (header::CACHE_CONTROL, ASSET_CACHE),
+        ],
         SURFACE_JS,
     )
         .into_response()
@@ -463,11 +498,14 @@ mod tests {
         assert_eq!(page.status(), StatusCode::OK);
         let html = to_bytes(page.into_body(), usize::MAX).await.unwrap();
         let html = String::from_utf8(html.to_vec()).unwrap();
-        // Asset refs are relative; at the root mount the base href is "/".
-        assert!(html.contains(r#"href="surface.css""#));
-        assert!(html.contains(r#"src="surface.js""#));
+        // Asset refs are relative and content-fingerprinted (`?v=<hash>`); at the
+        // root mount the base href is "/".
+        assert!(html.contains(r#"href="surface.css?v="#));
+        assert!(html.contains(r#"src="surface.js?v="#));
         assert!(html.contains(r#"<base href="/">"#));
         assert!(!html.contains("__BASE_HREF__"));
+        assert!(!html.contains("__CSS_HREF__"));
+        assert!(!html.contains("__JS_SRC__"));
         // Mobile layout: a hamburger toggle + the inbox feed as a drawer.
         assert!(html.contains(r#"id="menu""#));
         assert!(html.contains(r#"id="feed""#));
@@ -487,6 +525,8 @@ mod tests {
             css.headers().get(header::CONTENT_TYPE).unwrap(),
             "text/css; charset=utf-8"
         );
+        // Fingerprinted URL → cache long-term.
+        assert_eq!(css.headers().get(header::CACHE_CONTROL).unwrap(), ASSET_CACHE);
 
         let js = app
             .oneshot(
@@ -502,6 +542,17 @@ mod tests {
             js.headers().get(header::CONTENT_TYPE).unwrap(),
             "text/javascript; charset=utf-8"
         );
+        assert_eq!(js.headers().get(header::CACHE_CONTROL).unwrap(), ASSET_CACHE);
+    }
+
+    #[test]
+    fn asset_hash_is_deterministic_and_content_sensitive() {
+        // Same bytes → same hash (stable URL); different bytes → different hash
+        // (busts the cache). A fixed vector pins the algorithm so a future change
+        // to it is a deliberate, visible edit.
+        assert_eq!(asset_hash("body {}"), asset_hash("body {}"));
+        assert_ne!(asset_hash("body {}"), asset_hash("body {} "));
+        assert_eq!(asset_hash(""), "cbf29ce484222325");
     }
 
     #[tokio::test]
