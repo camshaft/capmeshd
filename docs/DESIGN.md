@@ -247,7 +247,8 @@ protocol is one in-process adapter module. No adapter → no advertisement for t
   nmidi). One service type `_capmesh._tcp.local` = the daemon's control endpoint.
 - **TXT carries only coarse, filterable keys — not the schema:**
   `cap=midi`, `dir=source`, `id=<uuid>`, `host=<host-id>`, `v=1`, `ep=<port>`,
-  `descr=/caps/<uuid>` (a pointer to fetch the rich descriptor over the daemon's own HTTP/RPC).
+  `descr=/caps/<uuid>` (a pointer to fetch the rich descriptor from the peer's mesh control
+  endpoint at `ep` — the read path pinned in [`MESH-PROTOCOL.md`](MESH-PROTOCOL.md)).
   This is the standard DNS-SD idiom and sidesteps TXT's size/typing limits.
 - **⚠ Connect by IP from the mDNS A/AAAA record, never by resolving `<peer>.local`.** (The operator
   has moved off `.local` to `.lan` — but resolving discovered peers by the address in the service
