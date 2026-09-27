@@ -55,6 +55,21 @@ enum Cmd {
         #[arg(long)]
         watch: bool,
     },
+    /// Browse the mesh and list discovered capmesh capabilities (§7 discover).
+    Discover {
+        /// How long to browse before printing, in seconds.
+        #[arg(long, default_value_t = 3)]
+        timeout_secs: u64,
+        /// Only show this capability kind (midi | audio | …).
+        #[arg(long)]
+        kind: Option<String>,
+        /// Only show this direction (source | sink | duplex | control).
+        #[arg(long)]
+        dir: Option<String>,
+        /// Only show capabilities on this host.
+        #[arg(long)]
+        host: Option<String>,
+    },
     /// Establish a mount on a daemon (§3): create/attach a p2p link to a remote port.
     Mount(MountArgs),
     /// Tear a mount down (§3).
@@ -162,6 +177,20 @@ async fn main() -> Result<()> {
 
     match &args.cmd {
         Some(Cmd::ProbeCtl { socket, watch }) => return probe_ctl(socket, *watch).await,
+        Some(Cmd::Discover {
+            timeout_secs,
+            kind,
+            dir,
+            host,
+        }) => {
+            return cmd_discover(
+                *timeout_secs,
+                kind.as_deref(),
+                dir.as_deref(),
+                host.as_deref(),
+            )
+            .await;
+        }
         Some(Cmd::Mount(m)) => return cmd_mount(m).await,
         Some(Cmd::Unmount { socket, mount_id }) => return cmd_unmount(socket, mount_id).await,
         Some(Cmd::MountStatus { socket, mount_id }) => {
@@ -332,6 +361,57 @@ async fn probe_ctl(socket: &Path, watch: bool) -> Result<()> {
                 }
             }
         }
+    }
+    Ok(())
+}
+
+/// Browse `_capmesh._tcp` for `timeout_secs`, then print the discovered capabilities that
+/// match the optional filters (§7 discover). Peers are keyed by the IP from their mDNS
+/// record (§5). Deduped by capability id (a peer may resolve more than once).
+async fn cmd_discover(
+    timeout_secs: u64,
+    kind: Option<&str>,
+    dir: Option<&str>,
+    host: Option<&str>,
+) -> Result<()> {
+    let events = discovery::browse().context("start mDNS browse")?;
+    info!(timeout_secs, "discovering capmesh capabilities");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    let mut seen: std::collections::BTreeMap<String, (CapabilityAdvert, std::net::IpAddr, u16)> =
+        std::collections::BTreeMap::new();
+
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep_until(deadline) => break,
+            ev = events.recv_async() => match ev {
+                Ok(ServiceEvent::ServiceResolved(svc)) => {
+                    if let (Some(addr), Ok(advert)) =
+                        (discovery::resolved_addr(&svc), discovery::advert_from_resolved(&svc))
+                        && advert.matches(kind, dir, host)
+                    {
+                        seen.insert(advert.id.clone(), (advert, addr, svc.get_port()));
+                    }
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            },
+        }
+    }
+
+    if seen.is_empty() {
+        info!("no capmesh capabilities discovered");
+    }
+    for (advert, addr, port) in seen.values() {
+        info!(
+            host = %advert.host,
+            cap = %advert.cap,
+            dir = %advert.dir,
+            id = %advert.id,
+            %addr,
+            port,
+            descr = %advert.descr,
+            "capability"
+        );
     }
     Ok(())
 }
