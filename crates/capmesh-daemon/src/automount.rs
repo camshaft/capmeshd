@@ -48,6 +48,12 @@ pub fn role_for_action(action: &str) -> Option<MountRole> {
 /// (`kind`↔port type, `dir`, `port` id — each `None` matches anything), map `action` to a
 /// role, and negotiate the format from the local codecs (consumer) against that port's
 /// advertised formats (producer, §4).
+///
+/// The returned `port_id` is always one that **exists in `ports`** (the peer's fetched
+/// descriptor): the planner only ever names a port it selected here. This is where a remote
+/// port-id is validated — a mirror-source data-plane daemon treats `remote.port-id` as an
+/// opaque peer label and does not check it (nmidid #98), so a selector that pins a `port`
+/// absent from the descriptor is caught here as [`PlanError::NoMatchingPort`], never issued.
 pub fn plan_mount(
     action: &str,
     selector_kind: Option<&str>,
@@ -242,6 +248,24 @@ mod tests {
         let ports = vec![port("kbd-0", "source", "midi", &["midi1"])];
         let err = plan_mount("mirror-local", Some("audio"), None, None, &ports, &[fmt("midi1")])
             .unwrap_err();
+        assert_eq!(err, PlanError::NoMatchingPort);
+    }
+
+    #[test]
+    fn selector_port_absent_from_descriptor_is_no_match() {
+        // capmeshd owns port-id validation (nmidid #98 treats remote.port-id as opaque): a
+        // selector pinning a port-id that the fetched descriptor does not advertise must be
+        // caught here, not issued and rejected by the daemon.
+        let ports = vec![port("kbd-0", "source", "midi", &["midi1"])];
+        let err = plan_mount(
+            "mirror-local",
+            Some("midi"),
+            None,
+            Some("kbd-9"), // not in the descriptor
+            &ports,
+            &[fmt("midi1")],
+        )
+        .unwrap_err();
         assert_eq!(err, PlanError::NoMatchingPort);
     }
 
