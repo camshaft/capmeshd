@@ -1,0 +1,11 @@
+[package]
+name = "capmesh-discovery"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "capmesh DNS-SD / mDNS discovery: the _capmesh._tcp advert schema, advertiser, and browse"
+
+[dependencies]
+mdns-sd.workspace = true
+anyhow.workspace = true
+tracing.workspace = true

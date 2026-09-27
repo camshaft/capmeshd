@@ -1,11 +1,15 @@
 //! DNS-SD / mDNS discovery for the capmesh (DESIGN §5).
 //!
+//! This crate is the reusable discovery layer: the `_capmesh._tcp` advert schema, the
+//! advertiser, and the browse receiver. `capmeshd` and any future mesh client depend on
+//! it rather than re-implementing the wire schema.
+//!
 //! One service type — `_capmesh._tcp.local.` — carries one record per advertised
 //! capability. The TXT record holds only the coarse, filterable keys (`cap`, `dir`,
 //! `id`, `host`, `v`, `ep`, `descr`); the rich typed descriptor is fetched separately
-//! via the `descr` pointer. The advertiser is generalized from nmidi's
-//! `ServiceAdvertiser` (`nmidi-core/src/discovery.rs`), which advertised
-//! `_apple-midi._udp` — here it advertises the capmesh control endpoint.
+//! via the `descr` pointer. The advertiser is generalized from the sibling `nmidi-core`
+//! crate's `ServiceAdvertiser`, which advertised `_apple-midi._udp` — here it advertises
+//! the capmesh control endpoint.
 //!
 //! ⚠ Peers are always connected by the **IP address from the mDNS A/AAAA record**
 //! ([`resolved_addr`]), never by resolving a `.local`/`.lan` name (DESIGN §5).

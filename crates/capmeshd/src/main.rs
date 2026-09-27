@@ -10,11 +10,11 @@
 
 mod config;
 mod ctl;
-mod discovery;
 mod negotiate;
 mod reconcile;
 
 use anyhow::{Context, Result};
+use capmesh_discovery as discovery;
 use clap::{Parser, Subcommand};
 use config::Config;
 use ctl::{CtlClient, Format, LocalEndpoint, MountRole, MountSpec, RemoteEndpoint};
