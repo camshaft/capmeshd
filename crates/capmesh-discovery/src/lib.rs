@@ -22,6 +22,12 @@ use tracing::warn;
 /// The capmesh DNS-SD service type (DESIGN §5): the daemon's control endpoint.
 pub const SERVICE_TYPE: &str = "_capmesh._tcp.local.";
 
+/// The AppleMIDI/RTP-MIDI DNS-SD service type. A MIDI source (a Mac network session or
+/// `nmidi-fake-source`) advertises this natively; capmeshd browses it to learn a MIDI peer's
+/// data-plane **control** port, correlated to the capmesh node by IP (DESIGN §5). The SRV port
+/// of this record is the control port; the data-plane daemon derives the data port as +1.
+pub const APPLE_MIDI_SERVICE_TYPE: &str = "_apple-midi._udp.local.";
+
 /// Advertisement schema version carried in the `v` TXT key.
 pub const ADVERT_VERSION: &str = "1";
 
@@ -172,6 +178,18 @@ pub fn browse() -> Result<mdns_sd::Receiver<mdns_sd::ServiceEvent>> {
     Ok(receiver)
 }
 
+/// Browse the LAN for `_apple-midi._udp` records — MIDI sources' data-plane endpoints. The
+/// caller matches `ServiceEvent::ServiceResolved`, reads [`resolved_addr`] + the SRV port
+/// (`svc.get_port()`, the AppleMIDI control port), and feeds them to an [`AppleMidiPeers`] map
+/// to correlate with capmesh MIDI capabilities by IP.
+pub fn browse_apple_midi() -> Result<mdns_sd::Receiver<mdns_sd::ServiceEvent>> {
+    let mdns = ServiceDaemon::new().context("failed to create mDNS daemon")?;
+    let receiver = mdns
+        .browse(APPLE_MIDI_SERVICE_TYPE)
+        .context("failed to browse for AppleMIDI services")?;
+    Ok(receiver)
+}
+
 /// The IP address to connect a discovered peer by (DESIGN §5): the address from the
 /// resolved mDNS record, IPv4 preferred, never a `.local`/`.lan` name. `None` if the
 /// record carried no address.
@@ -192,6 +210,41 @@ pub fn advert_from_resolved(svc: &ResolvedService) -> Result<CapabilityAdvert> {
         .map(|p| (p.key().to_string(), p.val_str().to_string()))
         .collect();
     CapabilityAdvert::from_txt(&props)
+}
+
+/// The set of AppleMIDI peers currently seen on the LAN, keyed by IP — the correlation table
+/// that lets capmeshd resolve a discovered MIDI capability (a `_capmesh._tcp` advert, known by
+/// its resolved IP) to the data-plane **control** port from the peer's `_apple-midi._udp`
+/// record. Populated from [`browse_apple_midi`] events; queried when issuing a mount.
+///
+/// Keyed by IP because that is the stable join between the two adverts (both resolve to the
+/// same host address); the value is the AppleMIDI control (SRV) port, passed into a mount
+/// verbatim (the data-plane daemon derives the data port as control + 1).
+#[derive(Debug, Clone, Default)]
+pub struct AppleMidiPeers {
+    by_addr: HashMap<IpAddr, u16>,
+}
+
+impl AppleMidiPeers {
+    /// A fresh, empty table.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record (or refresh) the control port observed for a peer IP.
+    pub fn observe(&mut self, addr: IpAddr, control_port: u16) {
+        self.by_addr.insert(addr, control_port);
+    }
+
+    /// Drop a peer IP that went away (its `_apple-midi._udp` record was removed).
+    pub fn forget(&mut self, addr: &IpAddr) {
+        self.by_addr.remove(addr);
+    }
+
+    /// The AppleMIDI control port most recently observed for `addr`, if any.
+    pub fn control_port(&self, addr: &IpAddr) -> Option<u16> {
+        self.by_addr.get(addr).copied()
+    }
 }
 
 #[cfg(test)]
@@ -252,5 +305,23 @@ mod tests {
         assert!(!a.matches(Some("audio"), None, None)); // wrong kind
         assert!(!a.matches(None, Some("sink"), None)); // wrong dir
         assert!(!a.matches(None, None, Some("other-host"))); // wrong host
+    }
+
+    #[test]
+    fn apple_midi_peers_correlate_by_addr() {
+        let a: IpAddr = "192.168.1.23".parse().unwrap();
+        let b: IpAddr = "192.168.1.99".parse().unwrap();
+        let mut peers = AppleMidiPeers::new();
+        assert_eq!(peers.control_port(&a), None);
+
+        peers.observe(a, 5004);
+        assert_eq!(peers.control_port(&a), Some(5004));
+        assert_eq!(peers.control_port(&b), None); // unrelated peer
+
+        peers.observe(a, 5006); // refresh (e.g. re-advertised on a new port)
+        assert_eq!(peers.control_port(&a), Some(5006));
+
+        peers.forget(&a);
+        assert_eq!(peers.control_port(&a), None); // peer went away
     }
 }
