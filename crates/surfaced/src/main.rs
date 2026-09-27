@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use surfaced::ctl;
 use surfaced::http::router_with_base;
 use surfaced::inbox::SurfaceStore;
 use tracing::{Level, info};
@@ -29,6 +30,11 @@ struct Args {
     /// http://127.0.0.1:8787; }`.
     #[arg(short = 'b', long, env = "SURFACED_BASE_PATH", default_value = "")]
     base_path: String,
+
+    /// Path of the Unix control socket capmeshd drives (`surface-ctl`). Omit to
+    /// run HTTP-only (no mesh control plane).
+    #[arg(short = 's', long, env = "SURFACED_SOCKET")]
+    socket: Option<String>,
 
     /// Log level (trace, debug, info, warn, error).
     #[arg(short, long, default_value = "info")]
@@ -61,6 +67,7 @@ async fn main() -> Result<()> {
         }
     };
 
+    let ctl_store = Arc::clone(&store);
     let app = router_with_base(store, &args.base_path);
     let listener = tokio::net::TcpListener::bind(args.http_addr)
         .await
@@ -73,6 +80,21 @@ async fn main() -> Result<()> {
             args.http_addr, args.base_path
         );
     }
-    axum::serve(listener, app).await.context("serving HTTP")?;
+
+    let http = async move { axum::serve(listener, app).await.context("serving HTTP") };
+
+    // Serve the control socket alongside HTTP when configured; both share the
+    // one SurfaceStore, so a control-socket push and an HTTP push are identical.
+    match args.socket {
+        Some(sock) => {
+            info!("surfaced control socket (surface-ctl) at {sock}");
+            let ctl = ctl::run(sock, ctl_store);
+            tokio::try_join!(http, ctl)?;
+        }
+        None => {
+            info!("surfaced: HTTP-only (no --socket; mesh control plane disabled)");
+            http.await?;
+        }
+    }
     Ok(())
 }
