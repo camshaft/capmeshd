@@ -553,16 +553,49 @@ async fn cmd_discover(
         info!("no capmesh capabilities discovered");
     }
     for (advert, addr, port) in seen.values() {
-        info!(
-            host = %advert.host,
-            cap = %advert.cap,
-            dir = %advert.dir,
-            id = %advert.id,
-            %addr,
-            port,
-            descr = %advert.descr,
-            "capability"
-        );
+        // Resolve the coarse advert's `descr` pointer into the full typed descriptor over the
+        // peer's mesh control endpoint (docs/MESH-PROTOCOL.md). A peer that doesn't serve the
+        // endpoint (or is momentarily down) still shows as the coarse advert.
+        match capmesh_mesh::fetch_capability(*addr, *port, &advert.descr).await {
+            Ok(cap) => {
+                info!(
+                    host = %advert.host,
+                    cap = %advert.cap,
+                    id = %advert.id,
+                    %addr,
+                    port,
+                    ports = cap.ports.len(),
+                    "capability"
+                );
+                for p in &cap.ports {
+                    let codecs = p
+                        .formats
+                        .iter()
+                        .map(|f| f.codec.as_str())
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    info!(
+                        id = %advert.id,
+                        port_id = %p.port_id,
+                        dir = p.dir.as_deref().unwrap_or("-"),
+                        r#type = %p.type_,
+                        name = %p.name,
+                        codecs = %codecs,
+                        "  port"
+                    );
+                }
+            }
+            Err(e) => info!(
+                host = %advert.host,
+                cap = %advert.cap,
+                dir = %advert.dir,
+                id = %advert.id,
+                %addr,
+                port,
+                descr = %advert.descr,
+                "capability (descriptor unavailable: {e})"
+            ),
+        }
     }
     Ok(())
 }
