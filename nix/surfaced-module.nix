@@ -46,6 +46,17 @@ in
       '';
     };
 
+    basePath = lib.mkOption {
+      type = lib.types.str;
+      default = "";
+      example = "/surfaced";
+      description = ''
+        Mount the server under a URL prefix for reverse-proxy deployment (nginx).
+        Empty (default) serves at the root. Proxy WITHOUT stripping the prefix:
+        `location /surfaced/ { proxy_pass http://127.0.0.1:8787; proxy_buffering off; }`.
+      '';
+    };
+
     openFirewall = lib.mkOption {
       type = lib.types.bool;
       default = false;
@@ -70,7 +81,8 @@ in
         ExecStart = "${cfg.package}/bin/surfaced"
           + " --http-addr ${cfg.address}:${toString cfg.port}"
           + " --state-dir ${cfg.stateDir}"
-          + " --log-level ${cfg.logLevel}";
+          + " --log-level ${cfg.logLevel}"
+          + lib.optionalString (cfg.basePath != "") " --base-path ${cfg.basePath}";
         StateDirectory = "surfaced";
         Restart = "on-failure";
         RestartSec = 2;

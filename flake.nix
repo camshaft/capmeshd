@@ -119,6 +119,7 @@
                       enable = true;
                       address = "0.0.0.0";
                       port = 8787;
+                      basePath = "/surfaced";
                       openFirewall = true;
                     };
                   })
@@ -131,6 +132,7 @@
               grep -q 'bin/surfaced' exec
               grep -q -- '--http-addr 0.0.0.0:8787' exec
               grep -q -- '--state-dir /var/lib/surfaced' exec
+              grep -q -- '--base-path /surfaced' exec
               cp exec $out
             '';
 
