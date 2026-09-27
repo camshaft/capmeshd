@@ -30,6 +30,11 @@ use crate::protocol::{MountState, MountStatus, RemoteEndpoint};
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const HANDSHAKE_ATTEMPTS: u32 = 3;
 
+/// How often the session initiator drives a clock-sync exchange (CK0). Real
+/// AppleMIDI peers expect the inviter to keep clock-sync alive; without it an
+/// idle or strict source may time the session out.
+const CK_SYNC_INTERVAL: Duration = Duration::from_secs(10);
+
 /// Drops stale or duplicate RTP packets by sequence number, so a reordered or
 /// retransmitted datagram never replays MIDI that has already been played (a
 /// replayed note-on/off would double-trigger the instrument).
@@ -149,12 +154,27 @@ async fn run_pump(
 
         let started = Instant::now();
         let mut gate = SeqGate::default();
+        // Timestamps are in 100µs units of our own clock.
+        let now_ts = |started: &Instant| (started.elapsed().as_micros() / 100) as u64;
+        // As the session initiator, drive clock-sync periodically. The first
+        // tick fires immediately, sending the initial CK0 as soon as we go active.
+        let mut ck_timer = tokio::time::interval(CK_SYNC_INTERVAL);
         loop {
             tokio::select! {
                 biased;
                 _ = cancel.notified() => {
                     info!("mount unmounted; tearing down session");
                     break;
+                }
+                _ = ck_timer.tick() => {
+                    let ck0 = AppleMidiPacket::Synchronization {
+                        ssrc,
+                        count: 0,
+                        timestamp1: now_ts(&started),
+                        timestamp2: 0,
+                        timestamp3: 0,
+                    };
+                    let _ = sockets.send_control(&ck0, &control_addr).await;
                 }
                 data = sockets.recv_data() => match data {
                     Ok((packet, _)) => {
@@ -171,19 +191,32 @@ async fn run_pump(
                         info!("remote ended the session");
                         break;
                     }
-                    Ok((AppleMidiPacket::Synchronization { count, timestamp1, .. }, from)) => {
-                        // Minimal clock-sync keep-alive: answer CK0 with CK1 carrying
-                        // our current timestamp (100µs units).
-                        if count == 0 {
-                            let ts = (started.elapsed().as_micros() / 100) as u64;
-                            let reply = AppleMidiPacket::Synchronization {
-                                ssrc,
-                                count: 1,
-                                timestamp1,
-                                timestamp2: ts,
-                                timestamp3: 0,
-                            };
-                            let _ = sockets.send_control(&reply, &from).await;
+                    Ok((AppleMidiPacket::Synchronization { count, timestamp1, timestamp2, .. }, from)) => {
+                        // AppleMIDI clock-sync (100µs units). Answer a peer's CK0
+                        // with CK1, and complete our own exchange by answering the
+                        // peer's CK1 (a response to our CK0) with CK2.
+                        match count {
+                            0 => {
+                                let reply = AppleMidiPacket::Synchronization {
+                                    ssrc,
+                                    count: 1,
+                                    timestamp1,
+                                    timestamp2: now_ts(&started),
+                                    timestamp3: 0,
+                                };
+                                let _ = sockets.send_control(&reply, &from).await;
+                            }
+                            1 => {
+                                let reply = AppleMidiPacket::Synchronization {
+                                    ssrc,
+                                    count: 2,
+                                    timestamp1,
+                                    timestamp2,
+                                    timestamp3: now_ts(&started),
+                                };
+                                let _ = sockets.send_control(&reply, &from).await;
+                            }
+                            _ => {}
                         }
                     }
                     Ok(_) => {}
@@ -426,9 +459,11 @@ mod tests {
                 timestamp3: 0,
             };
             fake_ctl.send_to(&ck0.to_bytes(), from).await.unwrap();
+            // The pump also drives its own CK0 (count 0) as initiator; wait for
+            // the CK1 (count 1) that answers *our* probe.
             loop {
                 let (n, _) = fake_ctl.recv_from(&mut buf).await.unwrap();
-                if let Ok(p @ AppleMidiPacket::Synchronization { .. }) =
+                if let Ok(p @ AppleMidiPacket::Synchronization { count: 1, .. }) =
                     AppleMidiPacket::parse(&buf[..n])
                 {
                     *ck1_w.lock().unwrap() = Some(p);
@@ -470,6 +505,100 @@ mod tests {
             } => {
                 assert_eq!(count, 1, "reply must be CK1");
                 assert_eq!(timestamp1, 0xDEAD_BEEF, "CK1 echoes the CK0 timestamp1");
+            }
+            other => panic!("expected Synchronization, got {other:?}"),
+        }
+        pump.abort();
+    }
+
+    /// As the session initiator the pump must *drive* clock-sync: it sends its
+    /// own CK0 and, on the peer's CK1 response, completes the exchange with CK2.
+    #[tokio::test]
+    async fn pump_initiates_clock_sync_and_completes_with_ck2() {
+        use tokio::net::UdpSocket;
+
+        let fake_ctl = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let fake_ctl_port = fake_ctl.local_addr().unwrap().port();
+
+        let ck2 = Arc::new(Mutex::new(None::<AppleMidiPacket>));
+        let ck2_w = Arc::clone(&ck2);
+        tokio::spawn(async move {
+            let mut buf = [0u8; 2048];
+            let (n, from) = fake_ctl.recv_from(&mut buf).await.unwrap();
+            let AppleMidiPacket::Invitation { token, ssrc, .. } =
+                AppleMidiPacket::parse(&buf[..n]).unwrap()
+            else {
+                return;
+            };
+            let accept = AppleMidiPacket::InvitationAccepted {
+                version: APPLEMIDI_VERSION,
+                token,
+                ssrc,
+                name: "fake-peer".to_string(),
+            };
+            fake_ctl.send_to(&accept.to_bytes(), from).await.unwrap();
+
+            // Wait for the pump's own CK0 (count 0), respond with CK1, then
+            // capture the CK2 (count 2) that completes the exchange.
+            loop {
+                let (n, _) = fake_ctl.recv_from(&mut buf).await.unwrap();
+                match AppleMidiPacket::parse(&buf[..n]) {
+                    Ok(AppleMidiPacket::Synchronization {
+                        count: 0,
+                        timestamp1,
+                        ..
+                    }) => {
+                        let ck1 = AppleMidiPacket::Synchronization {
+                            ssrc,
+                            count: 1,
+                            timestamp1,
+                            timestamp2: 0x1234,
+                            timestamp3: 0,
+                        };
+                        fake_ctl.send_to(&ck1.to_bytes(), from).await.unwrap();
+                    }
+                    Ok(p @ AppleMidiPacket::Synchronization { count: 2, .. }) => {
+                        *ck2_w.lock().unwrap() = Some(p);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        let status = connecting_status();
+        let (notifier, _rx) = broadcast::channel(8);
+        let remote = RemoteEndpoint {
+            host: None,
+            addr: "127.0.0.1".to_string(),
+            port: fake_ctl_port,
+            port_id: "source-0".to_string(),
+        };
+        let pump = tokio::spawn(run_pump(
+            remote,
+            Box::new(RecordingSink::new()),
+            Arc::clone(&status),
+            notifier,
+            Arc::new(Notify::new()),
+        ));
+
+        let reply = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(p) = ck2.lock().unwrap().clone() {
+                    break p;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("received a CK2 within timeout");
+
+        match reply {
+            AppleMidiPacket::Synchronization {
+                count, timestamp2, ..
+            } => {
+                assert_eq!(count, 2, "initiator completes the exchange with CK2");
+                assert_eq!(timestamp2, 0x1234, "CK2 echoes the peer's CK1 timestamp2");
             }
             other => panic!("expected Synchronization, got {other:?}"),
         }
