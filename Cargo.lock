@@ -137,6 +137,7 @@ dependencies = [
  "hostname",
  "mdns-sd",
  "serde",
+ "serde_json",
  "thiserror",
  "tokio",
  "toml",
