@@ -11,6 +11,19 @@ data-plane daemons over control sockets).
 store, the HTTP/SSE attachment serving, and attachment fan-out. capmeshd stays stateless
 plumbing and drives `surfaced` over this socket; it carries no surface data itself.
 
+> **Control plane vs. data plane — a load-bearing split (operator directive).**
+> capmeshd is **control plane + service discovery only**: it advertises/discovers
+> surface capabilities on the mesh, wires topology, and reports status — it **never
+> pushes items or handles surface content**. **All data interaction** — serving the
+> surface, the durable inbox, and **pushing display items** — is `surfaced`'s job (the
+> data daemon), exposed over its **HTTP/SSE** surface and its **embedded MCP server**
+> (§8), which an agent talks to **directly**. Over `surface-ctl` capmeshd uses the
+> **control** methods — register a surface (`create-surface`), discover
+> (`list-surfaces`), inspect (`list-items`), lifecycle. Content push (`send-item`) and
+> view control (`set-view`) are **data-plane** operations: the primary path is
+> `surfaced`'s HTTP/MCP, and they are offered on the local socket only as a co-located
+> convenience — **capmeshd does not push content**.
+
 This is a **sibling** of the mount protocol in `CONTROL-PROTOCOL.md`, not a section of
 it: the two share only the **framing** (§1 there). `capmesh-ctl` proper is the typed
 port + mount/unmount/negotiation model for streaming data planes (nmidid, audio, …);
@@ -97,6 +110,12 @@ A **surface view** (the `list-items` result) is the surface's current state:
 | `send-item` | `{surface-id, item, promote?}` | `{id, ts}` | append a display item to the inbox (and, if `promote`, make it the main view) |
 | `set-view` | `{surface-id, item-id?}` | `{}` | select which item the main view shows (`item-id` null/absent clears it) |
 | `list-items` | `{surface-id}` | `SurfaceView` | the surface's current state (title, main view, items) |
+| `list-surfaces` | `{}` | `{surfaces: [SurfaceSummary]}` | discover every registered surface (id, title, item-count, current-view) — the control/discovery method |
+
+The **control/discovery** methods (`create-surface`, `list-surfaces`, `list-items`)
+are capmeshd's use of this socket. `send-item` and `set-view` are **data-plane**
+operations (see the split above): capmeshd does not push content; an agent uses
+`surfaced`'s HTTP/MCP directly, and these socket methods are a co-located convenience.
 
 Every method but `hello` requires a completed `hello`. `surface-id` MUST be a path-safe
 id (`[A-Za-z0-9._-]+`, not `.`/`..`, ≤128 chars); otherwise `invalid-surface-id`.
@@ -184,8 +203,10 @@ JSON-RPC `error` with a machine code in `data.code` (mirrors CONTROL-PROTOCOL.md
 `/s/{id}/items`, `/s/{id}/view`); see DESIGN §10.1. `surface-ctl` and the HTTP surface act on
 the **same** store, so:
 
-- A `send-item` over this socket appears immediately on every attached browser tab (SSE
-  fan-out), and in `list-items` and `GET /s/{id}/items` alike.
+- The **data-plane push paths** are all `surfaced`'s: `POST /s/{id}/items`, the MCP
+  `send_item` tool (§8), and (as a local convenience) `send-item` over this socket. Any
+  of them appears immediately on every attached browser tab (SSE fan-out) and in
+  `list-items` / `GET /s/{id}/items` alike — they share one store.
 - An **attach token** set via `create-surface` is enforced on the HTTP side: attaching to a
   protected surface requires the token (`…/s/{id}?token=<t>`, or an `X-Surface-Token` /
   `Authorization: Bearer` header). This socket, being local-trust, is never token-gated.
@@ -196,10 +217,37 @@ the **same** store, so:
 
 - The framing (§1), `hello` with `capabilities:["surface","durable-inbox","attach-fanout"]`.
 - `create-surface` (title + attach token), `send-item` (all item types, `promote`),
-  `set-view`, `list-items`.
-- Durable per-surface inbox (on-disk NDJSON, replayed on restart), bounded in memory.
+  `set-view`, `list-items`, `list-surfaces`.
+- Durable per-surface inbox (on-disk NDJSON, replayed on restart + compacted), bounded in memory.
 - SSE fan-out of pushes/view-changes to attached tabs.
+- An **embedded MCP server** (§8) — the agent-facing data-plane API.
 
-Later: attach-lifecycle notifications (daemon → capmeshd, e.g. attach-count), a
-`delete-surface`/`clear` method, and log compaction. The MCP `send` tool (DESIGN §7) lives
-on capmeshd's MCP server and drives `send-item` over this socket.
+Later: attach-lifecycle notifications (daemon → capmeshd, e.g. attach-count) and a
+`delete-surface`/`clear` method.
+
+---
+
+## 8. The embedded MCP server (agent-facing data plane)
+
+Because **content push is the data daemon's job** (not capmeshd's — see the split in the
+intro), `surfaced` hosts its **own MCP server** so an agent drives surfaces **directly**,
+without capmeshd in the path. It is served at **`/mcp`** on `surfaced`'s HTTP server
+(Streamable HTTP: the agent POSTs a JSON-RPC message and gets a JSON response; a
+notification gets `202`; `GET /mcp` is `405` — no server-initiated stream). It shares the
+same `SurfaceStore`, so an agent's push lands on the live surface a browser is attached to.
+
+Tools:
+
+| tool | arguments | does |
+|---|---|---|
+| `list_surfaces` | — | list every registered surface (id, title, item-count, current-view) |
+| `list_items` | `{surface-id}` | the display items on a surface |
+| `send_item` | `{surface-id, item, promote?}` | post a display item (created if new); `promote` (default `true`) also shows it in the main view |
+
+`item` is the display-item shape (§4): `{"type":"pdf","url":…}`, `{"type":"text","body":…}`,
+`{"type":"link","url":…,"title":…}`, `{"type":"navigate","url":…}`, `{"type":"html","markup":…}`,
+or `{"type":"script","code":…}`.
+
+**Auth.** Optional: run `surfaced --mcp-token <t>` (or `SURFACED_MCP_TOKEN`) and the agent
+sends `Authorization: Bearer <t>`; omitted, `/mcp` is open (trust the LAN / a reverse proxy).
+Point an MCP client at `http://<host>:8787/mcp` (or `…/surfaced/mcp` behind nginx).
