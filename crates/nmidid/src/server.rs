@@ -14,23 +14,27 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufRea
 use tokio::net::UnixListener;
 use tracing::{debug, info, warn};
 
+use crate::mounts::MountRegistry;
 use crate::ports::PortProvider;
 use crate::protocol::{
-    self, CAPABILITIES, DAEMON_ID, DaemonError, INVALID_PARAMS, METHOD_NOT_FOUND, PARSE_ERROR,
-    PROTOCOL_MAJOR, Request,
+    self, CAPABILITIES, DAEMON_ID, DaemonError, INVALID_PARAMS, METHOD_NOT_FOUND, MountSpec,
+    PARSE_ERROR, PROTOCOL_MAJOR, Request,
 };
 
-/// Per-connection dispatch state. One `Session` exists per accepted connection.
+/// Per-connection dispatch state. One `Session` exists per accepted connection;
+/// the `mounts` registry is shared daemon-wide across every connection.
 pub struct Session {
     ports: Arc<dyn PortProvider>,
+    mounts: Arc<MountRegistry>,
     /// A compatible `hello` must complete before any other method (§1.2).
     hello_done: bool,
 }
 
 impl Session {
-    pub fn new(ports: Arc<dyn PortProvider>) -> Self {
+    pub fn new(ports: Arc<dyn PortProvider>, mounts: Arc<MountRegistry>) -> Self {
         Session {
             ports,
+            mounts,
             hello_done: false,
         }
     }
@@ -50,12 +54,45 @@ impl Session {
             "hello" => self.handle_hello(params),
             "list-ports" => self.handle_list_ports(),
             "describe-port" => self.handle_describe_port(params),
+            "mount" => self.handle_mount(params),
+            "unmount" => self.handle_unmount(params),
+            "mount-status" => self.handle_mount_status(params),
             other => Err(DaemonError::protocol(
                 METHOD_NOT_FOUND,
                 "method-not-found",
                 format!("unknown method '{other}'"),
             )),
         }
+    }
+
+    fn handle_mount(&self, params: &Value) -> Result<Value, DaemonError> {
+        let spec: MountSpec = serde_json::from_value(params.clone()).map_err(|e| {
+            DaemonError::protocol(
+                INVALID_PARAMS,
+                "invalid-params",
+                format!("invalid mount spec: {e}"),
+            )
+        })?;
+        self.mounts.mount(spec)
+    }
+
+    fn handle_unmount(&self, params: &Value) -> Result<Value, DaemonError> {
+        let mount_id = params
+            .get("mount-id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                DaemonError::protocol(
+                    INVALID_PARAMS,
+                    "invalid-params",
+                    "unmount requires a 'mount-id'",
+                )
+            })?;
+        Ok(self.mounts.unmount(mount_id))
+    }
+
+    fn handle_mount_status(&self, params: &Value) -> Result<Value, DaemonError> {
+        let mount_id = params.get("mount-id").and_then(Value::as_str);
+        Ok(self.mounts.status(mount_id))
     }
 
     fn handle_hello(&mut self, params: &Value) -> Result<Value, DaemonError> {
@@ -169,12 +206,13 @@ pub async fn serve_connection<R, W>(
     mut reader: R,
     mut writer: W,
     ports: Arc<dyn PortProvider>,
+    mounts: Arc<MountRegistry>,
 ) -> Result<()>
 where
     R: AsyncBufRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let mut session = Session::new(ports);
+    let mut session = Session::new(ports, mounts);
     let mut line = String::new();
 
     loop {
@@ -216,8 +254,13 @@ where
 ///
 /// Any stale socket file at `path` is removed first. The socket is set to
 /// owner/group read-write (`0o660`) — the local trust boundary (§1.1). Peer
-/// credential enforcement is a later increment.
-pub async fn run(path: impl AsRef<Path>, ports: Arc<dyn PortProvider>) -> Result<()> {
+/// credential enforcement is a later increment. `mounts` is the shared,
+/// daemon-wide mount registry.
+pub async fn run(
+    path: impl AsRef<Path>,
+    ports: Arc<dyn PortProvider>,
+    mounts: Arc<MountRegistry>,
+) -> Result<()> {
     let path = path.as_ref();
 
     // Remove a stale socket from a previous run so bind() doesn't fail with
@@ -243,10 +286,11 @@ pub async fn run(path: impl AsRef<Path>, ports: Arc<dyn PortProvider>) -> Result
         let (stream, _addr) = listener.accept().await.context("accepting connection")?;
         debug!("control connection accepted");
         let ports = Arc::clone(&ports);
+        let mounts = Arc::clone(&mounts);
         tokio::spawn(async move {
             let (read_half, write_half) = stream.into_split();
             let reader = BufReader::new(read_half);
-            if let Err(e) = serve_connection(reader, write_half, ports).await {
+            if let Err(e) = serve_connection(reader, write_half, ports, mounts).await {
                 warn!("control connection ended with error: {e}");
             } else {
                 debug!("control connection closed");
@@ -258,6 +302,7 @@ pub async fn run(path: impl AsRef<Path>, ports: Arc<dyn PortProvider>) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mounts::NullMounter;
     use crate::protocol::{Format, PortDescriptor};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -298,8 +343,14 @@ mod tests {
     async fn exchange(ports: Arc<dyn PortProvider>, requests: &[Value]) -> Vec<Value> {
         let (mut client, server) = tokio::io::duplex(64 * 1024);
         let (sr, sw) = tokio::io::split(server);
+        let mounts = Arc::new(MountRegistry::new(
+            Arc::new(NullMounter),
+            Arc::clone(&ports),
+        ));
         let handle = tokio::spawn(async move {
-            serve_connection(BufReader::new(sr), sw, ports).await.ok();
+            serve_connection(BufReader::new(sr), sw, ports, mounts)
+                .await
+                .ok();
         });
 
         for req in requests {
@@ -367,6 +418,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mount_roundtrip_over_socket() {
+        let mount = serde_json::json!({"jsonrpc":"2.0","id":2,"method":"mount","params":{
+            "mount-id":"m1","role":"mirror-source",
+            "local":{"virtual":true,"name":"laptop: Keystation"},
+            "remote":{"host":"laptop","addr":"192.168.1.23","port":5004,"port-id":"source-0"},
+            "format":{"codec":"midi1"}}});
+        let status =
+            serde_json::json!({"jsonrpc":"2.0","id":3,"method":"mount-status","params":{}});
+        let unmount = serde_json::json!({"jsonrpc":"2.0","id":4,"method":"unmount","params":{"mount-id":"m1"}});
+        let status2 =
+            serde_json::json!({"jsonrpc":"2.0","id":5,"method":"mount-status","params":{}});
+        let out = exchange(sample_ports(), &[hello(), mount, status, unmount, status2]).await;
+        assert_eq!(out[1]["result"]["state"], "connecting");
+        assert_eq!(out[1]["result"]["mount-id"], "m1");
+        assert_eq!(out[2]["result"]["mounts"].as_array().unwrap().len(), 1);
+        assert_eq!(out[2]["result"]["mounts"][0]["state"], "connecting");
+        assert!(out[3]["result"].is_object()); // unmount → {}
+        assert_eq!(out[4]["result"]["mounts"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn mount_unknown_remote_port_is_no_such_port() {
+        let mount = serde_json::json!({"jsonrpc":"2.0","id":2,"method":"mount","params":{
+            "mount-id":"m1","role":"mirror-source",
+            "local":{"virtual":true},
+            "remote":{"addr":"192.168.1.23","port":5004,"port-id":"ghost-9"},
+            "format":{"codec":"midi1"}}});
+        let out = exchange(sample_ports(), &[hello(), mount]).await;
+        assert_eq!(out[1]["error"]["data"]["code"], "no-such-port");
+    }
+
+    #[tokio::test]
     async fn unsupported_protocol_major_is_rejected() {
         let bad = serde_json::json!({"jsonrpc":"2.0","id":1,"method":"hello",
             "params":{"protocol":"2","client":"capmeshd/0.1"}});
@@ -379,8 +462,15 @@ mod tests {
         let (mut client, server) = tokio::io::duplex(64 * 1024);
         let (sr, sw) = tokio::io::split(server);
         let ports = sample_ports();
-        let handle =
-            tokio::spawn(async move { serve_connection(BufReader::new(sr), sw, ports).await.ok() });
+        let mounts = Arc::new(MountRegistry::new(
+            Arc::new(NullMounter),
+            Arc::clone(&ports),
+        ));
+        let handle = tokio::spawn(async move {
+            serve_connection(BufReader::new(sr), sw, ports, mounts)
+                .await
+                .ok()
+        });
 
         client.write_all(b"{ this is not json\n").await.unwrap();
         let mut hello_line = serde_json::to_vec(&hello()).unwrap();
