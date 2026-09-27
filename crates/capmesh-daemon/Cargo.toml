@@ -1,0 +1,14 @@
+[package]
+name = "capmesh-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "capmesh control-plane core: the desired-mount reconciler and format negotiation"
+
+[dependencies]
+capmesh-ctl = { path = "../capmesh-ctl" }
+tracing.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+serde_json.workspace = true

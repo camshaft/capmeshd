@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 capmesh-discovery = { path = "../capmesh-discovery" }
 capmesh-ctl = { path = "../capmesh-ctl" }
+capmesh-daemon = { path = "../capmesh-daemon" }
 tokio.workspace = true
 mdns-sd.workspace = true
 serde.workspace = true
