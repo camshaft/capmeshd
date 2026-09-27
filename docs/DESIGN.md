@@ -20,8 +20,9 @@ deployment.
 The mental model is a **LAN-native, distributed IFTTT**: pipe anything to anything, on the fly,
 local-first, controllable by agents.
 
-> **The one-line architecture:** `capmeshd` advertises typed capabilities over DNS-SD and
-> reconciles declarative "mounts" by driving existing transports through **capability plugins**,
+> **The one-line architecture:** `capmeshd` is **stateless control-plane plumbing** — it advertises
+> typed capabilities over DNS-SD and reconciles declarative "mounts" by driving each capability's
+> own **data-plane daemon over a control socket** (never carrying data or transport state itself),
 > with an **MCP server** (that any host can run as a mesh client, not a hub) exposing
 > discover / describe / connect / disconnect / status to agents, and **NixOS modules** that make
 > advertisement and permanent mounts a single declarative act deployed with Colmena.
@@ -57,23 +58,33 @@ The load-bearing decision: **centralize only the *view*, never the data.**
                        control RPC          │               │  control RPC
    host A (source)     (cluster-key auth)   │               │                 host B (sink)
    ┌──────────────────────────┐   DNS-SD    ▼               ▼   DNS-SD    ┌──────────────────────────┐
-   │ capmeshd                 │◄───────────  _capmesh._tcp  ───────────►│ capmeshd                 │
-   │  • advertise caps        │  (distributed discovery; zero-config)   │  • desired-mount set      │
-   │  • plugin: midi/audio/…  │                                         │  • reconcile actual↔desired│
+   │ capmeshd (stateless)     │◄───────────  _capmesh._tcp  ───────────►│ capmeshd (stateless)     │
+   │  • advertise caps        │  (distributed discovery; zero-config)   │  • reconcile actual↔desired│
    └───────────┬──────────────┘                                        └────────────┬──────────────┘
-               │        DATA PLANE — always DIRECT peer↔peer, per capability          │
-               ▼        (RTP-MIDI / PipeWire+roc / AES67 / Sunshine|wayvnc / WS)       ▼
-   physical MIDI device / PipeWire node / screen / Moonraker  ══════════════►  local virtual endpoint
+    control socket │ (drive LOCAL data-plane daemon; capmeshd carries no data)  control socket │
+                   ▼                                                                  ▼
+   ┌──────────────────────────┐      DATA PLANE — daemon↔daemon,        ┌──────────────────────────┐
+   │ data-plane daemon        │      DIRECT peer-to-peer                │ data-plane daemon        │
+   │  nmidid / PipeWire /     │◄══════════════════════════════════════►│  nmidid / PipeWire /     │
+   │  Moonraker / Sunshine    │  RTP-MIDI / roc·AES67 / WS / video      │  Moonraker / Sunshine    │
+   └───────────┬──────────────┘                                        └────────────┬──────────────┘
+               ▼                                                                     ▼
+   physical MIDI device / PipeWire node / screen / printer            local virtual endpoint
 ```
 
 - **Discovery = distributed (mDNS/DNS-SD).** No host registers to a hub. Daemons announce and
   browse `_capmesh._tcp`. Join/leave is zero-config — the plug-n-play property the operator wants.
-- **Data plane = strictly peer-to-peer, direct.** A mount is always a direct host↔host connection.
-  **No media ever transits a hub** → no bottleneck, no single point of failure for live wiring.
+- **`capmeshd` = stateless control-plane plumbing.** It holds no persistent authoritative state and
+  **never carries data**. It reconciles mounts by driving each capability's own **data-plane daemon
+  over a control socket** (§4); a restart rebuilds actual-state from declarative config + querying
+  those sockets.
+- **Data plane = strictly peer-to-peer, direct — daemon↔daemon.** A mount is a direct connection
+  between the two hosts' data-plane daemons (nmidid↔nmidid, etc.). **No media ever transits a hub,
+  and it never transits capmeshd** → no bottleneck, no single point of failure for live wiring.
 - **Control plane / MCP = a mesh *client*, not a hub.** The MCP server browses the mesh via mDNS
-  and issues control RPCs to peer daemons. The agent gets **one endpoint**; the distributed model
-  is preserved; if the MCP host dies, every existing mount keeps running because each sink daemon
-  self-heals its own desired-state.
+  and issues control RPCs to peer capmeshd daemons. The agent gets **one endpoint**; the distributed
+  model is preserved; if the MCP host dies, every existing mount keeps running because each sink
+  daemon self-heals its own desired-state.
 
 ---
 
@@ -99,44 +110,96 @@ the daemons reconcile. This is what makes it IFTTT-like and lets permanent mount
 
 ---
 
-## 4. The plugin system
+## 4. The plugin system — capmeshd drives data-plane daemons over control sockets
 
-`capmeshd` owns the control plane; **every capability kind is a plugin** implementing one trait.
-This is the operator's explicit design instinct, confirmed.
+**`capmeshd` is stateless plumbing.** It owns discovery, the desired-mount reconciler, the MCP
+surface, and cross-host coordination — but it **never links a transport crate and never carries
+data**. Each capability's *data plane* is owned by its **own daemon**, which exposes a **control
+socket**; a capmeshd **plugin is a thin client of that control socket**. This is the operator's
+directive: keep capmeshd stateless plumbing, push the data plane out to per-capability daemons.
+
+**The plugins live *inside* capmeshd — there is no separate per-capability "mapper" daemon.** Each
+plugin is an **in-process adapter module** compiled into capmeshd that knows how to speak one
+data-plane protocol; a **TOML config** (§4.1) declares which protocols this host supports and how to
+reach each data-plane daemon (socket path / endpoint / params). The only processes on a host are
+capmeshd plus the *real* data-plane services that would run regardless (PipeWire, Moonraker,
+`nmidid` for MIDI) — capmeshd never spawns a translation daemon of its own. "capmeshd links no
+transport crate" still holds: an adapter speaks a **protocol** (Unix socket / WebSocket / CLI), it
+does not link the transport's stack.
 
 ```rust
-/// One implementation per capability kind. capmeshd loads a set of these.
+/// One implementation per capability kind. Each plugin is a CLIENT of a local
+/// data-plane daemon's control socket — it holds no transport state itself.
 trait CapabilityPlugin {
     fn kind(&self) -> CapabilityKind;
 
-    /// Enumerate what this host currently offers/consumes for this kind
-    /// (e.g. midir port scan). Feeds the advertiser + the descriptor endpoint.
+    /// Ask the local data-plane daemon what this host offers/consumes for this
+    /// kind (e.g. nmidid's port list). Feeds the advertiser + descriptor endpoint.
     async fn scan_local(&self) -> Vec<Capability>;
 
-    /// Full typed descriptor for a locally-advertised capability (served over
-    /// the daemon's HTTP/RPC at the `descr` pointer from the TXT record).
+    /// Full typed descriptor for a locally-advertised capability.
     async fn describe(&self, cap: &CapabilityId) -> Descriptor;
 
-    /// Realize a data-plane connection: source cap (remote) → local sink (or
-    /// vice-versa). Returns a live MountHandle whose Drop tears the connection down.
+    /// Instruct the LOCAL data-plane daemon (over its control socket) to
+    /// establish/attach a peer-to-peer data connection to the remote source
+    /// (or accept from the remote sink). capmeshd is not in the data path.
+    /// The returned MountHandle's Drop tells the daemon to tear the link down.
     async fn mount(&self, spec: &MountSpec) -> Result<MountHandle>;
 
-    /// Liveness / throughput / last-seen for a live mount.
+    /// Query the data-plane daemon for liveness / throughput / last-seen.
     async fn status(&self, mount: &MountId) -> MountStatus;
 }
 ```
 
-**Two realization styles, both behind the same trait — this is the key generality:**
+**Two flavors of control socket, both behind the same trait — this is the key generality:**
 
-- **In-process** (MIDI): the plugin links `nmidi-core`, does the AppleMIDI `IN/OK/CK` handshake
-  (already implemented), then **creates a local virtual ALSA/CoreMIDI port and pumps RTP-MIDI both
-  ways** — closing nmidi's two `TODO`s directly in the mount path.
-- **Drive an external daemon** (audio/screen/printer): the plugin shells out to / speaks the IPC of
-  an existing service — `pw-cli`/libpipewire for audio, `wayvncctl` JSON-IPC or Sunshine for screen,
-  Moonraker/PrusaLink WebSocket for the printer. `capmeshd` never carries that data itself.
+- **Daemons with a native control protocol** (audio/screen/printer): the plugin speaks the existing
+  protocol directly — `pw-cli`/libpipewire for PipeWire, `wayvncctl` JSON-IPC or Sunshine for
+  screen, Moonraker WebSocket JSON-RPC / PrusaLink HTTP for the printer. No new daemon to write.
+- **Daemons we extend to speak a *capmesh control protocol*** (MIDI): **nmidi is extended into a
+  data-plane daemon (`nmidid`) that exposes a control socket** — "create a virtual ALSA/CoreMIDI
+  port and connect RTP-MIDI to `<peer addr>`" / "tear it down" — and owns the AppleMIDI handshake +
+  the bidirectional pump entirely. capmeshd's MIDI plugin just drives that socket. **This is a
+  separate nmidi workstream** (see §11): closing nmidi's two `TODO`s *and* wrapping them behind a
+  control socket, so nmidi becomes "purely in charge of the MIDI data plane."
 
-Adding a new capability = implementing this one trait. `MountHandle: Drop` gives idempotent
-teardown for free and makes the reconciler simple (drop the handle to converge toward "unmounted").
+The capmesh control protocol (flavor 2) is a small line/JSON-RPC protocol over a Unix domain socket,
+specified in `docs/CONTROL-PROTOCOL.md` (to be written): `list-caps`, `mount {local-port, peer,
+descriptor}`, `unmount {mount-id}`, `status {mount-id}`. Any future first-party data-plane daemon
+implements it and drops straight into capmeshd. Adding a capability kind = one plugin (a socket
+client) + either an existing daemon's native protocol or a small daemon speaking this protocol.
+`MountHandle: Drop` gives idempotent teardown (the reconciler converges "unmounted" by dropping it).
+
+### 4.1 The data-plane config (TOML)
+
+capmeshd is **config-driven**: a TOML file declares which data-plane protocols this host supports
+and how each in-process adapter reaches its local data-plane daemon. The NixOS module (§9) renders
+this file from `services.capmesh.advertise.*`, so the operator never hand-writes it — but it is the
+single, inspectable source of "what this host can plumb."
+
+```toml
+# /etc/capmesh/capmesh.toml  (rendered by the NixOS module)
+host-id = "green-machine"
+cluster-key-file = "/run/agenix/capmesh-cluster.key"
+
+[dataplane.midi]
+protocol = "nmidi-ctl"                       # the capmesh control-socket protocol (§4, flavor 2)
+socket   = "/run/nmidid.sock"                # nmidid owns the RTP-MIDI data plane
+
+[dataplane.audio]
+protocol = "pipewire"                        # native protocol; adapter drives pw-cli / libpipewire
+
+[dataplane.printer.voron]
+protocol = "moonraker-jsonrpc"               # native protocol
+endpoint = "ws://127.0.0.1:7125/websocket"
+
+[dataplane.printer.prusa-mk4]
+protocol = "prusalink-http"
+endpoint = "http://prusa-mk4.lan/api"
+```
+
+A plugin adapter is selected by `protocol`; adding a host binding is a config line, adding a *new*
+protocol is one in-process adapter module. No adapter → no advertisement for that kind on that host.
 
 ---
 
@@ -248,30 +311,43 @@ a target).
 
 ## 10. Plugins v1
 
-| Kind | Data-plane transport (composed) | Realization | Notes |
+Each row is an **in-process adapter** in capmeshd (§4) that drives an external data-plane daemon.
+
+| Kind | Data-plane daemon | Adapter (control protocol) | Notes |
 |---|---|---|---|
-| `midi` | RTP-MIDI / AppleMIDI (**nmidi**) | in-process | closes nmidi's two TODOs; first plugin |
-| `audio` | PipeWire + **roc** (resilient) / PipeWire-RTP + AES67 (interop) | drive external | WirePlumber keeps links |
-| `screen` | **Sunshine/Moonlight** (media-grade) / **wayvnc** (`wayvncctl` IPC) | drive external | "mirror" + Cast-style "display URL" |
-| `control-api` | **Moonraker** JSON-RPC/WS *and* **PrusaLink** HTTP | drive external | generic over both printers; `invoke` in MCP |
+| `midi` | **`nmidid`** (RTP-MIDI / AppleMIDI) | `nmidi-ctl` Unix socket (§4 flavor 2) | separate nmidi workstream extends it into a data-plane daemon + closes its two TODOs |
+| `audio` | PipeWire + **roc** / PipeWire-RTP + AES67 | native — `pw-cli` / libpipewire | WirePlumber keeps links |
+| `screen` | **Sunshine/Moonlight** / **wayvnc** | native — `wayvncctl` JSON-IPC / Sunshine | "mirror" + Cast-style "display URL" |
+| `control-api` | **Moonraker** / **PrusaLink** | native — Moonraker WS JSON-RPC / PrusaLink HTTP | generic over both printers; `invoke` in MCP |
 
 ---
 
 ## 11. Phased execution plan (starts from nmidi)
 
-**M0 — Finish the MIDI vertical on nmidi; prove the whole shape end-to-end.**
+M0 runs as **two coordinated workstreams** (two build verticals):
+
+**M0a — nmidi → `nmidid` (a data-plane daemon with a control socket).** *Separate nmidi workstream.*
 - Close nmidi's two `TODO`s (`nmidi-client/src/main.rs`): a proper connection **state machine**
   (Connecting → Connected → Disconnected/Rejected) and **MIDI mounting** — create a local virtual
-  ALSA/CoreMIDI port + bidirectional RTP-MIDI forwarding.
-- Add a minimal long-running control API (`discover`/`connect`/`disconnect`/`status`, MIDI only).
-- First NixOS module (`services.capmesh.advertise.midi`), deploy to two machines via Colmena.
+  ALSA/CoreMIDI port + bidirectional RTP-MIDI forwarding (`midir::create_virtual`).
+- Wrap those behind a **`nmidi-ctl` control socket** (`list-caps` / `mount {local-port, peer,
+  descriptor}` / `unmount` / `status`) so nmidi becomes "purely in charge of the MIDI data plane."
+- **Exit:** `nmidid` creates/tears-down a mount on a control-socket command; data flows nmidid↔nmidid.
+
+**M0b — capmeshd MIDI slice (drives `nmidid`).** *capmeshd workstream.*
+- Minimal capmeshd: `_capmesh._tcp` advertise + browse (lift nmidi's `ServiceAdvertiser`), the
+  desired-mount reconciler, a `midi` adapter that speaks `nmidi-ctl`, and a minimal control API
+  (`discover`/`connect`/`disconnect`/`status`, MIDI only) reading the §4.1 TOML.
+- First NixOS module (`services.capmesh.advertise.midi`) rendering the TOML; deploy to two machines
+  via Colmena.
 - **Exit / demo:** a **physical MIDI device plugged into one host plays a SuperCollider instance on
   another host** (cross-OS CoreMIDI↔ALSA), wired from one command. This is the operator's milestone.
 
-**M1 — Extract the generic abstraction.** Refactor into `capmesh-discovery` (generalized
+**M1 — Extract the generic abstraction.** Refactor capmeshd into `capmesh-discovery` (generalized
 advertiser/browse over `_capmesh._tcp` + descriptor fetch), `capmesh-model` (capability descriptor +
-mount types), `capmesh-daemon` (reconcile loop + the `CapabilityPlugin` trait). MIDI becomes the
-first plugin. **Exit:** MIDI works unchanged through the generic daemon; a new kind = one trait impl.
+mount types), `capmesh-daemon` (reconcile loop + the in-process `CapabilityPlugin` adapter trait).
+MIDI is the first adapter. **Exit:** MIDI works unchanged through the generic daemon; a new kind = one
+adapter module + a §4.1 config entry.
 
 **M2 — MCP server.** Wrap the control API in the §7 MCP server (Streamable HTTP). **Exit:** an agent
 discovers and wires MIDI mounts over the mesh with no bespoke glue.
@@ -298,7 +374,7 @@ pure-IoT slice.
 |---|---|---|---|
 | D1 | Distributed vs central | fully distributed / central hub / **split (control-view central, data+discovery distributed)** | **split** (§2) |
 | D2 | Control model | imperative-only / **reconcile** / hybrid | **reconcile** (§6) — permanent mounts declarative, temp = TTL lease |
-| D3 | Plugin realization | in-process only / external-daemon only / **both behind one trait** | **both** (§4) |
+| D3 | Plugin location & data plane | separate mapper daemon per kind / **in-process TOML-driven adapters in capmeshd, data-plane daemons stay external** | **in-process adapters** (§4, §4.1); capmeshd stateless plumbing, drives data-plane daemons over control sockets, carries no data |
 | D4 | Security v1 | open LAN / **cluster key via age** / mTLS now | **cluster key via age** (§8), mTLS path later |
 | D5 | nmidi relationship | wrap standalone / **generalize into capmesh crates** | **generalize** (§4, §11-M1) |
 | D6 | Discovery transport | central registry / **mDNS + descriptor pointer** | **mDNS + descriptor pointer** (§5) |

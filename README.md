@@ -7,8 +7,10 @@ plane over transports that already exist. Local-first. Controllable by AI agents
 
 > A **LAN-native, distributed IFTTT**: pipe anything to anything, on the fly.
 
+- **`capmeshd`** is **stateless control-plane plumbing** — in-process, TOML-driven adapters drive
+  each capability's own data-plane daemon over a control socket; it carries no data itself.
 - **Discovery** is distributed (mDNS/DNS-SD) — zero-config, plug-n-play.
-- **Data plane** is strictly peer-to-peer — no media transits a hub.
+- **Data plane** is strictly peer-to-peer, daemon↔daemon — no media transits a hub or capmeshd.
 - **Control / MCP** is a mesh *client* any host can run — one endpoint for the agent, no SPOF.
 - **Trust boundary** = the hosts managed by [`dotfiles`](https://github.com/camshaft/dotfiles),
   gated by a cluster key provisioned via `age`.
@@ -21,12 +23,14 @@ phased plan from `nmidi` outward.
 
 **First milestone (M0):** a physical MIDI device plugged into one host plays a SuperCollider
 instance on another host, cross-OS (CoreMIDI ↔ ALSA), wired from one command — proving the whole
-shape end-to-end. Built by closing [`nmidi`](https://github.com/camshaft/nmidi)'s two mounting
-`TODO`s.
+shape end-to-end. Built as two workstreams: extend [`nmidi`](https://github.com/camshaft/nmidi)
+into a MIDI **data-plane daemon** (`nmidid`) with a control socket (closing its two mounting
+`TODO`s), and a minimal capmeshd MIDI adapter that drives it.
 
 ## Related repos
 
-- [`camshaft/nmidi`](https://github.com/camshaft/nmidi) — MIDI-over-network seed (the first plugin).
+- [`camshaft/nmidi`](https://github.com/camshaft/nmidi) — MIDI-over-network seed; becomes `nmidid`,
+  the MIDI data-plane daemon capmeshd drives (the first adapter's target).
 - [`camshaft/dotfiles`](https://github.com/camshaft/dotfiles) — NixOS fleet (Colmena, Avahi); where
   the `services.capmesh` module and permanent mounts live.
 - [`camshaft/printers`](https://github.com/camshaft/printers) — Voron / Klipper / Moonraker (the
