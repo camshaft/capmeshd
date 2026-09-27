@@ -113,8 +113,9 @@ the daemons reconcile. This is what makes it IFTTT-like and lets permanent mount
 The data-plane concepts **are unified** — borrowing PipeWire's proven node/port/link shape,
 mesh-wide. A capability is a **node** exposing typed **ports**. Each port has:
 
-- a **port kind**: **`stream`** (a typed byte/event stream — midi/audio/video) or **`rpc`** (a
-  request/response control handle — e.g. Moonraker); and
+- a **port kind**: **`stream`** (a typed byte/event stream — midi/audio/video), **`rpc`** (a
+  request/response control handle — e.g. Moonraker), or **`surface`** (a durable, scriptable display
+  sink — §10.1); and
 - for `stream` ports, a **direction**: **`source`** (produces) or **`sink`** (consumes).
 
 A **mount is a type-compatible link** between ports: a `stream` source links only to a `stream`
@@ -307,6 +308,8 @@ matches Home Assistant's proven pattern) + stdio for local dev. Runs as a mesh c
   - `status(mount-id? | host? | all)` → live health/throughput/last-seen.
   - `invoke(capability-id, method, params)` → escape hatch for `control-api` kinds (Moonraker
     `printer.*`, PrusaLink endpoints).
+  - `send(surface-id, item)` → push a display item to a `surface` sink (§10.1): `{navigate|pdf|text|
+    link|html|script, ...}`. The "voice agent, put this PDF manual page on my phone" verb.
 - **Resources** — `capmesh://topology` (current graph snapshot), `capmesh://host/<id>` (read-only
   live state).
 - **Prompts** — worked examples ("connect the studio keyboard to the SuperCollider host temporarily").
@@ -377,6 +380,61 @@ Each row is an **in-process adapter** in capmeshd (§4) that drives an external 
 | `audio` | PipeWire + **roc** / PipeWire-RTP + AES67 | native — `pw-cli` / libpipewire | WirePlumber keeps links |
 | `screen` | **Sunshine/Moonlight** / **wayvnc** | native — `wayvncctl` JSON-IPC / Sunshine | "mirror" + Cast-style "display URL" |
 | `control-api` | **Moonraker** / **PrusaLink** | native — Moonraker WS JSON-RPC / PrusaLink HTTP | generic over both printers; `invoke` in MCP |
+| `surface` | **`surfaced`** (HTTP/WS server, our own) | `surface-ctl` (capmesh-ctl + surface ops) | durable scriptable display sink; browser tab = attachment; see §10.1 |
+
+---
+
+## 10.1 The browser surface capability (`surface`)
+
+A **surface** is a **durable, addressable, arbitrarily-scriptable display sink** on the mesh — the
+"aim a browser at it and it becomes a screen you can push to" capability. The design turns on one
+split and one unification.
+
+**Split — the device is NOT the tab.** The logical surface lives in a small **`surfaced`
+data-plane daemon** (an HTTP/WS server) and holds all state; it exists whether or not a browser is
+open. An actual **browser tab is an ephemeral *attachment*** pointed at `http://<host>:<port>/s/
+<surface-id>`, 0..N of them, connected back over WebSocket/SSE. On attach it syncs current state +
+streams live updates; on close, the surface and its history live on. This is what makes "register a
+browser and have it persist even when it's not open" real, and it's declared permanent in NixOS
+(§9) like any durable device.
+
+**Unification — a surface IS a persistent inbox.** Every push appends a **display item** to a
+**durable, ordered, bounded inbox** the surface keeps (survives close, survives `surfaced` restart
+via on-disk state). The tab renders **two zones**: a **main view** = the currently-selected item
+(latest by default; the operator can scroll back and re-select any past item) and a **visible inbox
+feed** listing everything ever pushed. So "just show the current thing" and "see everything that's
+been pushed" are the same model — the current view is the head of the inbox, and the feed is its
+history. A push may target the inbox only (a link that waits for you) or also promote to the main
+view (a PDF the agent wants shown now).
+
+**Arbitrarily scriptable — because `surfaced` serves *our own* page.** The attachment page is
+same-origin to `surfaced`, so a display item can be as rich as **arbitrary HTML / JS / a live
+component**, not just a URL. Built-in item types (structured, for convenience):
+
+| item type | renders |
+|---|---|
+| `navigate {url}` | an **iframe** to a third-party URL (one thing among many) |
+| `pdf {url}` | a PDF viewer (the "put this manual page on my phone" case) |
+| `text {body}` / `link {url, title}` | a text note / a clickable link in the feed |
+| `html {markup}` | arbitrary same-origin DOM we control |
+| `script {code}` | arbitrary JS run in the surface page — full scripting escape hatch |
+
+**Why arbitrary script is safe here:** pushes are gated by the **trust boundary** (§8) — only
+cluster-authenticated mesh hosts / trusted agents can `send` to a surface — so "run arbitrary JS in
+my display" is a *feature the surface trusts its controller with*, not an open hole. **Untrusted
+third-party web content is the case we sandbox:** a random website/PDF is rendered inside an
+**iframe** (isolated by same-origin policy), never injected as script. So: we fully script *our*
+surface; we *contain* someone else's page.
+
+**Attachment auth.** A browser opening `…/s/<id>?token=<t>` presents a **per-surface token**
+(the surface's `send`-capability credential is separate). This suits a **phone** — not a
+dotfiles-managed host, so it can't carry the cluster key — while keeping the surface itself a
+trusted, mesh-advertised device. Path to a stronger per-device pairing later.
+
+**Data-plane daemon:** `surfaced` is a first-party daemon (like `nmidid`) — it speaks an extended
+`capmesh-ctl` (`surface-ctl`: `create-surface` / `send-item` / `set-view` / `list-items` / attach
+lifecycle) over the local control socket; capmeshd's `surface` adapter drives it. `surfaced` owns
+the HTTP/WS serving, the inbox store, and attachment fan-out; capmeshd stays stateless plumbing.
 
 ---
 
@@ -412,6 +470,14 @@ disappears when unplugged. A new kind = one adapter module + a §4.1 config entr
 **M2 — MCP server.** Wrap the control API in the §7 MCP server (Streamable HTTP). **Exit:** an agent
 discovers and wires MIDI mounts over the mesh with no bespoke glue.
 
+**M2.5 — Browser surface (agent-facing; operator-prioritized).** Build `surfaced` (§10.1): the
+HTTP/WS server, the durable per-surface **inbox store** + on-disk persistence, the attachment page
+(main view + visible inbox feed), `surface-ctl` over the control socket, capmeshd's `surface`
+adapter, the MCP `send` tool, per-surface token attach, and the `services.capmesh.advertise.surface`
+NixOS bit. **Exit:** a voice/agent pushes a **PDF manual page to the phone surface** and it appears
+(and stays in the phone's inbox, visible later even after the tab was closed). *This capability is
+independent of the media legs; it can land right after the MCP server rather than waiting for M3–M5.*
+
 **M3 — Audio.** `audio` plugin driving PipeWire + roc (resilient) and PipeWire-RTP/AES67 (interop).
 **Exit:** "route host X's audio to the living-room speakers" via agent/command.
 
@@ -441,6 +507,8 @@ pure-IoT slice.
 | D7 | Data-plane model | per-kind bespoke / **unified typed ports (`stream` source/sink + `rpc`)** | **unified typed ports** (§3.1) — control-APIs are `rpc` handles, not fake streams |
 | D8 | Virtual endpoints | mount = bytes only / **transports may materialize local virtual endpoints** | **virtual endpoints** (§3.2) — remote device shows up as a native local device |
 | D9 | Auto-mount | explicit connect only / **declarative discovery-driven selectors** | **auto-mount selectors** (§6.1), per-host opt-in, trust-gated — lands in M1 |
+| D10 | Browser as a capability | ephemeral tab / **durable `surface` sink = persistent inbox, tab is an attachment** | **durable surface** (§10.1) — device ≠ tab; every push logged in a visible inbox that survives close |
+| D11 | Surface scripting | fixed iframe+overlay only / **arbitrarily scriptable (our same-origin page)** | **arbitrary script** (§10.1) — safe because pushes are trust-gated; untrusted third-party pages sandboxed in an iframe |
 
 ---
 
@@ -455,3 +523,7 @@ pure-IoT slice.
 - **nmidi is early.** M0 is real work (the mounting TODO is the whole mount primitive in miniature),
   but it is exactly the work that validates the abstraction before generalizing.
 - **Don't rebuild Home Assistant** for the pure-IoT slice — adapt to it (M6).
+- **The surface's arbitrary-script power leans entirely on the trust boundary (§8).** `send` MUST be
+  cluster-authenticated; the per-surface attach token is for *rendering*, not for pushing. Untrusted
+  web content is only ever iframe-sandboxed, never injected as script. If the trust boundary is ever
+  weakened, revisit surface scripting first.
