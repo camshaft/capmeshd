@@ -2,8 +2,10 @@
 // /s/{id}; reads the surface id from the URL, attaches over SSE (an initial
 // snapshot then live updates), and renders the main view + inbox feed.
 //
-// Trust model (DESIGN §8): third-party navigate/pdf render inside a sandboxed
-// iframe that cannot reach this origin; trusted same-origin html/script (only
+// Trust model (DESIGN §8): a third-party `navigate` URL renders inside a
+// sandboxed iframe that cannot reach this origin; a `pdf` renders in a plain
+// iframe so the browser's built-in PDF viewer works (a sandbox blocks it) — safe
+// because the PDF is cross-origin/passive; trusted same-origin html/script (only
 // cluster-authenticated hosts can push) render/execute directly.
 (function () {
   var m = location.pathname.match(/\/s\/([^\/]+)/);
@@ -98,20 +100,47 @@
     mainEl.innerHTML = "";
     if (!it) { mainEl.innerHTML = '<div class="empty">No item selected yet.</div>'; return; }
     switch (it.type) {
-      case "navigate":
       case "pdf": {
-        var url = it.url || "";
+        var purl = it.url || "";
         // A browser silently refuses to load an http:// URL inside an https page
         // (mixed content). Rather than show a doomed blank frame, surface it.
+        if (location.protocol === "https:" && /^http:\/\//i.test(purl)) {
+          mainEl.appendChild(externalFallback(purl,
+            "This item's URL is http:// and a secure (https) page will not load it inline (mixed content). Open it directly:"));
+          break;
+        }
+        // Deep-link into the document when a page is given: the built-in PDF
+        // viewer honors the `#page=N` open parameter (1-based).
+        var psrc = purl;
+        if (it.page) {
+          psrc = purl + (purl.indexOf("#") >= 0 ? "&" : "#") + "page=" + encodeURIComponent(it.page);
+        }
+        var pwrap = document.createElement("div");
+        pwrap.className = "framewrap";
+        // NO sandbox: a sandboxed iframe blocks the browser's built-in PDF viewer
+        // (it renders a "cannot display" placeholder). The PDF is cross-origin and
+        // passive — it cannot script this page — and the viewer's own page-nav /
+        // zoom / print / download chrome is exactly what we want for a long manual.
+        var pf = document.createElement("iframe");
+        pf.className = "stage";
+        pf.setAttribute("referrerpolicy", "no-referrer");
+        pf.src = psrc;
+        pwrap.appendChild(pf);
+        pwrap.appendChild(openLink(purl, "open ↗")); // always an escape hatch
+        mainEl.appendChild(pwrap);
+        break;
+      }
+      case "navigate": {
+        var url = it.url || "";
         if (location.protocol === "https:" && /^http:\/\//i.test(url)) {
           mainEl.appendChild(externalFallback(url,
             "This item's URL is http:// and a secure (https) page will not load it inline (mixed content). Open it directly:"));
           break;
         }
-        // A third-party URL (site or PDF). It keeps its OWN origin (allow-same-origin
-        // is safe here because the content is cross-origin — it still cannot touch
-        // this page), which is what lets the browser's PDF viewer render inline and
-        // real sites work; allow-downloads covers a "save" from the viewer.
+        // A third-party web page: contained in a sandboxed iframe. It keeps its
+        // OWN origin (allow-same-origin is safe here because the content is
+        // cross-origin — it still cannot touch this page); allow-downloads covers
+        // a save, allow-popups/forms let normal sites work.
         var wrap = document.createElement("div");
         wrap.className = "framewrap";
         var f = stage("allow-scripts allow-same-origin allow-popups allow-forms allow-downloads");

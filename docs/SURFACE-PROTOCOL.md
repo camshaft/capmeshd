@@ -160,19 +160,24 @@ the inbox feed without moving the main view.
 
 ## 4. Display item types
 
-The built-in item types (DESIGN §10.1). `navigate`/`pdf` are third-party URLs, rendered
-inside a **sandboxed iframe** by the attachment page; `html`/`script` are same-origin and
-trusted (safe because pushes reach a surface only over this local-trust socket, or an HTTP
-path gated by the surface's attach token — DESIGN §8).
+The built-in item types (DESIGN §10.1). `navigate` is a third-party URL rendered inside a
+**sandboxed iframe**; `pdf` renders in a **plain iframe** so the browser's built-in PDF
+viewer works (a sandbox blocks it) — safe because the PDF is cross-origin/passive and the
+sender is trusted; `html`/`script` are same-origin and trusted (safe because pushes reach a
+surface only over this local-trust socket, or an HTTP path gated by the surface's attach
+token — DESIGN §8).
 
 | `type` | fields | renders as |
 |---|---|---|
 | `navigate` | `{url}` | a sandboxed iframe to a third-party URL |
-| `pdf` | `{url}` | a PDF viewer (sandboxed iframe) |
+| `pdf` | `{url, page?}` | the browser's PDF viewer; `page` (1-based) deep-links into the document (`#page=N`) |
 | `text` | `{body}` | a plain-text note |
 | `link` | `{url, title?}` | a clickable link |
 | `html` | `{markup}` | arbitrary same-origin DOM |
 | `script` | `{code}` | arbitrary JS run in the surface page |
+
+`page` is optional; omit it to open at the first page. Example — jump a long manual to page
+348: `{"type":"pdf","url":"https://host/manual.pdf","page":348}`.
 
 ---
 
