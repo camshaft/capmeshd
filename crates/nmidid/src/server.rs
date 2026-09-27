@@ -422,6 +422,16 @@ pub async fn run(
 ) -> Result<()> {
     let path = path.as_ref();
 
+    // Ensure the socket's parent directory exists. Under systemd `RuntimeDirectory`
+    // creates it, but a manual or non-systemd run should not fail with ENOENT.
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+        && !parent.exists()
+    {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating socket directory {}", parent.display()))?;
+    }
+
     // Remove a stale socket from a previous run so bind() doesn't fail with
     // "address already in use".
     if path.exists() {
@@ -895,5 +905,54 @@ mod tests {
 
         server.abort();
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// `run` creates the socket's parent directory if it does not exist, so a
+    /// manual or non-systemd launch does not fail with ENOENT.
+    #[tokio::test]
+    async fn run_creates_the_socket_parent_directory() {
+        use std::time::{Duration, Instant};
+        use tokio::net::UnixStream;
+
+        let dir = std::env::temp_dir().join(format!(
+            "nmidid-test-dir-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        assert!(!dir.exists(), "test precondition: parent dir absent");
+        let path = dir.join("nmidid.sock");
+
+        let ports = sample_ports();
+        let mounts = Arc::new(MountRegistry::new(
+            Arc::new(NullMounter),
+            Arc::new(NullConnector),
+            Arc::clone(&ports),
+        ));
+        let server_path = path.clone();
+        let server = tokio::spawn(async move {
+            run(&server_path, ports, mounts, PeerPolicy::new(vec![], vec![]))
+                .await
+                .ok();
+        });
+
+        // If we can connect, the parent dir was created and the socket bound.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let connected = loop {
+            match UnixStream::connect(&path).await {
+                Ok(_) => break true,
+                Err(_) if Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Err(_) => break false,
+            }
+        };
+        assert!(connected, "run did not bind a socket under a fresh parent dir");
+        assert!(dir.exists(), "run should have created the socket parent dir");
+
+        server.abort();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
