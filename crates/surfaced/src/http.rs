@@ -315,9 +315,17 @@ async fn events(
         .filter_map(|r| r.ok())
         .map(to_event);
     let stream = tokio_stream::once(to_event(initial)).chain(live);
-    Sse::new(stream)
+    let mut resp = Sse::new(stream)
         .keep_alive(KeepAlive::default())
-        .into_response()
+        .into_response();
+    // Tell a buffering reverse proxy (nginx and friends honor this) NOT to hold
+    // the SSE bytes back: without it, live view/item events can be withheld until
+    // the connection closes, so an attached tab appears to update only on reload.
+    resp.headers_mut().insert(
+        "x-accel-buffering",
+        header::HeaderValue::from_static("no"),
+    );
+    resp
 }
 
 /// Render a surface event as an SSE `data:` frame. Our event types always
@@ -380,6 +388,31 @@ mod tests {
         assert_eq!(items[0]["item"]["body"], "hello phone");
         // Promoted push is the main view.
         assert_eq!(v["current-view"], items[0]["id"]);
+    }
+
+    #[tokio::test]
+    async fn events_stream_disables_proxy_buffering() {
+        let store = Arc::new(SurfaceStore::in_memory());
+        let app = router(store);
+        // The response headers arrive before the (long-lived) SSE body streams,
+        // so we can assert them without draining the stream.
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/s/phone/events")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get("content-type").unwrap(),
+            "text/event-stream"
+        );
+        // Without this a buffering reverse proxy holds live updates back until
+        // the connection closes (the "have to refresh to update" symptom).
+        assert_eq!(resp.headers().get("x-accel-buffering").unwrap(), "no");
     }
 
     #[tokio::test]
