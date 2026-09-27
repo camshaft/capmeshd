@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use surfaced::http::router;
+use surfaced::http::router_with_base;
 use surfaced::inbox::SurfaceStore;
 use tracing::{Level, info};
 use tracing_subscriber::FmtSubscriber;
@@ -22,6 +22,13 @@ struct Args {
     /// (surfaces do not survive a restart).
     #[arg(short = 'd', long)]
     state_dir: Option<String>,
+
+    /// Mount the server under a URL prefix (e.g. `/surfaced`) for reverse-proxy
+    /// deployment behind nginx. Empty (default) serves at the root. Proxy
+    /// WITHOUT stripping the prefix: `location /surfaced/ { proxy_pass
+    /// http://127.0.0.1:8787; }`.
+    #[arg(short = 'b', long, env = "SURFACED_BASE_PATH", default_value = "")]
+    base_path: String,
 
     /// Log level (trace, debug, info, warn, error).
     #[arg(short, long, default_value = "info")]
@@ -54,11 +61,18 @@ async fn main() -> Result<()> {
         }
     };
 
-    let app = router(store);
+    let app = router_with_base(store, &args.base_path);
     let listener = tokio::net::TcpListener::bind(args.http_addr)
         .await
         .with_context(|| format!("binding {}", args.http_addr))?;
-    info!("surfaced HTTP/SSE serving on http://{}", args.http_addr);
+    if args.base_path.trim().trim_matches('/').is_empty() {
+        info!("surfaced HTTP/SSE serving on http://{}", args.http_addr);
+    } else {
+        info!(
+            "surfaced HTTP/SSE serving on http://{} under base path '{}'",
+            args.http_addr, args.base_path
+        );
+    }
     axum::serve(listener, app).await.context("serving HTTP")?;
     Ok(())
 }

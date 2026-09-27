@@ -3,8 +3,11 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- Mount-prefix aware: the server injects the configured base ("/" at root, or
+     e.g. "/surfaced/" behind nginx) so every relative URL below resolves under it. -->
+<base href="__BASE_HREF__">
 <title>surface</title>
-<link rel="stylesheet" href="/surface.css">
+<link rel="stylesheet" href="surface.css">
 </head>
 <body>
 <header>
@@ -15,6 +18,6 @@
   <div id="main"><div class="empty">No item selected yet.</div></div>
   <aside id="feed"><h2>inbox</h2><ul id="list"></ul></aside>
 </main>
-<script src="/surface.js"></script>
+<script src="surface.js"></script>
 </body>
 </html>
