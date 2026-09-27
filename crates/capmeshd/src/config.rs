@@ -249,6 +249,31 @@ remote = { host = "studio", addr = "192.168.1.23", port = 5004, port-id = "kbd-0
     }
 
     #[test]
+    fn parses_the_module_rendered_subtable_form() {
+        // The exact shape the NixOS module emits (pkgs.formats.toml renders `remote` as a
+        // [permanent-mount.remote] subtable, not an inline table) — pins renderer↔parser.
+        let cfg = Config::parse(
+            r#"
+host-id = "check-host"
+
+[[permanent-mount]]
+codec = "midi1"
+local-name = "studio keyboard"
+role = "mirror-source"
+
+[permanent-mount.remote]
+addr = "192.168.1.23"
+port = 5004
+port-id = "kbd-0"
+"#,
+        )
+        .expect("parse module-rendered form");
+        let pm = &cfg.permanent_mounts[0];
+        assert_eq!(pm.remote.port_id, "kbd-0");
+        assert_eq!(pm.remote.addr, "192.168.1.23".parse::<IpAddr>().unwrap());
+    }
+
+    #[test]
     fn permanent_mount_rejects_a_non_ip_addr() {
         // Connect-by-IP (§5): a `.local` remote must not parse.
         let err = Config::parse(

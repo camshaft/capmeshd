@@ -18,12 +18,31 @@ let
     )
     (lib.filterAttrs (_n: dp: dp.enable) cfg.advertise);
 
+  # A permanentMounts entry → a `[[permanent-mount]]` table (§9 → §4.1). Optional fields are
+  # OMITTED when unset — `pkgs.formats.toml` cannot represent null, and the parser's
+  # deny_unknown_fields is happy with absent optionals.
+  renderPermanentMount = m:
+    {
+      role = m.role;
+      codec = m.codec;
+      remote = {
+        addr = m.remote.addr;
+        port = m.remote.port;
+        "port-id" = m.remote.portId;
+      } // lib.optionalAttrs (m.remote.host != null) { host = m.remote.host; };
+    }
+    // lib.optionalAttrs (m.mountId != null) { "mount-id" = m.mountId; }
+    // lib.optionalAttrs (m.localName != null) { "local-name" = m.localName; };
+
   settings = {
     "host-id" = cfg.hostId;
     "advertise-port" = cfg.advertisePort;
   }
   // lib.optionalAttrs (cfg.clusterKeyFile != null) { "cluster-key-file" = cfg.clusterKeyFile; }
-  // lib.optionalAttrs (enabledDataplanes != { }) { dataplane = enabledDataplanes; };
+  // lib.optionalAttrs (enabledDataplanes != { }) { dataplane = enabledDataplanes; }
+  // lib.optionalAttrs (cfg.permanentMounts != [ ]) {
+    "permanent-mount" = map renderPermanentMount cfg.permanentMounts;
+  };
 
   configFile = tomlFormat.generate "capmesh.toml" settings;
 
@@ -44,6 +63,55 @@ let
         type = lib.types.nullOr lib.types.str;
         default = null;
         description = "Endpoint URL for endpoint protocols (e.g. Moonraker WS).";
+      };
+    };
+  });
+
+  permanentMountModule = lib.types.submodule ({ ... }: {
+    options = {
+      mountId = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        description = "Idempotency key (§3.1); defaults from the remote endpoint when unset.";
+      };
+      role = lib.mkOption {
+        type = lib.types.enum [ "mirror-source" "mirror-sink" "link" ];
+        default = "mirror-source";
+        description = "Which end the daemon materializes (§3.1).";
+      };
+      localName = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        description = "Display name for the local virtual device (mirror roles).";
+      };
+      codec = lib.mkOption {
+        type = lib.types.str;
+        default = "midi1";
+        description = "Chosen wire-format codec.";
+      };
+      remote = lib.mkOption {
+        description = "The remote endpoint to mount — connect by IP, never a .local name (§5).";
+        type = lib.types.submodule {
+          options = {
+            host = lib.mkOption {
+              type = lib.types.nullOr lib.types.str;
+              default = null;
+              description = "Remote host-id (informational).";
+            };
+            addr = lib.mkOption {
+              type = lib.types.str;
+              description = "Remote peer IP from the mDNS record (never a .local/.lan name).";
+            };
+            port = lib.mkOption {
+              type = lib.types.port;
+              description = "Remote data-plane port.";
+            };
+            portId = lib.mkOption {
+              type = lib.types.str;
+              description = "Remote port-id to mount.";
+            };
+          };
+        };
       };
     };
   });
@@ -83,6 +151,15 @@ in
       default = { };
       example = lib.literalExpression ''{ midi.enable = true; }'';
       description = "Capability kinds this host advertises and how to reach each data-plane daemon.";
+    };
+
+    permanentMounts = lib.mkOption {
+      type = lib.types.listOf permanentMountModule;
+      default = [ ];
+      example = lib.literalExpression ''
+        [ { localName = "studio keyboard";
+            remote = { addr = "192.168.1.23"; port = 5004; portId = "kbd-0"; }; } ]'';
+      description = "Permanent desired mounts reconciled every boot for self-heal (DESIGN §9).";
     };
   };
 

@@ -156,6 +156,14 @@
                         enable = true;
                         socket = "/run/nmidid.sock";
                       };
+                      permanentMounts = [{
+                        localName = "studio keyboard";
+                        remote = {
+                          addr = "192.168.1.23";
+                          port = 5004;
+                          portId = "kbd-0";
+                        };
+                      }];
                     };
                   })
                 ];
@@ -167,6 +175,9 @@
               grep -q 'host-id = "check-host"' rendered.toml
               grep -q 'protocol = "nmidi-ctl"' rendered.toml
               grep -q 'socket = "/run/nmidid.sock"' rendered.toml
+              grep -q '\[\[permanent-mount\]\]' rendered.toml
+              grep -q 'port-id = "kbd-0"' rendered.toml
+              grep -q 'addr = "192.168.1.23"' rendered.toml
               cp rendered.toml $out
             '';
 
