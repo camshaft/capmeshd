@@ -12,7 +12,11 @@ header .status { margin-left: auto; font-size: .8rem; opacity: .7; }
   background: transparent; border: 1px solid var(--edge); border-radius: .4rem; color: inherit;
 }
 
-main { flex: 1 1 auto; min-height: 0; position: relative; display: flex; }
+/* `overflow: hidden` clips the off-canvas inbox drawer: when closed it is shoved
+   to translateX(100%) (just past the right edge), which would otherwise extend
+   the page and force a horizontal scroll on narrow screens. #main keeps its own
+   scroll below. */
+main { flex: 1 1 auto; min-height: 0; position: relative; display: flex; overflow: hidden; }
 
 /* Main view: the selected item, centered as the primary content. */
 #main {
