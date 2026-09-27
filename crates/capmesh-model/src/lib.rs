@@ -223,6 +223,35 @@ impl Notification {
     }
 }
 
+/// A capability's rich descriptor as served by the peer↔peer mesh control endpoint
+/// (docs/MESH-PROTOCOL.md §3): the response body of `GET /caps/<id>`. It resolves the coarse
+/// `_capmesh._tcp` advert's `descr` pointer into the full typed shape a mount needs — the
+/// remote `port-id`, data-plane `port`, and preference-ordered `formats` — carried by its
+/// [`PortDescriptor`]s. Serialized by the serving host, deserialized by the browsing host.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CapabilityDescriptor {
+    /// The stable capability id (matches the advert `id` / the `descr` path).
+    pub id: String,
+    /// The advertising host's id.
+    pub host: String,
+    /// Capability kind: `midi | audio | screen | control-api | ...` (matches the advert `cap`).
+    pub kind: String,
+    /// Direction: `source | sink | duplex | control` (matches the advert `dir`).
+    pub dir: String,
+    /// The typed ports this capability exposes (§3) — the same shape `capmesh-ctl` `list-ports`
+    /// returns, reused verbatim so the model has a single definition.
+    #[serde(default)]
+    pub ports: Vec<PortDescriptor>,
+}
+
+/// The response body of the mesh endpoint's `GET /caps` (docs/MESH-PROTOCOL.md §3): every
+/// capability the serving host currently exposes, for a one-round-trip browse.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CapabilitiesResponse {
+    #[serde(default)]
+    pub caps: Vec<CapabilityDescriptor>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -369,5 +398,54 @@ mod tests {
                 method: "something-new".into()
             }
         );
+    }
+
+    #[test]
+    fn parses_the_mesh_capability_descriptor_example() {
+        // The MESH-PROTOCOL.md §3 `GET /caps/<id>` example.
+        let json = r#"{
+            "id": "b1f0-uuid", "host": "green-machine", "kind": "midi", "dir": "source",
+            "ports": [
+              { "port-id": "kbd-0", "kind": "stream", "dir": "source", "type": "midi",
+                "name": "Keystation 49e", "virtualizable": true,
+                "formats": [ {"codec":"ump","group":0}, {"codec":"midi1"} ] }
+            ]
+        }"#;
+        let cap: CapabilityDescriptor = serde_json::from_str(json).unwrap();
+        assert_eq!(cap.id, "b1f0-uuid");
+        assert_eq!(cap.host, "green-machine");
+        assert_eq!(cap.kind, "midi");
+        assert_eq!(cap.dir, "source");
+        assert_eq!(cap.ports.len(), 1);
+        assert_eq!(cap.ports[0].port_id, "kbd-0");
+        assert_eq!(cap.ports[0].formats.len(), 2);
+
+        // Round-trips through the on-wire shape (nested PortDescriptor keys preserved).
+        let v = serde_json::to_value(&cap).unwrap();
+        assert_eq!(v["id"], "b1f0-uuid");
+        assert_eq!(v["ports"][0]["port-id"], "kbd-0");
+        assert_eq!(v["ports"][0]["type"], "midi");
+        let back: CapabilityDescriptor = serde_json::from_value(v).unwrap();
+        assert_eq!(back, cap);
+    }
+
+    #[test]
+    fn caps_list_response_round_trips() {
+        // The `GET /caps` envelope; empty list decodes from a missing/empty `caps`.
+        let empty: CapabilitiesResponse = serde_json::from_str("{}").unwrap();
+        assert!(empty.caps.is_empty());
+
+        let resp = CapabilitiesResponse {
+            caps: vec![CapabilityDescriptor {
+                id: "a".into(),
+                host: "h".into(),
+                kind: "midi".into(),
+                dir: "sink".into(),
+                ports: vec![],
+            }],
+        };
+        let back: CapabilitiesResponse =
+            serde_json::from_str(&serde_json::to_string(&resp).unwrap()).unwrap();
+        assert_eq!(back, resp);
     }
 }
