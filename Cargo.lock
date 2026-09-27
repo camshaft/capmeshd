@@ -694,6 +694,7 @@ name = "nmidid"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "capmesh-model",
  "clap",
  "libc",
  "midir",
