@@ -12,15 +12,17 @@
 //!
 //! Single-peer: the most recent inviter is the active peer.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use nmidi_core::discovery::ServiceAdvertiser;
 use nmidi_core::util::generate_ssrc;
 use nmidi_core::{APPLEMIDI_VERSION, AppleMidiPacket, RtpPacket};
 use tokio::net::UdpSocket;
-use tracing::{Level, info};
+use tracing::{Level, info, warn};
 use tracing_subscriber::FmtSubscriber;
 
 #[derive(Parser, Debug)]
@@ -39,9 +41,14 @@ struct Args {
     #[arg(long, default_value = "500")]
     note_interval_ms: u64,
 
-    /// Session name advertised in the invitation reply.
+    /// Session name advertised in the invitation reply and the mDNS service.
     #[arg(long, default_value = "nmidi-fake-source")]
     name: String,
+
+    /// Do not advertise the `_apple-midi._udp` mDNS service (advertised by default
+    /// so a browsing host can discover the data-plane control port).
+    #[arg(long)]
+    no_advertise: bool,
 
     /// Log level (trace, debug, info, warn, error).
     #[arg(short, long, default_value = "info")]
@@ -76,6 +83,32 @@ async fn main() -> Result<()> {
         args.port + 1,
         ssrc
     );
+
+    // Advertise the data-plane endpoint over `_apple-midi._udp` (the RTP-MIDI
+    // standard discovery record) so a browsing host learns the control port
+    // without it being hand-supplied. Held for the process lifetime; the handle
+    // unregisters the service on drop.
+    let _service = if args.no_advertise {
+        None
+    } else {
+        match ServiceAdvertiser::new()
+            .and_then(|a| a.advertise_service(&args.name, &args.name, args.port, HashMap::new()))
+        {
+            Ok(service) => {
+                info!(
+                    "advertising _apple-midi._udp service {:?} on control port {}",
+                    args.name, args.port
+                );
+                Some(service)
+            }
+            Err(e) => {
+                // Advertising is best-effort; the source still works with a
+                // hand-supplied remote port if mDNS is unavailable.
+                warn!("mDNS advertise failed (continuing without it): {e}");
+                None
+            }
+        }
+    };
 
     let started = Instant::now();
     let mut ticker = tokio::time::interval(Duration::from_millis(args.note_interval_ms));

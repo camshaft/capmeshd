@@ -70,10 +70,14 @@ nmidi-fake-source --bind 127.0.0.1 --port 5008 --note-interval-ms 100
 | `--bind <addr>` | `0.0.0.0` | Address for the control + data sockets. |
 | `--port <port>` | `5008` | Control port; the **data port is `port + 1`** (AppleMIDI convention). |
 | `--note-interval-ms <ms>` | `500` | Cadence of emitted MIDI notes. |
-| `--name <str>` | `nmidi-fake-source` | Session name in the invitation reply. |
+| `--name <str>` | `nmidi-fake-source` | Session name in the invitation reply and the mDNS service. |
+| `--no-advertise` | *(off)* | Suppress the `_apple-midi._udp` mDNS advertisement. |
 | `--log-level <lvl>` | `info` | Log verbosity. |
 
-It is single-peer (the most recent inviter is the active peer).
+It is single-peer (the most recent inviter is the active peer). By default it
+advertises its data-plane control port over `_apple-midi._udp` (the standard
+RTP-MIDI discovery record), so a browsing host can learn where to point a mount
+without the port being hand-supplied.
 
 ### Rehearsal wiring
 
