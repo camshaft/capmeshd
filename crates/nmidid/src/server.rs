@@ -704,4 +704,77 @@ mod tests {
         // The connection kept serving: hello still got a result.
         assert_eq!(lines[1]["result"]["daemon"], DAEMON_ID);
     }
+
+    /// Exercise the real `run` accept path over an actual Unix socket: bind an
+    /// *enforcing* policy that does not name us, then connect from this same
+    /// process. The connection must still be served via the always-allowed
+    /// self-uid bypass (§1.1), proving the wired `peer_cred()` gate lets a
+    /// legitimate local peer through, and the socket is created `0o660`.
+    #[tokio::test]
+    async fn run_serves_a_permitted_connection_over_a_real_socket() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{Duration, Instant};
+        use tokio::io::AsyncBufReadExt;
+        use tokio::net::UnixStream;
+
+        let path = std::env::temp_dir().join(format!(
+            "nmidid-test-{}-{}.sock",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+
+        let ports = sample_ports();
+        let mounts = Arc::new(MountRegistry::new(
+            Arc::new(NullMounter),
+            Arc::new(NullConnector),
+            Arc::clone(&ports),
+        ));
+        // Enforcing, but the allow-list does NOT name us; the connection is
+        // permitted only by the self-uid bypass (client is this process).
+        let peers = PeerPolicy::new(vec![999_999], vec![]);
+        assert!(peers.enforcing());
+
+        let server_path = path.clone();
+        let server = tokio::spawn(async move {
+            run(&server_path, ports, mounts, peers).await.ok();
+        });
+
+        // Retry until the listener is bound (run() spawned above), bounded.
+        let stream = {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                match UnixStream::connect(&path).await {
+                    Ok(s) => break s,
+                    Err(_) if Instant::now() < deadline => {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                    Err(e) => panic!("could not connect to nmidid socket: {e}"),
+                }
+            }
+        };
+
+        // §1.1: the control socket is owner/group-only.
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o660, "socket perms should be 0o660");
+
+        let (r, mut w) = stream.into_split();
+        let mut reader = BufReader::new(r);
+        let mut line = serde_json::to_vec(&hello()).unwrap();
+        line.push(b'\n');
+        w.write_all(&line).await.unwrap();
+
+        let mut resp = String::new();
+        tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut resp))
+            .await
+            .expect("hello response within timeout")
+            .expect("read a response line");
+        let v: Value = serde_json::from_str(resp.trim()).unwrap();
+        assert_eq!(v["result"]["daemon"], DAEMON_ID);
+
+        server.abort();
+        let _ = std::fs::remove_file(&path);
+    }
 }
