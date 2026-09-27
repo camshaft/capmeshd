@@ -17,6 +17,25 @@
   var mainEl = document.getElementById("main");
   var listEl = document.getElementById("list");
   var statusEl = document.getElementById("status");
+  var feedEl = document.getElementById("feed");
+  var backdropEl = document.getElementById("backdrop");
+  var menuEl = document.getElementById("menu");
+
+  // The inbox feed is an off-canvas drawer on narrow (phone) screens; the
+  // hamburger toggles it. On wide screens CSS shows it as a persistent sidebar,
+  // so these class/backdrop toggles are visually inert there.
+  function openFeed() {
+    feedEl.classList.add("open"); feedEl.setAttribute("aria-hidden", "false");
+    menuEl.setAttribute("aria-expanded", "true"); backdropEl.hidden = false;
+  }
+  function closeFeed() {
+    feedEl.classList.remove("open"); feedEl.setAttribute("aria-hidden", "true");
+    menuEl.setAttribute("aria-expanded", "false"); backdropEl.hidden = true;
+  }
+  menuEl.addEventListener("click", function () {
+    if (feedEl.classList.contains("open")) closeFeed(); else openFeed();
+  });
+  backdropEl.addEventListener("click", closeFeed);
 
   function summary(it) {
     switch (it.type) {
@@ -91,6 +110,8 @@
             method: "POST", headers: { "content-type": "application/json" },
             body: JSON.stringify({ "item-id": itemId })
           });
+          // Selecting an item closes the drawer so the item shows centered.
+          closeFeed();
         });
       })(entry.id);
       listEl.appendChild(li);
