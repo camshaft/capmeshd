@@ -57,6 +57,20 @@ in
       '';
     };
 
+    socket = lib.mkOption {
+      type = lib.types.nullOr lib.types.path;
+      default = null;
+      example = "/run/surfaced/surfaced.sock";
+      description = ''
+        Path of the local `surface-ctl` control socket capmeshd drives
+        (docs/SURFACE-PROTOCOL.md). `null` (default) runs HTTP-only, with no mesh
+        control plane. When set under `/run/surfaced` the systemd RuntimeDirectory
+        provides the directory. The socket is owner/group `0o660` (local trust);
+        for capmeshd to drive it, capmeshd's service must share surfaced's group —
+        wired when the capmesh `surface` adapter lands (coordinate cross-service).
+      '';
+    };
+
     openFirewall = lib.mkOption {
       type = lib.types.bool;
       default = false;
@@ -82,8 +96,11 @@ in
           + " --http-addr ${cfg.address}:${toString cfg.port}"
           + " --state-dir ${cfg.stateDir}"
           + " --log-level ${cfg.logLevel}"
-          + lib.optionalString (cfg.basePath != "") " --base-path ${cfg.basePath}";
+          + lib.optionalString (cfg.basePath != "") " --base-path ${cfg.basePath}"
+          + lib.optionalString (cfg.socket != null) " --socket ${cfg.socket}";
         StateDirectory = "surfaced";
+        # /run/surfaced for the control socket (harmless when socket is unset).
+        RuntimeDirectory = "surfaced";
         Restart = "on-failure";
         RestartSec = 2;
         DynamicUser = true;
