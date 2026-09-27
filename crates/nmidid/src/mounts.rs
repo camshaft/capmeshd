@@ -132,9 +132,15 @@ impl MountRegistry {
         }
     }
 
-    /// Subscribe to the daemon's `mount-state` notification stream.
+    /// Subscribe to the daemon's notification stream (`mount-state`, `port-*`).
     pub fn subscribe(&self) -> broadcast::Receiver<Value> {
         self.notifier.subscribe()
+    }
+
+    /// A sender handle onto the daemon's notification bus, for other producers
+    /// (e.g. the hot-plug monitor) to emit §5 notifications on the same stream.
+    pub fn notifier(&self) -> broadcast::Sender<Value> {
+        self.notifier.clone()
     }
 
     /// Establish a mount (§3.1). Idempotent on `mount-id`: a repeat returns the
