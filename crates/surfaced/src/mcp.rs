@@ -100,6 +100,18 @@ fn tools_list() -> Value {
             }
         },
         {
+            "name": "remove_item",
+            "description": "Remove one item from a surface's inbox by id (prune a stale item without clearing the whole surface). `item-id` is the id from list_items.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "surface-id": { "type": "string" },
+                    "item-id": { "type": "string" }
+                },
+                "required": ["surface-id", "item-id"]
+            }
+        },
+        {
             "name": "delete_surface",
             "description": "Delete a surface entirely (its inbox and on-disk log).",
             "inputSchema": {
@@ -124,6 +136,7 @@ fn tools_call(store: &SurfaceStore, params: &Value) -> Value {
             Err(e) => tool_error(e),
         },
         "send_item" => send_item(store, &args),
+        "remove_item" => remove_item(store, &args),
         "clear_surface" => match surface_id(&args) {
             Ok(id) => {
                 store.clear(&id);
@@ -161,6 +174,21 @@ fn send_item(store: &SurfaceStore, args: &Value) -> Value {
         "posted item {} to surface '{}'",
         pushed.entry.id, id
     ))
+}
+
+fn remove_item(store: &SurfaceStore, args: &Value) -> Value {
+    let id = match surface_id(args) {
+        Ok(id) => id,
+        Err(e) => return tool_error(e),
+    };
+    let Some(item_id) = args.get("item-id").and_then(Value::as_str) else {
+        return tool_error("remove_item requires 'item-id'".to_string());
+    };
+    if store.remove_item(&id, item_id) {
+        tool_text(format!("removed item {item_id} from surface '{id}'"))
+    } else {
+        tool_error(format!("no such item '{item_id}' on surface '{id}'"))
+    }
 }
 
 /// Extract and validate a `surface-id` argument.
@@ -229,6 +257,7 @@ mod tests {
             "list_surfaces",
             "list_items",
             "send_item",
+            "remove_item",
             "clear_surface",
             "delete_surface",
         ] {
@@ -284,6 +313,28 @@ mod tests {
         let items_text = li["result"]["content"][0]["text"].as_str().unwrap();
         assert!(items_text.contains("pdf"));
         assert!(items_text.contains("\"page\": 348"));
+    }
+
+    #[test]
+    fn remove_item_tool_prunes_one() {
+        let store = SurfaceStore::in_memory();
+        let pushed = store.push("phone", crate::item::DisplayItem::Text { body: "a".into() }, true);
+        let out = dispatch(
+            &store,
+            &req(2, "tools/call", json!({"name":"remove_item",
+                "arguments":{"surface-id":"phone","item-id":pushed.entry.id}})),
+        )
+        .unwrap();
+        assert!(out["result"]["isError"].as_bool() != Some(true));
+        assert_eq!(store.snapshot("phone").items.len(), 0);
+        // Removing an unknown item is a tool error.
+        let bad = dispatch(
+            &store,
+            &req(3, "tools/call", json!({"name":"remove_item",
+                "arguments":{"surface-id":"phone","item-id":"nope"}})),
+        )
+        .unwrap();
+        assert_eq!(bad["result"]["isError"], true);
     }
 
     #[test]

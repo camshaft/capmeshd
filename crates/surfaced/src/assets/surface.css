@@ -49,7 +49,10 @@ main { flex: 1 1 auto; min-height: 0; position: relative; display: flex; overflo
 #clear { font: inherit; font-size: .7rem; text-transform: none; letter-spacing: 0; padding: .2rem .5rem; cursor: pointer; background: transparent; border: 1px solid var(--edge); border-radius: .3rem; color: inherit; opacity: .9; }
 #clear:hover { background: #8881; }
 #feed ul { list-style: none; margin: 0; padding: 0; }
-#feed li { padding: .7rem .75rem; border-bottom: 1px solid var(--edge); cursor: pointer; }
+#feed li { padding: .7rem .75rem; border-bottom: 1px solid var(--edge); cursor: pointer; position: relative; padding-right: 2.2rem; }
+/* Per-row remove (✕): always visible but subtle (no hover on touch), top-right. */
+#feed .del { position: absolute; top: .4rem; right: .4rem; font: inherit; font-size: .85rem; line-height: 1; padding: .2rem .4rem; background: transparent; border: 0; color: inherit; opacity: .4; cursor: pointer; border-radius: .3rem; }
+#feed .del:hover { opacity: 1; background: #8882; }
 #feed li:hover { background: #8881; }
 #feed li.active { background: color-mix(in srgb, var(--accent) 14%, transparent); border-left: 3px solid var(--accent); }
 #feed .sum { display: block; overflow-wrap: anywhere; }

@@ -194,7 +194,12 @@
       var sum = document.createElement("span"); sum.className = "sum"; sum.textContent = summary(entry.item);
       var meta = document.createElement("span"); meta.className = "meta";
       meta.textContent = new Date(entry.ts).toLocaleTimeString();
-      li.appendChild(sum); li.appendChild(meta);
+      // A per-row ✕ to prune one stale item (DELETE); the SSE snapshot echo
+      // drops it from every attached tab.
+      var del = document.createElement("button");
+      del.className = "del"; del.type = "button"; del.title = "Remove this item";
+      del.setAttribute("aria-label", "Remove this item"); del.textContent = "✕";
+      li.appendChild(sum); li.appendChild(meta); li.appendChild(del);
       (function (itemId) {
         li.addEventListener("click", function () {
           // Select locally RIGHT NOW (don't wait on the server round-trip or the
@@ -203,6 +208,13 @@
           select(itemId, true);
           // Selecting an item closes the drawer so the item shows centered.
           closeFeed();
+        });
+        del.addEventListener("click", function (e) {
+          // Don't let the click bubble to the row's select handler.
+          e.stopPropagation();
+          fetch("s/" + encodeURIComponent(id) + "/items/" + encodeURIComponent(itemId) + tq, {
+            method: "DELETE"
+          });
         });
       })(entry.id);
       listEl.appendChild(li);
