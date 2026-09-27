@@ -65,13 +65,51 @@ impl PeerPolicy {
         !self.allow_uids.is_empty() || !self.allow_gids.is_empty()
     }
 
-    /// Whether a peer with the given uid/gid may connect.
-    pub fn allows(&self, uid: u32, gid: u32) -> bool {
+    /// Whether a peer with the given uid and full group set may connect.
+    ///
+    /// `gids` is the peer's complete group membership (primary gid plus any
+    /// supplementary groups), because the shared-group trust model keys on a
+    /// group a client typically holds as a *supplementary* group — e.g. a
+    /// systemd `DynamicUser` whose primary gid is transient but which joins the
+    /// shared `capmesh` group via `SupplementaryGroups`. See [`peer_gids`].
+    pub fn allows(&self, uid: u32, gids: &[u32]) -> bool {
         if !self.enforcing() {
             return true;
         }
-        uid == self.self_uid || self.allow_uids.contains(&uid) || self.allow_gids.contains(&gid)
+        if uid == self.self_uid || self.allow_uids.contains(&uid) {
+            return true;
+        }
+        gids.iter().any(|g| self.allow_gids.contains(g))
     }
+}
+
+/// The full set of group ids to test a peer against: its primary gid plus any
+/// supplementary groups. `SO_PEERCRED` carries only the peer's primary gid, so
+/// on Linux we read its supplementary groups from `/proc/<pid>/status` (the pid
+/// also comes from `SO_PEERCRED`). This is what lets a policy keyed on a shared
+/// *supplementary* group match a client whose primary gid is something else.
+fn peer_gids(cred: &tokio::net::unix::UCred) -> Vec<u32> {
+    let mut gids = vec![cred.gid()];
+    #[cfg(target_os = "linux")]
+    if let Some(pid) = cred.pid()
+        && let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status"))
+    {
+        for g in parse_status_groups(&status) {
+            if !gids.contains(&g) {
+                gids.push(g);
+            }
+        }
+    }
+    gids
+}
+
+/// Parse the `Groups:` line of `/proc/<pid>/status` into supplementary gids.
+fn parse_status_groups(status: &str) -> Vec<u32> {
+    status
+        .lines()
+        .find_map(|l| l.strip_prefix("Groups:"))
+        .map(|rest| rest.split_whitespace().filter_map(|t| t.parse().ok()).collect())
+        .unwrap_or_default()
 }
 
 /// Per-connection dispatch state. One `Session` exists per accepted connection;
@@ -384,16 +422,19 @@ pub async fn run(
         let (stream, _addr) = listener.accept().await.context("accepting connection")?;
 
         // Local-trust boundary (§1.1): refuse peers outside the configured
-        // owner/group.
+        // owner/group. Test the peer's full group set (primary + supplementary)
+        // so a shared-group policy matches a DynamicUser client.
         match stream.peer_cred() {
-            Ok(cred) if peers.allows(cred.uid(), cred.gid()) => {}
             Ok(cred) => {
-                warn!(
-                    "refused control connection from uid {} gid {} (not permitted)",
-                    cred.uid(),
-                    cred.gid()
-                );
-                continue;
+                let gids = peer_gids(&cred);
+                if !peers.allows(cred.uid(), &gids) {
+                    warn!(
+                        "refused control connection from uid {} gids {:?} (not permitted)",
+                        cred.uid(),
+                        gids
+                    );
+                    continue;
+                }
             }
             Err(e) => {
                 // Fail closed while enforcing; otherwise proceed.
@@ -503,17 +544,34 @@ mod tests {
     fn peer_policy_non_enforcing_allows_all() {
         let p = PeerPolicy::with_self_uid(vec![], vec![], 1000);
         assert!(!p.enforcing());
-        assert!(p.allows(1234, 5678));
+        assert!(p.allows(1234, &[5678]));
     }
 
     #[test]
     fn peer_policy_enforcing_allows_self_uid_and_listed() {
         let p = PeerPolicy::with_self_uid(vec![42], vec![7], 1000);
         assert!(p.enforcing());
-        assert!(p.allows(1000, 999)); // daemon's own uid always allowed
-        assert!(p.allows(42, 999)); // listed uid
-        assert!(p.allows(0, 7)); // listed gid
-        assert!(!p.allows(5, 5)); // neither → refused
+        assert!(p.allows(1000, &[999])); // daemon's own uid always allowed
+        assert!(p.allows(42, &[999])); // listed uid
+        assert!(p.allows(0, &[7])); // listed gid as primary
+        assert!(!p.allows(5, &[5])); // neither → refused
+    }
+
+    #[test]
+    fn peer_policy_matches_a_listed_supplementary_group() {
+        // The shared-group model: the client's primary gid is transient (e.g. a
+        // DynamicUser) but it holds the allowed group as a *supplementary* gid.
+        let p = PeerPolicy::with_self_uid(vec![], vec![7], 1000);
+        assert!(p.allows(5, &[65534, 7])); // primary 65534 not listed, supp 7 is
+        assert!(!p.allows(5, &[65534, 8])); // no listed gid anywhere → refused
+    }
+
+    #[test]
+    fn parse_status_groups_reads_the_groups_line() {
+        let status = "Name:\tcapmeshd\nUid:\t997\t997\t997\t997\nGid:\t65534\t65534\t65534\t65534\nGroups:\t7 24 \n";
+        assert_eq!(parse_status_groups(status), vec![7, 24]);
+        assert_eq!(parse_status_groups("Groups:\t\n"), Vec::<u32>::new());
+        assert_eq!(parse_status_groups("no groups line here\n"), Vec::<u32>::new());
     }
 
     #[tokio::test]
