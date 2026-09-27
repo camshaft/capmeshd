@@ -181,7 +181,17 @@ mod tests {
     use super::*;
     use crate::protocol::{MountStats, MountStatus};
 
-    struct RecordingSink(Mutex<Vec<Vec<u8>>>);
+    /// A sink whose recorded messages are observable via a shared handle, so a
+    /// test can inspect what `run_pump` (which owns the sink) forwarded.
+    struct RecordingSink(Arc<Mutex<Vec<Vec<u8>>>>);
+    impl RecordingSink {
+        fn new() -> Self {
+            RecordingSink(Arc::new(Mutex::new(Vec::new())))
+        }
+        fn handle(&self) -> Arc<Mutex<Vec<Vec<u8>>>> {
+            Arc::clone(&self.0)
+        }
+    }
     impl MidiSink for RecordingSink {
         fn send(&self, message: &[u8]) -> anyhow::Result<()> {
             self.0.lock().unwrap().push(message.to_vec());
@@ -201,7 +211,7 @@ mod tests {
 
     #[test]
     fn forward_rtp_pushes_messages_and_marks_active() {
-        let sink = RecordingSink(Mutex::new(Vec::new()));
+        let sink = RecordingSink::new();
         let status = connecting_status();
 
         let mut pkt = RtpPacket::new(1, 1, 0);
@@ -221,7 +231,7 @@ mod tests {
 
     #[test]
     fn forward_rtp_empty_packet_leaves_state_untouched() {
-        let sink = RecordingSink(Mutex::new(Vec::new()));
+        let sink = RecordingSink::new();
         let status = connecting_status();
         let pkt = RtpPacket::new(1, 1, 0); // no commands
         forward_rtp(&pkt, &sink, &status);
@@ -229,5 +239,80 @@ mod tests {
         let s = status.lock().unwrap();
         assert_eq!(s.state, MountState::Connecting);
         assert_eq!(s.stats.bytes_in, 0);
+    }
+
+    /// End-to-end active-path test: a fake remote AppleMIDI peer accepts the
+    /// invitation and sends an RTP-MIDI note; the real `run_pump` must complete
+    /// the handshake, forward the note into the sink, and drive the mount to
+    /// `active` with `bytes-in` — all without any real MIDI hardware.
+    #[tokio::test]
+    async fn pump_completes_handshake_and_forwards_rtp() {
+        use tokio::net::UdpSocket;
+
+        let fake_ctl = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let fake_data = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let fake_ctl_port = fake_ctl.local_addr().unwrap().port();
+
+        // Fake peer: accept the invitation, then send one RTP note to the
+        // inviter's data port (its control port + 1, per bind_consecutive).
+        tokio::spawn(async move {
+            let mut buf = [0u8; 2048];
+            let (n, from) = fake_ctl.recv_from(&mut buf).await.unwrap();
+            if let Ok(AppleMidiPacket::Invitation { token, ssrc, .. }) =
+                AppleMidiPacket::parse(&buf[..n])
+            {
+                let accept = AppleMidiPacket::InvitationAccepted {
+                    version: APPLEMIDI_VERSION,
+                    token,
+                    ssrc,
+                    name: "fake-peer".to_string(),
+                };
+                fake_ctl.send_to(&accept.to_bytes(), from).await.unwrap();
+
+                let inviter_data = SocketAddr::new(from.ip(), from.port() + 1);
+                let mut rtp = RtpPacket::new(0xABCD, 1, 0);
+                rtp.add_command(0, vec![0x90, 0x40, 0x7f]); // note on
+                fake_data
+                    .send_to(&rtp.to_bytes(), inviter_data)
+                    .await
+                    .unwrap();
+            }
+        });
+
+        let sink = RecordingSink::new();
+        let recorded = sink.handle();
+        let status = connecting_status();
+        let (notifier, _rx) = broadcast::channel(8);
+        let remote = RemoteEndpoint {
+            host: None,
+            addr: "127.0.0.1".to_string(),
+            port: fake_ctl_port,
+            port_id: "source-0".to_string(),
+        };
+        let pump = tokio::spawn(run_pump(
+            remote,
+            Box::new(sink),
+            Arc::clone(&status),
+            notifier,
+        ));
+
+        // Wait for the note to be forwarded (bounded so a failure can't hang).
+        let got = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if !recorded.lock().unwrap().is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(got.is_ok(), "pump did not forward RTP within timeout");
+
+        assert_eq!(*recorded.lock().unwrap(), vec![vec![0x90, 0x40, 0x7f]]);
+        let s = status.lock().unwrap();
+        assert_eq!(s.state, MountState::Active);
+        assert!(s.stats.bytes_in >= 3);
+        drop(s);
+        pump.abort();
     }
 }
