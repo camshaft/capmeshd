@@ -243,6 +243,8 @@ dependencies = [
  "capmesh-ctl",
  "capmesh-daemon",
  "capmesh-discovery",
+ "capmesh-mesh",
+ "capmesh-model",
  "clap",
  "hostname",
  "mdns-sd",

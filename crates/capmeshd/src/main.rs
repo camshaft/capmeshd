@@ -11,16 +11,19 @@
 mod config;
 
 use anyhow::{Context, Result};
-use capmesh_ctl::{CtlClient, Format, LocalEndpoint, MountRole, MountSpec, RemoteEndpoint};
+use capmesh_ctl::{CtlClient, CtlError, Format, LocalEndpoint, MountRole, MountSpec, RemoteEndpoint};
 use capmesh_daemon::negotiate;
 use capmesh_daemon::reconcile::{self, Reconciler};
 use capmesh_discovery as discovery;
+use capmesh_mesh::server::CapabilityProvider;
+use capmesh_model::CapabilityDescriptor;
 use clap::{Parser, Subcommand};
 use config::Config;
 use discovery::{CapabilityAdvert, ServiceAdvertiser};
 use mdns_sd::ServiceEvent;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tracing::{info, warn};
 
 #[derive(Parser, Debug)]
@@ -309,6 +312,28 @@ async fn main() -> Result<()> {
     // carry on — a later tick's reconcile / the daemon coming up converges it.
     reconcile_permanent_mounts(&cfg).await;
 
+    // Serve the mesh control endpoint (docs/MESH-PROTOCOL.md) on the advertised port so peers
+    // can resolve this host's `descr` pointers into full capability descriptors. The provider
+    // projects the configured data-plane daemons' live `list-ports` on each request.
+    let provider = Arc::new(DataplaneCaps {
+        host_id: host_id.clone(),
+        kinds: cfg
+            .dataplane
+            .iter()
+            .filter_map(|(k, dp)| dp.socket.clone().map(|s| (k.clone(), s)))
+            .collect(),
+    });
+    match tokio::net::TcpListener::bind(("0.0.0.0", cfg.advertise_port)).await {
+        Ok(listener) => {
+            info!(port = cfg.advertise_port, "serving mesh control endpoint");
+            tokio::spawn(capmesh_mesh::server::serve(listener, provider));
+        }
+        Err(e) => warn!(
+            port = cfg.advertise_port,
+            "failed to bind mesh control endpoint: {e:#}"
+        ),
+    }
+
     let events = discovery::browse().context("start mDNS browse")?;
     info!("browsing {} for peers", discovery::SERVICE_TYPE);
 
@@ -386,6 +411,50 @@ fn note_automount_candidates(cfg: &Config, advert: &CapabilityAdvert, addr: IpAd
             );
         }
     }
+}
+
+/// The mesh control endpoint's capability provider (docs/MESH-PROTOCOL.md §4): one capability
+/// per configured socket-based data-plane kind, its ports projected live from the daemon's
+/// `list-ports` on each request. capmeshd holds no descriptor state — this is a read projection.
+struct DataplaneCaps {
+    host_id: String,
+    /// `(kind, ctl-socket-path)` for each socket-based advertised kind.
+    kinds: Vec<(String, PathBuf)>,
+}
+
+impl CapabilityProvider for DataplaneCaps {
+    async fn caps(&self) -> Vec<CapabilityDescriptor> {
+        let mut caps = Vec::new();
+        for (kind, socket) in &self.kinds {
+            match caps_for_kind(&self.host_id, kind, socket).await {
+                Ok(cap) => caps.push(cap),
+                // A daemon that is down (e.g. nmidid not up yet) drops out of the projection
+                // for this request; it reappears once the socket answers. Best-effort by design.
+                Err(e) => warn!(%kind, "mesh: skipping kind, list-ports failed: {e:#}"),
+            }
+        }
+        caps
+    }
+}
+
+/// Build one kind's capability descriptor from its data-plane daemon's live `list-ports`
+/// (§3): `id = "{host}-{kind}"` to match the advert, ports carried verbatim.
+async fn caps_for_kind(
+    host_id: &str,
+    kind: &str,
+    socket: &Path,
+) -> Result<CapabilityDescriptor, CtlError> {
+    let mut client = CtlClient::connect(socket).await?;
+    client.hello().await?;
+    let ports = client.list_ports().await?.ports;
+    Ok(CapabilityDescriptor {
+        id: format!("{host_id}-{kind}"),
+        host: host_id.to_string(),
+        kind: kind.to_string(),
+        // Coarse host-level direction (matches the advert); per-port `dir` lives in `ports`.
+        dir: "duplex".to_string(),
+        ports,
+    })
 }
 
 /// Drive a data-plane daemon's `capmesh-ctl` socket: connect, handshake, enumerate ports.
@@ -744,4 +813,87 @@ async fn connect_and_hello(socket: &Path) -> Result<CtlClient> {
     let hello = client.hello().await.context("hello handshake")?;
     info!(daemon = %hello.daemon, protocol = %hello.protocol, "hello ok");
     Ok(client)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `caps_for_kind` builds a capability descriptor from a data-plane daemon's live
+    /// `list-ports` (the mesh endpoint's per-request projection). Exercised against a fake
+    /// `capmesh-ctl` server over a Unix socket — no real MIDI hardware/sequencer needed.
+    #[tokio::test]
+    async fn caps_for_kind_projects_list_ports() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::UnixListener;
+
+        let path = std::env::temp_dir().join(format!(
+            "capmesh-mesh-provider-{}-{}.sock",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (r, mut w) = stream.into_split();
+            let mut lines = BufReader::new(r).lines();
+
+            // hello
+            let req = lines.next_line().await.unwrap().unwrap();
+            let v: serde_json::Value = serde_json::from_str(&req).unwrap();
+            assert_eq!(v["method"], "hello");
+            w.write_all(
+                format!(
+                    "{}\n",
+                    serde_json::json!({"jsonrpc":"2.0","id":v["id"],
+                        "result":{"protocol":"1","daemon":"nmidid/0.1","capabilities":["midi1"]}})
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+
+            // list-ports
+            let req = lines.next_line().await.unwrap().unwrap();
+            let v: serde_json::Value = serde_json::from_str(&req).unwrap();
+            assert_eq!(v["method"], "list-ports");
+            w.write_all(
+                format!(
+                    "{}\n",
+                    serde_json::json!({"jsonrpc":"2.0","id":v["id"],"result":{"ports":[
+                        {"port-id":"kbd-0","kind":"stream","dir":"source","type":"midi",
+                         "name":"Keystation 49e","virtualizable":true,
+                         "formats":[{"codec":"midi1"}]}]}})
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        });
+
+        let cap = caps_for_kind("green-machine", "midi", &path).await.unwrap();
+        assert_eq!(cap.id, "green-machine-midi");
+        assert_eq!(cap.host, "green-machine");
+        assert_eq!(cap.kind, "midi");
+        assert_eq!(cap.dir, "duplex");
+        assert_eq!(cap.ports.len(), 1);
+        assert_eq!(cap.ports[0].port_id, "kbd-0");
+        assert_eq!(cap.ports[0].formats[0].codec, "midi1");
+
+        server.await.unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn caps_for_kind_errors_when_socket_is_absent() {
+        // A down daemon → Err, which the provider turns into "skip this kind" (best-effort).
+        let missing = std::env::temp_dir().join("capmesh-mesh-provider-does-not-exist.sock");
+        let _ = std::fs::remove_file(&missing);
+        assert!(caps_for_kind("h", "midi", &missing).await.is_err());
+    }
 }
