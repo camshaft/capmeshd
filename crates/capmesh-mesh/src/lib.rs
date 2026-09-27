@@ -82,6 +82,73 @@ fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w == needle)
 }
 
+/// The serving side of the mesh control endpoint (docs/MESH-PROTOCOL.md §3).
+///
+/// These are the pure, transport-agnostic pieces — request-line parsing, routing over a
+/// snapshot of the host's capability descriptors, and HTTP response framing. The TCP accept
+/// loop and the live `list-ports` projection that builds the `caps` snapshot are supplied by
+/// capmeshd (which owns the config and the `capmesh-ctl` clients); keeping them out of here
+/// lets the routing be unit-tested with no sockets and no `capmesh-ctl` dependency.
+pub mod server {
+    use capmesh_model::{CapabilitiesResponse, CapabilityDescriptor};
+
+    /// Parse the request path from a raw HTTP/1.1 request head, requiring the `GET` method.
+    /// The query string (if any) is stripped. Returns `None` for a non-GET or a malformed
+    /// request line — the caller answers those with a 400/405 as it sees fit.
+    pub fn parse_get_path(request: &[u8]) -> Option<String> {
+        let line_end = super::find(request, b"\r\n").unwrap_or(request.len());
+        let line = std::str::from_utf8(&request[..line_end]).ok()?;
+        let mut parts = line.split(' ');
+        if parts.next()? != "GET" {
+            return None;
+        }
+        let target = parts.next()?;
+        Some(target.split('?').next().unwrap_or(target).to_string())
+    }
+
+    /// Route a GET path against a snapshot of the host's capability descriptors (§3):
+    /// `/caps` → 200 [`CapabilitiesResponse`]; `/caps/<id>` → 200 the descriptor, or 404;
+    /// anything else → 404. Returns `(status, json-body)`.
+    pub fn route(path: &str, caps: &[CapabilityDescriptor]) -> (u16, Vec<u8>) {
+        if path == "/caps" {
+            let resp = CapabilitiesResponse { caps: caps.to_vec() };
+            return (200, serde_json::to_vec(&resp).unwrap_or_default());
+        }
+        if let Some(id) = path.strip_prefix("/caps/") {
+            return match caps.iter().find(|c| c.id == id) {
+                Some(cap) => (200, serde_json::to_vec(cap).unwrap_or_default()),
+                None => (404, error_body("no-such-capability")),
+            };
+        }
+        (404, error_body("not-found"))
+    }
+
+    /// A JSON error body `{ "error": "<machine-code>" }` (§3 errors).
+    fn error_body(code: &str) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({ "error": code })).unwrap_or_default()
+    }
+
+    /// Frame an HTTP/1.1 response with a JSON body and `Connection: close` (the framing the
+    /// [`super::fetch_capability`] client expects — read the body to EOF).
+    pub fn http_response(status: u16, body: &[u8]) -> Vec<u8> {
+        let reason = match status {
+            200 => "OK",
+            400 => "Bad Request",
+            404 => "Not Found",
+            503 => "Service Unavailable",
+            _ => "OK",
+        };
+        let mut out = format!(
+            "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        out.extend_from_slice(body);
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -150,5 +217,104 @@ mod tests {
         assert_eq!(parse_status(b"HTTP/1.1 200 OK").unwrap(), 200);
         assert_eq!(parse_status(b"HTTP/1.1 503 Service Unavailable").unwrap(), 503);
         assert!(parse_status(b"garbage").is_err());
+    }
+}
+
+#[cfg(test)]
+mod server_tests {
+    use super::server::*;
+    use capmesh_model::{CapabilitiesResponse, CapabilityDescriptor};
+
+    fn cap(id: &str, kind: &str) -> CapabilityDescriptor {
+        CapabilityDescriptor {
+            id: id.into(),
+            host: "green-machine".into(),
+            kind: kind.into(),
+            dir: "source".into(),
+            ports: vec![],
+        }
+    }
+
+    #[test]
+    fn parse_get_path_requires_get_and_strips_query() {
+        assert_eq!(
+            parse_get_path(b"GET /caps HTTP/1.1\r\nHost: x\r\n\r\n").as_deref(),
+            Some("/caps")
+        );
+        assert_eq!(
+            parse_get_path(b"GET /caps/green-machine-midi?v=1 HTTP/1.1\r\n").as_deref(),
+            Some("/caps/green-machine-midi")
+        );
+        assert_eq!(parse_get_path(b"POST /caps HTTP/1.1\r\n"), None);
+        assert_eq!(parse_get_path(b"garbage"), None);
+    }
+
+    #[test]
+    fn routes_caps_list_and_by_id_and_404() {
+        let caps = vec![cap("green-machine-midi", "midi")];
+
+        let (status, body) = route("/caps", &caps);
+        assert_eq!(status, 200);
+        let list: CapabilitiesResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(list.caps.len(), 1);
+        assert_eq!(list.caps[0].id, "green-machine-midi");
+
+        let (status, body) = route("/caps/green-machine-midi", &caps);
+        assert_eq!(status, 200);
+        let one: CapabilityDescriptor = serde_json::from_slice(&body).unwrap();
+        assert_eq!(one.kind, "midi");
+
+        let (status, body) = route("/caps/nope", &caps);
+        assert_eq!(status, 404);
+        assert!(String::from_utf8_lossy(&body).contains("no-such-capability"));
+
+        assert_eq!(route("/other", &caps).0, 404);
+    }
+
+    #[test]
+    fn http_response_is_well_formed() {
+        let body = br#"{"caps":[]}"#;
+        let resp = http_response(200, body);
+        let text = String::from_utf8_lossy(&resp);
+        assert!(text.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(text.contains("Content-Length: 11\r\n"));
+        assert!(text.contains("Connection: close\r\n"));
+        assert!(text.ends_with(r#"{"caps":[]}"#));
+    }
+
+    /// The server core frames a response the client half parses back (end-to-end over
+    /// loopback TCP), proving the two halves of docs/MESH-PROTOCOL.md §3 interoperate.
+    #[tokio::test]
+    async fn server_core_and_client_round_trip() {
+        use std::net::Ipv4Addr;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let caps = vec![cap("green-machine-midi", "midi")];
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let n = stream.read(&mut buf).await.unwrap();
+            let path = parse_get_path(&buf[..n]).unwrap();
+            let (status, body) = route(&path, &caps);
+            stream
+                .write_all(&http_response(status, &body))
+                .await
+                .unwrap();
+            stream.flush().await.unwrap();
+        });
+
+        let got = super::fetch_capability(
+            Ipv4Addr::LOCALHOST.into(),
+            port,
+            "/caps/green-machine-midi",
+        )
+        .await
+        .unwrap();
+        assert_eq!(got.id, "green-machine-midi");
+        assert_eq!(got.kind, "midi");
     }
 }
