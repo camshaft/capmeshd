@@ -156,11 +156,28 @@ pub mod server {
         fn caps(&self) -> impl std::future::Future<Output = Vec<CapabilityDescriptor>> + Send;
     }
 
-    /// Serve the mesh control endpoint on `listener` until it errors: accept a connection,
-    /// answer one `GET /caps` / `GET /caps/<id>` from the provider's live snapshot, and close.
-    /// Each connection is handled in its own task so a slow client cannot block the endpoint.
+    /// Default deadline for reading a request head — a client that connects but never sends a
+    /// complete request is dropped rather than pinning its handler task forever.
+    pub const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// Serve the mesh control endpoint on `listener` until it errors, with the default request
+    /// read timeout ([`DEFAULT_READ_TIMEOUT`]).
     pub async fn serve<P>(listener: tokio::net::TcpListener, provider: std::sync::Arc<P>)
     where
+        P: CapabilityProvider + 'static,
+    {
+        serve_with(listener, provider, DEFAULT_READ_TIMEOUT).await
+    }
+
+    /// Serve the mesh control endpoint on `listener` until it errors: accept a connection,
+    /// answer one `GET /caps` / `GET /caps/<id>` from the provider's live snapshot, and close.
+    /// Each connection is handled in its own task so a slow client cannot block the endpoint;
+    /// `read_timeout` bounds how long one connection may take to send its request head.
+    pub async fn serve_with<P>(
+        listener: tokio::net::TcpListener,
+        provider: std::sync::Arc<P>,
+        read_timeout: std::time::Duration,
+    ) where
         P: CapabilityProvider + 'static,
     {
         loop {
@@ -173,7 +190,7 @@ pub mod server {
             };
             let provider = std::sync::Arc::clone(&provider);
             tokio::spawn(async move {
-                if let Err(e) = handle_conn(stream, provider.as_ref()).await {
+                if let Err(e) = handle_conn(stream, provider.as_ref(), read_timeout).await {
                     tracing::debug!("mesh endpoint connection error: {e}");
                 }
             });
@@ -181,30 +198,40 @@ pub mod server {
     }
 
     /// Read one request, route it against a fresh provider snapshot, and write the response.
+    /// A client that does not send a complete request head within `read_timeout` is answered
+    /// with a 400 and the connection is closed.
     async fn handle_conn<P: CapabilityProvider>(
         mut stream: tokio::net::TcpStream,
         provider: &P,
+        read_timeout: std::time::Duration,
     ) -> std::io::Result<()> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        // Read the request head until the blank line (a GET has no body), bounded so a peer
-        // cannot stream unbounded bytes at the endpoint.
-        let mut buf = Vec::new();
-        let mut chunk = [0u8; 1024];
-        loop {
-            let n = stream.read(&mut chunk).await?;
-            if n == 0 {
-                break;
+        // Read the request head until the blank line (a GET has no body), bounded in both bytes
+        // (a peer cannot stream unbounded data) and time (a silent peer cannot pin the task).
+        let read_head = async {
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 1024];
+            loop {
+                let n = stream.read(&mut chunk).await?;
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                if super::find(&buf, b"\r\n\r\n").is_some() || buf.len() > 16 * 1024 {
+                    break;
+                }
             }
-            buf.extend_from_slice(&chunk[..n]);
-            if super::find(&buf, b"\r\n\r\n").is_some() || buf.len() > 16 * 1024 {
-                break;
-            }
-        }
+            Ok::<_, std::io::Error>(buf)
+        };
 
-        let (status, body) = match parse_get_path(&buf) {
-            Some(path) => route(&path, &provider.caps().await),
-            None => (400, error_body("bad-request")),
+        let (status, body) = match tokio::time::timeout(read_timeout, read_head).await {
+            Ok(Ok(buf)) => match parse_get_path(&buf) {
+                Some(path) => route(&path, &provider.caps().await),
+                None => (400, error_body("bad-request")),
+            },
+            Ok(Err(e)) => return Err(e),
+            Err(_elapsed) => (400, error_body("request-timeout")),
         };
         stream.write_all(&http_response(status, &body)).await?;
         stream.flush().await?;
@@ -386,6 +413,42 @@ mod server_tests {
             .await
             .unwrap_err();
         assert!(matches!(err, super::MeshError::Http { status: 404 }));
+    }
+
+    /// A client that connects but never completes its request head is answered with a 400 and
+    /// dropped once the read timeout elapses — its handler task does not leak.
+    #[tokio::test]
+    async fn serve_times_out_a_silent_client() {
+        use std::net::Ipv4Addr;
+        use std::sync::Arc;
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::{TcpListener, TcpStream};
+
+        struct Empty;
+        impl CapabilityProvider for Empty {
+            async fn caps(&self) -> Vec<CapabilityDescriptor> {
+                vec![]
+            }
+        }
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            serve_with(listener, Arc::new(Empty), Duration::from_millis(150)).await
+        });
+
+        // Send a partial request head (no blank line) and never close; the server should
+        // time out, reply 400, and close — so our read-to-EOF completes with a 400 response.
+        let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).await.unwrap();
+        stream.write_all(b"GET /caps HTTP/1.1\r\n").await.unwrap();
+        stream.flush().await.unwrap();
+
+        let mut resp = Vec::new();
+        stream.read_to_end(&mut resp).await.unwrap();
+        let text = String::from_utf8_lossy(&resp);
+        assert!(text.starts_with("HTTP/1.1 400 "), "got: {text}");
+        assert!(text.contains("request-timeout"));
     }
 
     /// The server core frames a response the client half parses back (end-to-end over
