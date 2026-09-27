@@ -9,15 +9,14 @@
 //! the control API land in following slices.
 
 mod config;
-mod ctl;
 mod negotiate;
 mod reconcile;
 
 use anyhow::{Context, Result};
+use capmesh_ctl::{CtlClient, Format, LocalEndpoint, MountRole, MountSpec, RemoteEndpoint};
 use capmesh_discovery as discovery;
 use clap::{Parser, Subcommand};
 use config::Config;
-use ctl::{CtlClient, Format, LocalEndpoint, MountRole, MountSpec, RemoteEndpoint};
 use discovery::{CapabilityAdvert, ServiceAdvertiser};
 use mdns_sd::ServiceEvent;
 use reconcile::Reconciler;

@@ -23,10 +23,10 @@
             # midir and needs its own buildInputs in packages.nmidid). Adding such a
             # member no longer turns `nix flake check` red here.
             cargoBuildFlags = [ "-p" "capmeshd" ];
-            cargoTestFlags = [ "-p" "capmeshd" "-p" "capmesh-discovery" "-p" "capmesh-model" ];
+            cargoTestFlags = [ "-p" "capmeshd" "-p" "capmesh-discovery" "-p" "capmesh-model" "-p" "capmesh-ctl" ];
             # doCheck (default true) runs `cargo test` for capmeshd and its extracted
-            # `capmesh-discovery` + `capmesh-model` libraries in the sandbox — the discovery
-            # TXT-schema, ctl model-parse, and config-parser unit tests are pure, no network.
+            # capmesh-{discovery,model,ctl} libraries in the sandbox — the discovery TXT-schema,
+            # ctl model-parse, ctl socket round-trips, and config-parser tests are self-contained.
             meta = {
               description = "LAN capability mesh: stateless control-plane daemon (MIDI-first)";
               license = pkgs.lib.licenses.mit;
@@ -81,8 +81,8 @@
           checks.clippy = capmeshd.overrideAttrs (old: {
             pname = "${old.pname}-clippy";
             nativeBuildInputs = (old.nativeBuildInputs or [ ]) ++ [ pkgs.clippy ];
-            # Lint capmeshd and its extracted capmesh-discovery + capmesh-model libraries together.
-            buildPhase = "cargo clippy -p capmeshd -p capmesh-discovery -p capmesh-model --all-targets --release -- -D warnings";
+            # Lint capmeshd and its extracted capmesh-{discovery,model,ctl} libraries together.
+            buildPhase = "cargo clippy -p capmeshd -p capmesh-discovery -p capmesh-model -p capmesh-ctl --all-targets --release -- -D warnings";
             installPhase = "touch $out";
             doCheck = false;
           });

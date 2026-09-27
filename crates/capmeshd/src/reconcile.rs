@@ -3,7 +3,7 @@
 //! capmeshd holds no persistent authoritative state; it holds a **desired-mount set**
 //! (permanent mounts from config, temp mounts from agent/MCP commands) and continuously
 //! reconciles actual vs desired by driving a data-plane daemon's `capmesh-ctl` socket
-//! ([`crate::ctl`]). `connect`/`disconnect` are mutations of desired-state, not imperative
+//! ([`capmesh_ctl`]). `connect`/`disconnect` are mutations of desired-state, not imperative
 //! calls — this is what makes mounts idempotent and self-healing after a peer reboot.
 //!
 //! B2a is the poll-based core: [`reconcile`] is the pure decision (what to `mount` /
@@ -11,7 +11,7 @@
 //! `nmidid` ships `mount-state` notifications (§5), the reconciler will react to them
 //! event-driven instead of polling `mount-status`.
 
-use crate::ctl::{CtlClient, CtlError, MountSpec, MountState, MountStatus, Notification};
+use capmesh_ctl::{CtlClient, CtlError, MountSpec, MountState, MountStatus, Notification};
 use std::collections::{HashMap, HashSet};
 use tracing::info;
 
@@ -115,7 +115,7 @@ impl Reconciler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ctl::{Format, LocalEndpoint, MountRole, RemoteEndpoint};
+    use capmesh_ctl::{Format, LocalEndpoint, MountRole, RemoteEndpoint};
 
     fn spec(mount_id: &str) -> MountSpec {
         MountSpec {
