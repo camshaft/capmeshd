@@ -81,7 +81,9 @@
       li.appendChild(sum); li.appendChild(meta);
       (function (itemId) {
         li.addEventListener("click", function () {
-          fetch("/s/" + encodeURIComponent(id) + "/view", {
+          // Relative URL: resolves against <base href>, so it works under a
+          // reverse-proxy sub-path (e.g. /surfaced/) as well as at the root.
+          fetch("s/" + encodeURIComponent(id) + "/view", {
             method: "POST", headers: { "content-type": "application/json" },
             body: JSON.stringify({ "item-id": itemId })
           });
@@ -110,7 +112,8 @@
     renderFeed();
   }
 
-  var src = new EventSource("/s/" + encodeURIComponent(id) + "/events");
+  // Relative URL (resolves against <base href>) — reverse-proxy sub-path safe.
+  var src = new EventSource("s/" + encodeURIComponent(id) + "/events");
   src.onopen = function () { statusEl.textContent = "live"; };
   src.onerror = function () { statusEl.textContent = "reconnecting…"; };
   src.onmessage = function (e) { try { onEvent(JSON.parse(e.data)); } catch (_) {} };

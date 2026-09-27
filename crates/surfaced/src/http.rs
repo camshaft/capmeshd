@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    extract::{FromRef, Path, State},
     http::{StatusCode, header},
     response::{
         Html, IntoResponse, Response, Sse,
@@ -33,9 +33,37 @@ use tokio_stream::{StreamExt, wrappers::BroadcastStream};
 use crate::inbox::{PushRequest, SurfaceEvent, SurfaceStore, ViewRequest, broadcast_view};
 use crate::page::{SURFACE_CSS, SURFACE_HTML, SURFACE_JS};
 
-/// Build the surface HTTP router over a shared [`SurfaceStore`].
+/// Router state: the shared store plus the page HTML pre-rendered with the
+/// `<base href>` for the configured mount prefix (so the page's relative asset
+/// and API URLs resolve correctly whether served at `/` or behind a sub-path).
+#[derive(Clone)]
+struct AppState {
+    store: Arc<SurfaceStore>,
+    page_html: Arc<str>,
+}
+
+// Handlers that need only the store extract it directly via `FromRef`.
+impl FromRef<AppState> for Arc<SurfaceStore> {
+    fn from_ref(state: &AppState) -> Self {
+        Arc::clone(&state.store)
+    }
+}
+
+/// Build the surface HTTP router over a shared [`SurfaceStore`], served at `/`.
 pub fn router(store: Arc<SurfaceStore>) -> Router {
-    Router::new()
+    router_with_base(store, "")
+}
+
+/// Build the router mounted under `base_path` (e.g. `/surfaced` when reverse-
+/// proxied behind nginx). The prefix is normalized to `""` or `/segment...`;
+/// all routes nest under it and the page's `<base href>` is set so its relative
+/// URLs resolve under the prefix. nginx should proxy WITHOUT stripping the
+/// prefix (`location /surfaced/ { proxy_pass http://127.0.0.1:8787; }`).
+pub fn router_with_base(store: Arc<SurfaceStore>, base_path: &str) -> Router {
+    let base = normalize_base(base_path);
+    let page_html: Arc<str> =
+        Arc::from(SURFACE_HTML.replace("__BASE_HREF__", &html_base_href(&base)));
+    let inner = Router::new()
         .route("/", get(health))
         .route("/surface.css", get(css))
         .route("/surface.js", get(js))
@@ -43,7 +71,32 @@ pub fn router(store: Arc<SurfaceStore>) -> Router {
         .route("/s/{id}/events", get(events))
         .route("/s/{id}/items", get(list_items).post(push_item))
         .route("/s/{id}/view", post(set_view))
-        .with_state(store)
+        .with_state(AppState { store, page_html });
+    if base.is_empty() {
+        inner
+    } else {
+        Router::new().nest(&base, inner)
+    }
+}
+
+/// Normalize a mount prefix to `""` (root) or `/seg[/seg...]` (no trailing slash).
+fn normalize_base(raw: &str) -> String {
+    let trimmed = raw.trim().trim_matches('/');
+    if trimmed.is_empty() {
+        String::new()
+    } else {
+        format!("/{trimmed}")
+    }
+}
+
+/// The `<base href>` value for a normalized prefix — always ends in `/` so the
+/// page's relative URLs resolve directly under it (`/` for the root mount).
+fn html_base_href(base: &str) -> String {
+    if base.is_empty() {
+        "/".to_string()
+    } else {
+        format!("{base}/")
+    }
 }
 
 /// Serve the page stylesheet (linked from the HTML shell).
@@ -72,11 +125,11 @@ async fn health() -> &'static str {
     "surfaced: ok\n"
 }
 
-async fn page(Path(id): Path<String>) -> Response {
+async fn page(Path(id): Path<String>, State(state): State<AppState>) -> Response {
     if !SurfaceStore::valid_id(&id) {
         return bad_id();
     }
-    Html(SURFACE_HTML).into_response()
+    Html(state.page_html.to_string()).into_response()
 }
 
 async fn list_items(Path(id): Path<String>, State(store): State<Arc<SurfaceStore>>) -> Response {
@@ -247,8 +300,11 @@ mod tests {
         assert_eq!(page.status(), StatusCode::OK);
         let html = to_bytes(page.into_body(), usize::MAX).await.unwrap();
         let html = String::from_utf8(html.to_vec()).unwrap();
-        assert!(html.contains(r#"href="/surface.css""#));
-        assert!(html.contains(r#"src="/surface.js""#));
+        // Asset refs are relative; at the root mount the base href is "/".
+        assert!(html.contains(r#"href="surface.css""#));
+        assert!(html.contains(r#"src="surface.js""#));
+        assert!(html.contains(r#"<base href="/">"#));
+        assert!(!html.contains("__BASE_HREF__"));
 
         let css = app
             .clone()
@@ -280,5 +336,78 @@ mod tests {
             js.headers().get(header::CONTENT_TYPE).unwrap(),
             "text/javascript; charset=utf-8"
         );
+    }
+
+    #[tokio::test]
+    async fn served_under_a_base_path_for_reverse_proxy() {
+        let store = Arc::new(SurfaceStore::in_memory());
+        let app = router_with_base(store, "/surfaced/");
+
+        // Root paths are NOT served when mounted under a prefix.
+        let at_root = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/s/phone")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(at_root.status(), StatusCode::NOT_FOUND);
+
+        // The page is served under the prefix, with a matching <base href> so
+        // its relative asset/API URLs resolve under the prefix.
+        let page = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/surfaced/s/phone")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.status(), StatusCode::OK);
+        let html = to_bytes(page.into_body(), usize::MAX).await.unwrap();
+        let html = String::from_utf8(html.to_vec()).unwrap();
+        assert!(html.contains(r#"<base href="/surfaced/">"#));
+
+        // Assets and the push path also live under the prefix.
+        let css = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/surfaced/surface.css")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(css.status(), StatusCode::OK);
+
+        let push = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/surfaced/s/phone/items")
+                    .header("content-type", "application/json")
+                    .body(text_push("via proxy", true))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(push.status(), StatusCode::CREATED);
+    }
+
+    #[test]
+    fn base_path_normalization() {
+        assert_eq!(normalize_base(""), "");
+        assert_eq!(normalize_base("/"), "");
+        assert_eq!(normalize_base("surfaced"), "/surfaced");
+        assert_eq!(normalize_base("/surfaced/"), "/surfaced");
+        assert_eq!(normalize_base("/a/b"), "/a/b");
+        assert_eq!(html_base_href(""), "/");
+        assert_eq!(html_base_href("/surfaced"), "/surfaced/");
     }
 }
