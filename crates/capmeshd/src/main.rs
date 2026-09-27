@@ -51,6 +51,9 @@ enum Cmd {
         /// Path to the daemon's Unix control socket (e.g. /run/nmidid.sock).
         #[arg(long)]
         socket: PathBuf,
+        /// After hello + list-ports, keep listening and print daemon notifications (§5).
+        #[arg(long)]
+        watch: bool,
     },
     /// Establish a mount on a daemon (§3): create/attach a p2p link to a remote port.
     Mount(MountArgs),
@@ -154,7 +157,7 @@ async fn main() -> Result<()> {
     let args = Args::parse();
 
     match &args.cmd {
-        Some(Cmd::ProbeCtl { socket }) => return probe_ctl(socket).await,
+        Some(Cmd::ProbeCtl { socket, watch }) => return probe_ctl(socket, *watch).await,
         Some(Cmd::Mount(m)) => return cmd_mount(m).await,
         Some(Cmd::Unmount { socket, mount_id }) => return cmd_unmount(socket, mount_id).await,
         Some(Cmd::MountStatus { socket, mount_id }) => {
@@ -266,7 +269,7 @@ async fn main() -> Result<()> {
 
 /// Drive a data-plane daemon's `capmesh-ctl` socket: connect, handshake, enumerate ports.
 /// This is the `midi` adapter's first integration path against a live `nmidid` (§1.2, §3).
-async fn probe_ctl(socket: &Path) -> Result<()> {
+async fn probe_ctl(socket: &Path, watch: bool) -> Result<()> {
     info!(socket = %socket.display(), "connecting to capmesh-ctl socket");
     let mut client = CtlClient::connect(socket)
         .await
@@ -305,6 +308,20 @@ async fn probe_ctl(socket: &Path) -> Result<()> {
             .await
             .context("describe-port")?;
         info!(port_id = %d.port_id, name = %d.name, "describe-port ok");
+    }
+
+    // Listen for unsolicited daemon notifications (§5): mount-state + hotplug events.
+    if watch {
+        info!("watching for daemon notifications (ctrl-c to stop)");
+        loop {
+            match client.next_notification().await {
+                Ok(n) => info!(notification = ?n, "daemon notification"),
+                Err(e) => {
+                    warn!("notification stream ended: {e:#}");
+                    break;
+                }
+            }
+        }
     }
     Ok(())
 }
