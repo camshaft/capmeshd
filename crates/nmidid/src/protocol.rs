@@ -193,6 +193,9 @@ pub struct RemoteEndpoint {
     pub host: Option<String>,
     /// ALWAYS the IP from the mDNS record, never a `.local`/`.lan` name.
     pub addr: String,
+    /// The AppleMIDI **control** port (e.g. the SRV port from `_apple-midi._udp`).
+    /// The daemon derives the data-plane port as `port + 1` (AppleMIDI
+    /// convention); callers pass the control port here, not `port + 1`.
     pub port: u16,
     pub port_id: String,
 }

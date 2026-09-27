@@ -105,7 +105,7 @@ Audio/video (forward-looking, other daemons) use the *same* `Format` shape, e.g.
   "remote": {                     // the peer this host connects to (DIRECT, p2p)
      "host": "laptop",
      "addr": "192.168.1.23",      // ALWAYS the IP from the mDNS record, never a .local/.lan name
-     "port": 5004,
+     "port": 5004,                // the AppleMIDI CONTROL port; the daemon derives the data port as port+1
      "port-id": "kbd-0"
   },
   "format": {"codec":"midi1"}     // the CHOSEN format — result of negotiation (§4), not a list
