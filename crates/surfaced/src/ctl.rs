@@ -105,6 +105,7 @@ impl Session {
             "list-items" => self.handle_list_items(params),
             "list-surfaces" => self.handle_list_surfaces(),
             "clear-items" => self.handle_clear(params),
+            "remove-item" => self.handle_remove_item(params),
             "delete-surface" => self.handle_delete(params),
             "set-token" => self.handle_set_token(params),
             other => Err(CtlError::protocol(
@@ -209,6 +210,25 @@ impl Session {
         let id = surface_id(params)?;
         self.store.clear(&id); // idempotent: unknown surface is a no-op
         Ok(Value::Object(Map::new()))
+    }
+
+    fn handle_remove_item(&self, params: &Value) -> Result<Value, CtlError> {
+        let id = surface_id(params)?;
+        let item_id = params.get("item-id").and_then(Value::as_str).ok_or_else(|| {
+            CtlError::protocol(
+                INVALID_PARAMS,
+                "invalid-params",
+                "remove-item requires 'item-id'",
+            )
+        })?;
+        if self.store.remove_item(&id, item_id) {
+            Ok(Value::Object(Map::new()))
+        } else {
+            Err(CtlError::domain(
+                "no-such-item",
+                "unknown surface or item-id",
+            ))
+        }
     }
 
     fn handle_delete(&self, params: &Value) -> Result<Value, CtlError> {
@@ -473,6 +493,25 @@ mod tests {
         assert_eq!(out[3]["result"]["items"].as_array().unwrap().len(), 0);
         // After delete, the registry is empty.
         assert_eq!(out[5]["result"]["surfaces"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn remove_item_prunes_one() {
+        let store = Arc::new(SurfaceStore::in_memory());
+        let send = serde_json::json!({"jsonrpc":"2.0","id":2,"method":"send-item",
+            "params":{"surface-id":"s","item":{"type":"text","body":"a"}}});
+        // Send, capture the item id, remove it, then list.
+        let out1 = exchange(store.clone(), &[hello(), send]).await;
+        let item_id = out1[1]["result"]["id"].as_str().unwrap().to_string();
+        let remove = serde_json::json!({"jsonrpc":"2.0","id":3,"method":"remove-item",
+            "params":{"surface-id":"s","item-id":item_id}});
+        let list = serde_json::json!({"jsonrpc":"2.0","id":4,"method":"list-items","params":{"surface-id":"s"}});
+        let bad = serde_json::json!({"jsonrpc":"2.0","id":5,"method":"remove-item",
+            "params":{"surface-id":"s","item-id":"nope"}});
+        let out = exchange(store, &[hello(), remove, list, bad]).await;
+        assert!(out[1]["result"].is_object());
+        assert_eq!(out[2]["result"]["items"].as_array().unwrap().len(), 0);
+        assert_eq!(out[3]["error"]["data"]["code"], "no-such-item");
     }
 
     #[tokio::test]

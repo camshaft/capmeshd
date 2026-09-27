@@ -25,7 +25,7 @@ use axum::{
         Html, IntoResponse, Response, Sse,
         sse::{Event, KeepAlive},
     },
-    routing::{get, post},
+    routing::{delete, get, post},
 };
 use serde_json::{Value, json};
 use tokio_stream::{StreamExt, wrappers::BroadcastStream};
@@ -90,6 +90,7 @@ pub fn router_with_base(
         .route("/s/{id}", get(page))
         .route("/s/{id}/events", get(events))
         .route("/s/{id}/items", get(list_items).post(push_item))
+        .route("/s/{id}/items/{item_id}", delete(remove_item))
         .route("/s/{id}/view", post(set_view))
         .route("/s/{id}/clear", post(clear))
         .route("/mcp", post(mcp_post).get(mcp_get))
@@ -329,6 +330,26 @@ async fn clear(
     // Empties the inbox and broadcasts a fresh (empty) snapshot to attached tabs.
     store.clear(&id);
     StatusCode::NO_CONTENT.into_response()
+}
+
+/// Remove a single item from a surface's inbox by id (prune one stale item). The
+/// removal broadcasts a fresh snapshot so attached tabs drop it live.
+async fn remove_item(
+    Path((id, item_id)): Path<(String, String)>,
+    State(store): State<Arc<SurfaceStore>>,
+    AttachToken(tok): AttachToken,
+) -> Response {
+    if !SurfaceStore::valid_id(&id) {
+        return bad_id();
+    }
+    if !store.authorize_attach(&id, tok.as_deref()) {
+        return unauthorized();
+    }
+    if store.remove_item(&id, &item_id) {
+        StatusCode::NO_CONTENT.into_response()
+    } else {
+        (StatusCode::NOT_FOUND, "no such surface or item\n").into_response()
+    }
 }
 
 async fn events(
@@ -709,6 +730,40 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NO_CONTENT);
         assert_eq!(store.snapshot("s").items.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn delete_item_endpoint_removes_one() {
+        let store = Arc::new(SurfaceStore::in_memory());
+        let a = store.push("s", crate::item::DisplayItem::Text { body: "a".into() }, true);
+        store.push("s", crate::item::DisplayItem::Text { body: "b".into() }, false);
+        let app = router(store.clone());
+        // Remove item `a`.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/s/s/items/{}", a.entry.id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert_eq!(store.snapshot("s").items.len(), 1);
+        // Removing an unknown item is 404.
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/s/s/items/nope")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     #[test]

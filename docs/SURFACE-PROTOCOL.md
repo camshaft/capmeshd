@@ -110,6 +110,7 @@ A **surface view** (the `list-items` result) is the surface's current state:
 | `set-token` | `{surface-id, attach-token?}` | `{}` | rotate (string) or clear (null/absent → reopen) an existing surface's attach token; `no-such-surface` if it does not exist |
 | `send-item` | `{surface-id, item, promote?}` | `{id, ts}` | append a display item to the inbox (and, if `promote`, make it the main view) |
 | `set-view` | `{surface-id, item-id?}` | `{}` | select which item the main view shows (`item-id` null/absent clears it) |
+| `remove-item` | `{surface-id, item-id}` | `{}` | prune one item from the inbox by id; `no-such-item` if the surface or item is unknown |
 | `list-items` | `{surface-id}` | `SurfaceView` | the surface's current state (title, main view, items) |
 | `list-surfaces` | `{}` | `{surfaces: [SurfaceSummary]}` | discover every registered surface (id, title, item-count, current-view) — the control/discovery method |
 
@@ -224,7 +225,7 @@ the **same** store, so:
 
 - The framing (§1), `hello` with `capabilities:["surface","durable-inbox","attach-fanout"]`.
 - `create-surface` (title + attach token), `send-item` (all item types, `promote`),
-  `set-view`, `list-items`, `list-surfaces`, `clear-items`, `delete-surface`, `set-token`.
+  `set-view`, `list-items`, `list-surfaces`, `clear-items`, `remove-item`, `delete-surface`, `set-token`.
 - Durable per-surface inbox (on-disk NDJSON, replayed on restart + compacted), bounded in memory.
   A surface's config also survives restart via per-surface sidecars: main-view selection, attach
   token (a protected surface stays protected), and title.
@@ -251,6 +252,9 @@ Tools:
 | `list_surfaces` | — | list every registered surface (id, title, item-count, current-view) |
 | `list_items` | `{surface-id}` | the display items on a surface |
 | `send_item` | `{surface-id, item, promote?}` | post a display item (created if new); `promote` (default `true`) also shows it in the main view |
+| `remove_item` | `{surface-id, item-id}` | prune one item from the inbox by id (the `id` from `list_items`) |
+| `clear_surface` | `{surface-id}` | empty a surface's inbox (the surface itself stays) |
+| `delete_surface` | `{surface-id}` | delete a surface entirely (inbox + on-disk log) |
 
 `item` is the display-item shape (§4): `{"type":"pdf","url":…}`, `{"type":"text","body":…}`,
 `{"type":"link","url":…,"title":…}`, `{"type":"navigate","url":…}`, `{"type":"html","markup":…}`,

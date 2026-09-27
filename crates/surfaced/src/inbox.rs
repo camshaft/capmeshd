@@ -435,9 +435,6 @@ impl SurfaceStore {
         }
     }
 
-    /// Decide whether an HTTP request presenting `presented` may access surface
-    /// `id`. An absent or token-less surface is open (returns `true`); a
-    /// token-protected surface requires an exact match (DESIGN §10.1 attach auth).
     /// Clear a surface's inbox: drop all items, reset the main view, truncate the
     /// on-disk log, and broadcast a fresh (empty) snapshot to attached tabs.
     /// Returns `false` if the surface does not exist (a no-op).
@@ -457,6 +454,35 @@ impl SurfaceStore {
         }
         // The inbox is empty, so the view is none — persist that.
         self.write_view(id, None);
+        let _ = state.tx.send(SurfaceEvent::Snapshot {
+            surface: state.view(self.cap),
+        });
+        true
+    }
+
+    /// Remove a single item from a surface's inbox by id (prune a stale item
+    /// without clearing the whole surface). Rewrites the on-disk log to the
+    /// remaining window and broadcasts a fresh snapshot so attached tabs drop it.
+    /// If the removed item was the main view, the view resets to none. Returns
+    /// `false` if the surface or the item does not exist (a no-op).
+    pub fn remove_item(&self, id: &str, item_id: &str) -> bool {
+        let mut map = self.inner.lock().expect("store lock");
+        let Some(state) = map.get_mut(id) else {
+            return false;
+        };
+        let before = state.items.len();
+        state.items.retain(|i| i.id != item_id);
+        if state.items.len() == before {
+            return false; // no such item — nothing changed
+        }
+        // If the removed item was the main view, there is nothing to show.
+        if state.current_view.as_deref() == Some(item_id) {
+            state.current_view = None;
+            self.write_view(id, None);
+        }
+        // Rewrite the log to the retained window (drops the removed item on disk).
+        self.compact_log(id, &state.items);
+        state.appends_since_compaction = 0;
         let _ = state.tx.send(SurfaceEvent::Snapshot {
             surface: state.view(self.cap),
         });
@@ -497,6 +523,9 @@ impl SurfaceStore {
         removed
     }
 
+    /// Decide whether an HTTP request presenting `presented` may access surface
+    /// `id`. An absent or token-less surface is open (returns `true`); a
+    /// token-protected surface requires an exact match (DESIGN §10.1 attach auth).
     pub fn authorize_attach(&self, id: &str, presented: Option<&str>) -> bool {
         let map = self.inner.lock().expect("store lock");
         match map.get(id).and_then(|s| s.attach_token.as_deref()) {
@@ -901,6 +930,30 @@ mod tests {
         assert_eq!(read_log(dir.path(), "s").unwrap().len(), 0);
         // Clearing an unknown surface is a no-op.
         assert!(!store.clear("nope"));
+    }
+
+    #[test]
+    fn remove_item_prunes_one_and_rewrites_the_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SurfaceStore::with_state_dir(dir.path()).unwrap();
+        let a = store.push("s", text("a"), true); // a is the current view
+        store.push("s", text("b"), false);
+        let a_id = a.entry.id.clone();
+
+        // Remove the viewed item: it drops from the inbox, the log, and the view.
+        assert!(store.remove_item("s", &a_id));
+        let snap = store.snapshot("s");
+        assert_eq!(snap.items.len(), 1);
+        assert_eq!(snap.items[0].item, text("b"));
+        assert_eq!(snap.current_view, None, "removing the viewed item clears the view");
+        assert_eq!(read_log(dir.path(), "s").unwrap().len(), 1);
+
+        // Removing a nonexistent item, or from an unknown surface, is false.
+        assert!(!store.remove_item("s", "does-not-exist"));
+        assert!(!store.remove_item("ghost", &a_id));
+        // A fresh store replays exactly the remaining item.
+        let reborn = SurfaceStore::with_state_dir(dir.path()).unwrap();
+        assert_eq!(reborn.snapshot("s").items.len(), 1);
     }
 
     #[test]
