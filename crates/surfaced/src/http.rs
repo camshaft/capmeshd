@@ -81,6 +81,7 @@ pub fn router_with_base(
         .route("/s/{id}/events", get(events))
         .route("/s/{id}/items", get(list_items).post(push_item))
         .route("/s/{id}/view", post(set_view))
+        .route("/s/{id}/clear", post(clear))
         .route("/mcp", post(mcp_post).get(mcp_get))
         .with_state(AppState {
             store,
@@ -277,6 +278,22 @@ async fn set_view(
         }
         None => (StatusCode::NOT_FOUND, "no such surface or item\n").into_response(),
     }
+}
+
+async fn clear(
+    Path(id): Path<String>,
+    State(store): State<Arc<SurfaceStore>>,
+    AttachToken(tok): AttachToken,
+) -> Response {
+    if !SurfaceStore::valid_id(&id) {
+        return bad_id();
+    }
+    if !store.authorize_attach(&id, tok.as_deref()) {
+        return unauthorized();
+    }
+    // Empties the inbox and broadcasts a fresh (empty) snapshot to attached tabs.
+    store.clear(&id);
+    StatusCode::NO_CONTENT.into_response()
 }
 
 async fn events(
@@ -583,6 +600,31 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(open.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn clear_endpoint_empties_the_surface() {
+        let store = Arc::new(SurfaceStore::in_memory());
+        store.push(
+            "s",
+            crate::item::DisplayItem::Text {
+                body: "x".to_string(),
+            },
+            true,
+        );
+        let app = router(store.clone());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/s/s/clear")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert_eq!(store.snapshot("s").items.len(), 0);
     }
 
     #[test]

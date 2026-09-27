@@ -322,6 +322,44 @@ impl SurfaceStore {
     /// Decide whether an HTTP request presenting `presented` may access surface
     /// `id`. An absent or token-less surface is open (returns `true`); a
     /// token-protected surface requires an exact match (DESIGN §10.1 attach auth).
+    /// Clear a surface's inbox: drop all items, reset the main view, truncate the
+    /// on-disk log, and broadcast a fresh (empty) snapshot to attached tabs.
+    /// Returns `false` if the surface does not exist (a no-op).
+    pub fn clear(&self, id: &str) -> bool {
+        let mut map = self.inner.lock().expect("store lock");
+        let Some(state) = map.get_mut(id) else {
+            return false;
+        };
+        state.items.clear();
+        state.current_view = None;
+        state.appends_since_compaction = 0;
+        if let Some(path) = self.log_path(id)
+            && path.exists()
+            && let Err(e) = std::fs::write(&path, b"")
+        {
+            warn!("truncating log {}: {e}", path.display());
+        }
+        let _ = state.tx.send(SurfaceEvent::Snapshot {
+            surface: state.view(self.cap),
+        });
+        true
+    }
+
+    /// Remove a surface entirely (from memory and its on-disk log). Returns
+    /// `false` if it did not exist. Attached tabs' event streams end (the
+    /// broadcast sender drops) and reconnect against a fresh, empty surface.
+    pub fn delete(&self, id: &str) -> bool {
+        let mut map = self.inner.lock().expect("store lock");
+        let removed = map.remove(id).is_some();
+        if let Some(path) = self.log_path(id)
+            && path.exists()
+            && let Err(e) = std::fs::remove_file(&path)
+        {
+            warn!("removing log {}: {e}", path.display());
+        }
+        removed
+    }
+
     pub fn authorize_attach(&self, id: &str, presented: Option<&str>) -> bool {
         let map = self.inner.lock().expect("store lock");
         match map.get(id).and_then(|s| s.attach_token.as_deref()) {
@@ -595,5 +633,32 @@ mod tests {
         let rsnap = reborn.snapshot("s");
         assert_eq!(rsnap.items.len(), lines);
         assert_eq!(rsnap.items.last().unwrap().item, text("m49"));
+    }
+
+    #[test]
+    fn clear_empties_the_inbox_and_truncates_the_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SurfaceStore::with_state_dir(dir.path()).unwrap();
+        store.push("s", text("a"), true);
+        store.push("s", text("b"), false);
+        assert!(store.clear("s"));
+        let snap = store.snapshot("s");
+        assert_eq!(snap.items.len(), 0);
+        assert_eq!(snap.current_view, None);
+        assert_eq!(read_log(dir.path(), "s").unwrap().len(), 0);
+        // Clearing an unknown surface is a no-op.
+        assert!(!store.clear("nope"));
+    }
+
+    #[test]
+    fn delete_removes_the_surface_and_its_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SurfaceStore::with_state_dir(dir.path()).unwrap();
+        store.push("s", text("a"), true);
+        assert!(dir.path().join("s.jsonl").exists());
+        assert!(store.delete("s"));
+        assert!(!dir.path().join("s.jsonl").exists());
+        assert!(store.list_surfaces().is_empty());
+        assert!(!store.delete("s"));
     }
 }

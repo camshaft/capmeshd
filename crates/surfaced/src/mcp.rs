@@ -88,6 +88,24 @@ fn tools_list() -> Value {
                 },
                 "required": ["surface-id", "item"]
             }
+        },
+        {
+            "name": "clear_surface",
+            "description": "Clear a surface's inbox — drop all items and reset the main view (the surface itself stays).",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "surface-id": { "type": "string" } },
+                "required": ["surface-id"]
+            }
+        },
+        {
+            "name": "delete_surface",
+            "description": "Delete a surface entirely (its inbox and on-disk log).",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "surface-id": { "type": "string" } },
+                "required": ["surface-id"]
+            }
         }
     ]})
 }
@@ -105,6 +123,20 @@ fn tools_call(store: &SurfaceStore, params: &Value) -> Value {
             Err(e) => tool_error(e),
         },
         "send_item" => send_item(store, &args),
+        "clear_surface" => match surface_id(&args) {
+            Ok(id) => {
+                store.clear(&id);
+                tool_text(format!("cleared surface '{id}'"))
+            }
+            Err(e) => tool_error(e),
+        },
+        "delete_surface" => match surface_id(&args) {
+            Ok(id) => {
+                store.delete(&id);
+                tool_text(format!("deleted surface '{id}'"))
+            }
+            Err(e) => tool_error(e),
+        },
         other => tool_error(format!("unknown tool '{other}'")),
     }
 }
@@ -183,7 +215,7 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_names_the_three_tools() {
+    fn tools_list_names_the_tools() {
         let store = SurfaceStore::in_memory();
         let out = dispatch(&store, &req(2, "tools/list", json!({}))).unwrap();
         let names: Vec<String> = out["result"]["tools"]
@@ -192,9 +224,15 @@ mod tests {
             .iter()
             .map(|t| t["name"].as_str().unwrap().to_string())
             .collect();
-        assert!(names.contains(&"list_surfaces".to_string()));
-        assert!(names.contains(&"list_items".to_string()));
-        assert!(names.contains(&"send_item".to_string()));
+        for expected in [
+            "list_surfaces",
+            "list_items",
+            "send_item",
+            "clear_surface",
+            "delete_surface",
+        ] {
+            assert!(names.contains(&expected.to_string()), "missing {expected}");
+        }
     }
 
     #[test]

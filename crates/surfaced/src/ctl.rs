@@ -104,6 +104,8 @@ impl Session {
             "set-view" => self.handle_set_view(params),
             "list-items" => self.handle_list_items(params),
             "list-surfaces" => self.handle_list_surfaces(),
+            "clear-items" => self.handle_clear(params),
+            "delete-surface" => self.handle_delete(params),
             other => Err(CtlError::protocol(
                 METHOD_NOT_FOUND,
                 "method-not-found",
@@ -200,6 +202,18 @@ impl Session {
         let surfaces = serde_json::to_value(self.store.list_surfaces())
             .unwrap_or_else(|_| Value::Array(Vec::new()));
         Ok(serde_json::json!({ "surfaces": surfaces }))
+    }
+
+    fn handle_clear(&self, params: &Value) -> Result<Value, CtlError> {
+        let id = surface_id(params)?;
+        self.store.clear(&id); // idempotent: unknown surface is a no-op
+        Ok(Value::Object(Map::new()))
+    }
+
+    fn handle_delete(&self, params: &Value) -> Result<Value, CtlError> {
+        let id = surface_id(params)?;
+        self.store.delete(&id); // idempotent: unknown surface is a no-op
+        Ok(Value::Object(Map::new()))
     }
 
     fn handle_list_items(&self, params: &Value) -> Result<Value, CtlError> {
@@ -423,6 +437,23 @@ mod tests {
         assert_eq!(surfaces[0]["id"], "phone");
         assert_eq!(surfaces[0]["title"], "Phone");
         assert_eq!(surfaces[0]["item-count"], 0);
+    }
+
+    #[tokio::test]
+    async fn clear_and_delete_surfaces() {
+        let store = Arc::new(SurfaceStore::in_memory());
+        let send = serde_json::json!({"jsonrpc":"2.0","id":2,"method":"send-item",
+            "params":{"surface-id":"s","item":{"type":"text","body":"hi"}}});
+        let clear = serde_json::json!({"jsonrpc":"2.0","id":3,"method":"clear-items","params":{"surface-id":"s"}});
+        let list = serde_json::json!({"jsonrpc":"2.0","id":4,"method":"list-items","params":{"surface-id":"s"}});
+        let del = serde_json::json!({"jsonrpc":"2.0","id":5,"method":"delete-surface","params":{"surface-id":"s"}});
+        let all = serde_json::json!({"jsonrpc":"2.0","id":6,"method":"list-surfaces","params":{}});
+        let out = exchange(store, &[hello(), send, clear, list, del, all]).await;
+        // After clear, the surface exists but is empty.
+        assert!(out[2]["result"].is_object());
+        assert_eq!(out[3]["result"]["items"].as_array().unwrap().len(), 0);
+        // After delete, the registry is empty.
+        assert_eq!(out[5]["result"]["surfaces"].as_array().unwrap().len(), 0);
     }
 
     #[tokio::test]
