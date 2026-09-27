@@ -23,7 +23,7 @@ pub struct MountPlan {
 }
 
 /// Why an auto-mount could not be planned.
-#[derive(Debug, thiserror::Error, PartialEq)]
+#[derive(Debug, Clone, thiserror::Error, PartialEq)]
 pub enum PlanError {
     #[error("no advertised port matches the auto-mount selector")]
     NoMatchingPort,
@@ -104,6 +104,67 @@ pub fn build_mount_spec(
         },
         format: plan.format,
     }
+}
+
+/// The resolved remote coordinates for an auto-mount, gathered by the discovery layer: the
+/// idempotency `mount_id`, the peer's host-id and IP, its AppleMIDI **control** port (`None`
+/// until the peer's `_apple-midi._udp` record has been seen), and the local virtual name.
+#[derive(Debug, Clone)]
+pub struct Remote {
+    pub mount_id: String,
+    pub host: String,
+    pub addr: IpAddr,
+    pub control_port: Option<u16>,
+    pub local_name: Option<String>,
+}
+
+/// The outcome of evaluating one auto-mount rule against a discovered, descriptor-fetched peer.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AutoMountOutcome {
+    /// Issue this mount.
+    Mount(MountSpec),
+    /// A port matched and the format negotiated, but the peer's control port is not known yet
+    /// (no `_apple-midi._udp` record seen). Skip for now; a later apple-midi resolve re-triggers.
+    AwaitingControlPort,
+    /// The rule did not apply (no matching port / unknown action / no common format).
+    Skip(PlanError),
+}
+
+/// Evaluate one auto-mount rule (§6.1) against a peer whose descriptor has been fetched: plan
+/// the mount, then require the peer's control port before committing. This composes
+/// [`plan_mount`] and [`build_mount_spec`] and centralises the "matched but the data-plane port
+/// isn't known yet" state, so the daemon's discovery glue is a single `match`.
+pub fn evaluate(
+    action: &str,
+    selector_kind: Option<&str>,
+    selector_dir: Option<&str>,
+    selector_port: Option<&str>,
+    ports: &[PortDescriptor],
+    local_codecs: &[Format],
+    remote: Remote,
+) -> AutoMountOutcome {
+    let plan = match plan_mount(
+        action,
+        selector_kind,
+        selector_dir,
+        selector_port,
+        ports,
+        local_codecs,
+    ) {
+        Ok(plan) => plan,
+        Err(e) => return AutoMountOutcome::Skip(e),
+    };
+    let Some(control_port) = remote.control_port else {
+        return AutoMountOutcome::AwaitingControlPort;
+    };
+    AutoMountOutcome::Mount(build_mount_spec(
+        plan,
+        remote.mount_id,
+        remote.host,
+        remote.addr,
+        control_port,
+        remote.local_name,
+    ))
 }
 
 #[cfg(test)]
@@ -245,5 +306,70 @@ mod tests {
         );
         assert!(!spec.local.is_virtual);
         assert!(spec.local.name.is_none());
+    }
+
+    fn remote(control_port: Option<u16>) -> Remote {
+        Remote {
+            mount_id: "laptop-kbd-0".into(),
+            host: "laptop".into(),
+            addr: "192.168.1.23".parse().unwrap(),
+            control_port,
+            local_name: Some("laptop: Keystation 49e".into()),
+        }
+    }
+
+    #[test]
+    fn evaluate_issues_a_mount_when_the_control_port_is_known() {
+        let ports = vec![port("kbd-0", "source", "midi", &["midi1"])];
+        let outcome = evaluate(
+            "mirror-local",
+            Some("midi"),
+            Some("source"),
+            None,
+            &ports,
+            &[fmt("midi1")],
+            remote(Some(5004)),
+        );
+        match outcome {
+            AutoMountOutcome::Mount(spec) => {
+                assert_eq!(spec.mount_id, "laptop-kbd-0");
+                assert_eq!(spec.remote.port, 5004); // control port verbatim
+                assert_eq!(spec.remote.port_id, "kbd-0");
+                assert_eq!(spec.role, MountRole::MirrorSource);
+            }
+            other => panic!("expected Mount, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn evaluate_awaits_when_control_port_unknown() {
+        let ports = vec![port("kbd-0", "source", "midi", &["midi1"])];
+        let outcome = evaluate(
+            "mirror-local",
+            Some("midi"),
+            Some("source"),
+            None,
+            &ports,
+            &[fmt("midi1")],
+            remote(None), // no _apple-midi._udp record seen yet
+        );
+        assert_eq!(outcome, AutoMountOutcome::AwaitingControlPort);
+    }
+
+    #[test]
+    fn evaluate_skips_when_the_rule_does_not_apply() {
+        let ports = vec![port("kbd-0", "source", "midi", &["midi1"])];
+        // Selector wants audio; the only port is midi → Skip(NoMatchingPort), even though a
+        // control port is known (the rule simply doesn't apply here).
+        let outcome = evaluate(
+            "mirror-local",
+            Some("audio"),
+            None,
+            None,
+            &ports,
+            &[fmt("midi1")],
+            remote(Some(5004)),
+        );
+        assert_eq!(outcome, AutoMountOutcome::Skip(PlanError::NoMatchingPort));
     }
 }
