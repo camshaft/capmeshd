@@ -246,6 +246,25 @@ impl SurfaceStore {
         }
     }
 
+    /// Path of the per-surface title sidecar (extension not `jsonl`, so replay
+    /// ignores it as an item log).
+    fn title_path(&self, id: &str) -> Option<PathBuf> {
+        self.state_dir
+            .as_ref()
+            .map(|d| d.join(format!("{id}.title")))
+    }
+
+    /// Persist a surface's title so a friendly name survives a restart (in memory
+    /// only, the title would revert to the surface id). Best effort.
+    fn write_title(&self, id: &str, title: &str) {
+        let Some(path) = self.title_path(id) else {
+            return;
+        };
+        if let Err(e) = std::fs::write(&path, title.as_bytes()) {
+            warn!("writing title sidecar {}: {e}", path.display());
+        }
+    }
+
     /// Load every `<id>.jsonl` log under the state dir into memory.
     fn replay(&mut self) -> Result<()> {
         let Some(dir) = self.state_dir.clone() else {
@@ -299,6 +318,10 @@ impl SurfaceStore {
             // across a restart (its presence, not contents, is the key fact).
             if let Ok(tok) = std::fs::read_to_string(dir.join(format!("{id}.token"))) {
                 state.attach_token = Some(tok);
+            }
+            // Restore the friendly title (otherwise it would revert to the id).
+            if let Ok(title) = std::fs::read_to_string(dir.join(format!("{id}.title"))) {
+                state.title = title;
             }
             debug!("replayed surface '{id}' with {} items", state.items.len());
             map.insert(id.to_string(), state);
@@ -404,6 +427,7 @@ impl SurfaceStore {
             .or_insert_with(|| SurfaceState::new(id.to_string()));
         if let Some(t) = title {
             state.title = t;
+            self.write_title(id, &state.title);
         }
         if attach_token.is_some() {
             state.attach_token = attach_token;
@@ -462,6 +486,14 @@ impl SurfaceStore {
         // And the token sidecar, so a re-created surface of the same id is open
         // (not silently protected by the deleted surface's token).
         self.write_token(id, None);
+        // And the title sidecar, so a re-created surface starts with its id as
+        // the title rather than inheriting the deleted surface's name.
+        if let Some(path) = self.title_path(id)
+            && path.exists()
+            && let Err(e) = std::fs::remove_file(&path)
+        {
+            warn!("removing title sidecar {}: {e}", path.display());
+        }
         removed
     }
 
@@ -735,6 +767,20 @@ mod tests {
         assert_eq!(v["kind"], "view");
         assert_eq!(v["current-view"], "abc");
         assert!(v.get("current_view").is_none(), "must not use snake_case key");
+    }
+
+    #[test]
+    fn title_survives_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+        {
+            let store = SurfaceStore::with_state_dir(&path).unwrap();
+            store.ensure("s", Some("My Phone".to_string()), None);
+            store.push("s", text("hi"), true);
+        }
+        // A fresh store restores the friendly title (not the surface id).
+        let reborn = SurfaceStore::with_state_dir(&path).unwrap();
+        assert_eq!(reborn.snapshot("s").title, "My Phone");
     }
 
     #[test]
