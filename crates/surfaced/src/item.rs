@@ -10,17 +10,26 @@ use serde::{Deserialize, Serialize};
 
 /// A single thing pushed to a surface for display (DESIGN §10.1 built-in types).
 ///
-/// `navigate`/`pdf` render a third-party URL inside a sandboxed iframe (untrusted
-/// web content is contained, never injected). `html`/`script` are same-origin to
-/// `surfaced` and fully trusted — safe because `send` is trust-boundary-gated
-/// (DESIGN §8): only cluster-authenticated hosts may push.
+/// `navigate` renders a third-party URL inside a sandboxed iframe (untrusted web
+/// content is contained, never injected). `pdf` renders in a plain iframe so the
+/// browser's built-in PDF viewer works — a sandboxed iframe blocks it — which is
+/// safe because the PDF is cross-origin/passive and the sender is trusted.
+/// `html`/`script` are same-origin to `surfaced` and fully trusted — safe because
+/// `send` is trust-boundary-gated (DESIGN §8): only cluster-authenticated hosts
+/// may push.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum DisplayItem {
     /// An iframe pointed at a third-party URL (one thing among many).
     Navigate { url: String },
-    /// A PDF viewer (the "put this manual page on my phone" case).
-    Pdf { url: String },
+    /// A PDF viewer (the "put this manual page on my phone" case). An optional
+    /// `page` deep-links into the document (1-based), for the many-hundred-page
+    /// manuals where opening at page 1 is useless.
+    Pdf {
+        url: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        page: Option<u32>,
+    },
     /// A plain-text note.
     Text { body: String },
     /// A clickable link, optionally titled.
@@ -41,7 +50,10 @@ impl DisplayItem {
     pub fn summary(&self) -> String {
         match self {
             DisplayItem::Navigate { url } => format!("navigate → {url}"),
-            DisplayItem::Pdf { url } => format!("pdf → {url}"),
+            DisplayItem::Pdf { url, page } => match page {
+                Some(p) => format!("pdf → {url} (p.{p})"),
+                None => format!("pdf → {url}"),
+            },
             DisplayItem::Text { body } => {
                 let head: String = body.chars().take(60).collect();
                 format!("text: {head}")
@@ -68,4 +80,23 @@ pub struct InboxItem {
     pub promote: bool,
     /// The pushed display item.
     pub item: DisplayItem,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pdf_page_is_optional_and_round_trips() {
+        // No page: the field is omitted from the wire form entirely.
+        let plain: DisplayItem = serde_json::from_str(r#"{"type":"pdf","url":"u"}"#).unwrap();
+        assert_eq!(plain, DisplayItem::Pdf { url: "u".into(), page: None });
+        assert_eq!(serde_json::to_string(&plain).unwrap(), r#"{"type":"pdf","url":"u"}"#);
+
+        // With a page: carried through and shown in the feed summary.
+        let paged: DisplayItem =
+            serde_json::from_str(r#"{"type":"pdf","url":"u","page":42}"#).unwrap();
+        assert_eq!(paged, DisplayItem::Pdf { url: "u".into(), page: Some(42) });
+        assert!(paged.summary().contains("p.42"));
+    }
 }
