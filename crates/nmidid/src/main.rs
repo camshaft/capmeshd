@@ -1,11 +1,12 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Result;
 use clap::Parser;
 use nmidid::mounts::{MidirMounter, MountRegistry};
 use nmidid::ports::MidirPortProvider;
 use nmidid::pump::RtpConnector;
-use nmidid::server;
+use nmidid::{hotplug, server};
 use tracing::{Level, info};
 use tracing_subscriber::FmtSubscriber;
 
@@ -16,6 +17,10 @@ struct Args {
     /// Path of the Unix control socket to bind.
     #[arg(short, long, default_value = "/run/nmidid.sock")]
     socket: String,
+
+    /// How often to poll for local MIDI port changes (hot-plug), in seconds.
+    #[arg(long, default_value = "5")]
+    monitor_interval: u64,
 
     /// Log level (trace, debug, info, warn, error).
     #[arg(short, long, default_value = "info")]
@@ -45,5 +50,12 @@ async fn main() -> Result<()> {
         Arc::new(RtpConnector),
         ports.clone(),
     ));
+
+    // Hot-plug notifications (§5, `hotplug-events`): watch local ports and emit
+    // port-added/port-removed on the daemon's notification bus.
+    let port_rx =
+        nmidi_core::midi::start_port_monitor(Duration::from_secs(args.monitor_interval)).await;
+    hotplug::spawn(port_rx, mounts.notifier());
+
     server::run(&args.socket, ports, mounts).await
 }

@@ -11,6 +11,7 @@
 //! remote AppleMIDI handshake + RTP-MIDI pump (mount → `active`) and the
 //! hot-plug notifications land in the following increments.
 
+pub mod hotplug;
 pub mod mounts;
 pub mod ports;
 pub mod protocol;
