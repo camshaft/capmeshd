@@ -323,16 +323,24 @@ async fn main() -> Result<()> {
                     Ok(ServiceEvent::ServiceResolved(svc)) => {
                         match discovery::resolved_addr(&svc) {
                             Some(addr) => {
-                                let cap = discovery::advert_from_resolved(&svc)
-                                    .map(|a| format!("{}/{}", a.cap, a.dir))
-                                    .unwrap_or_else(|_| "unknown".to_string());
-                                info!(
-                                    fullname = %svc.get_fullname(),
-                                    %addr,
-                                    port = svc.get_port(),
-                                    %cap,
-                                    "resolved capmesh peer"
-                                );
+                                match discovery::advert_from_resolved(&svc) {
+                                    Ok(advert) => {
+                                        info!(
+                                            fullname = %svc.get_fullname(),
+                                            %addr,
+                                            port = svc.get_port(),
+                                            cap = %format!("{}/{}", advert.cap, advert.dir),
+                                            "resolved capmesh peer"
+                                        );
+                                        note_automount_candidates(&cfg, &advert, addr);
+                                    }
+                                    Err(e) => info!(
+                                        fullname = %svc.get_fullname(),
+                                        %addr,
+                                        port = svc.get_port(),
+                                        "resolved capmesh peer (advert parse failed: {e:#})"
+                                    ),
+                                }
                             }
                             None => warn!(
                                 fullname = %svc.get_fullname(),
@@ -356,6 +364,28 @@ async fn main() -> Result<()> {
     // Adverts unregister on drop.
     drop(adverts);
     Ok(())
+}
+
+/// Match a freshly-resolved peer advert against the config's auto-mount selectors (§6.1) and
+/// log each candidate. This is the discovery-driven half of auto-mount: the coarse advert
+/// carries `kind`/`dir` (matched here), but not the per-port descriptor. Issuing the derived
+/// mount needs the remote port's data-plane port, port-id, and formats — the mesh descriptor
+/// fetch that lands in a later slice — so a matched candidate is surfaced, not yet mounted.
+/// A selector that constrains `port` is intentionally skipped at this stage (no port-id yet).
+fn note_automount_candidates(cfg: &Config, advert: &CapabilityAdvert, addr: IpAddr) {
+    for am in &cfg.automount {
+        if am.selector.matches(&advert.cap, &advert.dir, None) {
+            info!(
+                cap = %advert.cap,
+                dir = %advert.dir,
+                host = %advert.host,
+                %addr,
+                action = %am.action,
+                lifetime = am.lifetime.as_deref().unwrap_or("while-advertised"),
+                "auto-mount candidate matched (§6.1); awaiting descriptor fetch to issue the mount"
+            );
+        }
+    }
 }
 
 /// Drive a data-plane daemon's `capmesh-ctl` socket: connect, handshake, enumerate ports.
