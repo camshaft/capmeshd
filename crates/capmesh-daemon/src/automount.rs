@@ -5,9 +5,9 @@
 //! the fetched descriptor, MESH-PROTOCOL.md §3), this picks the port to mount, maps the action
 //! to a [`MountRole`], and negotiates the wire format (§4) against the local side's codecs.
 //! It is deliberately transport-free: the result is everything a `MountSpec` needs *except* the
-//! remote peer's address and data-plane port, which the discovery layer fills in. That split
+//! remote peer's address and control port, which the discovery layer fills in. That split
 //! keeps the decision unit-testable and isolates the one piece still being pinned down (how a
-//! peer's data-plane port is conveyed).
+//! peer's control port is discovered).
 
 use crate::negotiate::{self, NoCommonFormat};
 use capmesh_ctl::{Format, LocalEndpoint, MountRole, MountSpec, PortDescriptor, RemoteEndpoint};
@@ -74,16 +74,17 @@ pub fn plan_mount(
 }
 
 /// Assemble the full [`MountSpec`] (§3.1) from a [`MountPlan`] and the resolved remote
-/// coordinates. The remote data-plane `port` is resolved by the caller — kept out of the
-/// planner so this stays kind-agnostic (for MIDI/AppleMIDI the caller reads it from the peer's
-/// `_apple-midi._udp` record; DESIGN §5). Mirror roles create a local virtual endpoint named
-/// `local_name`; `link` binds an existing real local port, so no virtual endpoint.
+/// coordinates. `control_port` is the remote's AppleMIDI **control** port — the SRV port of its
+/// `_apple-midi._udp` record — and goes into `remote.port` **verbatim**: the data-plane daemon
+/// derives the data port as `remote.port + 1` itself, so capmeshd MUST NOT add 1. The port is
+/// resolved by the caller, keeping this kind-agnostic. Mirror roles create a local virtual
+/// endpoint named `local_name`; `link` binds an existing real local port (no virtual endpoint).
 pub fn build_mount_spec(
     plan: MountPlan,
     mount_id: String,
     remote_host: String,
     remote_addr: IpAddr,
-    data_port: u16,
+    control_port: u16,
     local_name: Option<String>,
 ) -> MountSpec {
     let is_virtual = matches!(plan.role, MountRole::MirrorSource | MountRole::MirrorSink);
@@ -97,7 +98,8 @@ pub fn build_mount_spec(
         remote: RemoteEndpoint {
             host: remote_host,
             addr: remote_addr,
-            port: data_port,
+            // The control port verbatim; the daemon derives the data port as port + 1.
+            port: control_port,
             port_id: plan.port_id,
         },
         format: plan.format,
@@ -209,7 +211,7 @@ mod tests {
             "laptop-kbd-0".into(),
             "laptop".into(),
             "192.168.1.23".parse().unwrap(),
-            5004, // data-plane port the caller resolved (e.g. AppleMIDI control 5003 + 1)
+            5004, // the AppleMIDI CONTROL port (SRV port), verbatim; the daemon derives data = 5005
             Some("laptop: Keystation 49e".into()),
         );
         assert_eq!(spec.mount_id, "laptop-kbd-0");
