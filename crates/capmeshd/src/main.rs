@@ -77,9 +77,13 @@ enum Cmd {
     Reconcile {
         #[command(flatten)]
         mount: MountArgs,
-        /// Poll interval in seconds; 0 = reconcile once and exit.
+        /// Poll interval in seconds; 0 = reconcile once and exit (ignored with --watch).
         #[arg(long, default_value_t = 0)]
         interval_secs: u64,
+        /// After the initial pass, react to daemon mount-state/hotplug notifications (§5)
+        /// and re-reconcile on drift — event-driven, no polling.
+        #[arg(long)]
+        watch: bool,
     },
 }
 
@@ -166,7 +170,8 @@ async fn main() -> Result<()> {
         Some(Cmd::Reconcile {
             mount,
             interval_secs,
-        }) => return cmd_reconcile(mount, *interval_secs).await,
+            watch,
+        }) => return cmd_reconcile(mount, *interval_secs, *watch).await,
         None => {}
     }
 
@@ -345,29 +350,50 @@ async fn cmd_mount(m: &MountArgs) -> Result<()> {
     Ok(())
 }
 
-/// Reconcile a single desired mount against a daemon (DESIGN §6). With `interval_secs > 0`
-/// this runs the reconcile loop (converging + self-healing) until interrupted; otherwise it
-/// reconciles once and exits.
-async fn cmd_reconcile(m: &MountArgs, interval_secs: u64) -> Result<()> {
+/// Reconcile a single desired mount against a daemon (DESIGN §6). Modes: reconcile once and
+/// exit (default); `--interval-secs N` re-reconciles every N seconds; `--watch` reacts to
+/// daemon notifications (§5) and re-reconciles on drift, event-driven with no polling.
+async fn cmd_reconcile(m: &MountArgs, interval_secs: u64, watch: bool) -> Result<()> {
     let reconciler = Reconciler::with_desired(vec![m.to_spec()?]);
     let mut client = connect_and_hello(&m.socket).await?;
 
-    loop {
-        match reconciler.reconcile_once(&mut client).await {
-            Ok(plan) if plan.is_empty() => info!("reconcile: converged (no changes)"),
-            Ok(plan) => info!(
-                mounted = plan.to_mount.len(),
-                unmounted = plan.to_unmount.len(),
-                "reconcile: applied"
-            ),
-            Err(e) => warn!("reconcile pass failed: {e:#}"),
+    reconcile_pass(&reconciler, &mut client).await;
+
+    if watch {
+        info!("reconcile: watching daemon notifications (event-driven; ctrl-c to stop)");
+        loop {
+            match client.next_notification().await {
+                Ok(n) if reconcile::wants_reconcile(&n) => {
+                    info!(notification = ?n, "reconcile: drift — re-reconciling");
+                    reconcile_pass(&reconciler, &mut client).await;
+                }
+                Ok(n) => info!(notification = ?n, "reconcile: notification (no action)"),
+                Err(e) => {
+                    warn!("notification stream ended: {e:#}");
+                    break;
+                }
+            }
         }
-        if interval_secs == 0 {
-            break;
+    } else if interval_secs > 0 {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
+            reconcile_pass(&reconciler, &mut client).await;
         }
-        tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
     }
     Ok(())
+}
+
+/// One reconcile pass with logging; a failed pass is logged, not fatal (the loop retries).
+async fn reconcile_pass(reconciler: &Reconciler, client: &mut CtlClient) {
+    match reconciler.reconcile_once(client).await {
+        Ok(plan) if plan.is_empty() => info!("reconcile: converged (no changes)"),
+        Ok(plan) => info!(
+            mounted = plan.to_mount.len(),
+            unmounted = plan.to_unmount.len(),
+            "reconcile: applied"
+        ),
+        Err(e) => warn!("reconcile pass failed: {e:#}"),
+    }
 }
 
 /// Connect + hello, then tear a mount down (§3).

@@ -11,7 +11,7 @@
 //! `nmidid` ships `mount-state` notifications (§5), the reconciler will react to them
 //! event-driven instead of polling `mount-status`.
 
-use crate::ctl::{CtlClient, CtlError, MountSpec, MountState, MountStatus};
+use crate::ctl::{CtlClient, CtlError, MountSpec, MountState, MountStatus, Notification};
 use std::collections::{HashMap, HashSet};
 use tracing::info;
 
@@ -65,6 +65,21 @@ pub fn reconcile(desired: &[MountSpec], actual: &[MountStatus]) -> ReconcilePlan
     ReconcilePlan {
         to_mount,
         to_unmount,
+    }
+}
+
+/// Whether a daemon notification (§5) means actual-state may have drifted from desired and
+/// a reconcile pass should run. A mount dying (`failed`/`torn-down`) or a source port
+/// disappearing warrants re-reconcile (self-heal / teardown); `connecting`/`active`/
+/// `degraded` and a newly-arrived port are informational here — discovery-driven auto-mount
+/// on `port-added` is a separate, selector-gated concern (M1, DESIGN §6.1).
+pub fn wants_reconcile(n: &Notification) -> bool {
+    match n {
+        Notification::MountState { state, .. } => {
+            matches!(state, MountState::Failed | MountState::TornDown)
+        }
+        Notification::PortRemoved { .. } => true,
+        Notification::PortAdded(_) | Notification::Other { .. } => false,
     }
 }
 
@@ -193,6 +208,27 @@ mod tests {
             plan.to_unmount.is_empty(),
             "already torn-down: nothing to unmount"
         );
+    }
+
+    #[test]
+    fn wants_reconcile_only_on_drift() {
+        let ms = |state| Notification::MountState {
+            mount_id: "m1".into(),
+            state,
+            detail: None,
+            stats: None,
+        };
+        assert!(wants_reconcile(&ms(MountState::Failed)));
+        assert!(wants_reconcile(&ms(MountState::TornDown)));
+        assert!(!wants_reconcile(&ms(MountState::Active)));
+        assert!(!wants_reconcile(&ms(MountState::Connecting)));
+        assert!(!wants_reconcile(&ms(MountState::Degraded)));
+        assert!(wants_reconcile(&Notification::PortRemoved {
+            port_id: "kbd-0".into()
+        }));
+        assert!(!wants_reconcile(&Notification::Other {
+            method: "port-added".into()
+        }));
     }
 
     #[tokio::test]
