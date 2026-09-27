@@ -16,8 +16,7 @@ use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
-use tokio::sync::broadcast;
-use tokio::task::AbortHandle;
+use tokio::sync::{Notify, broadcast};
 
 use crate::ports::PortProvider;
 use crate::protocol::{
@@ -86,8 +85,9 @@ pub trait Mounter: Send + Sync {
 }
 
 /// Drives a mount's data path: connects to the remote and pumps events into the
-/// sink, updating `status`. Returns a handle to abort the task on unmount (or
-/// `None` if the connector does not spawn one, e.g. in tests).
+/// sink, updating `status`. The task runs until the remote ends the session or
+/// `cancel` is notified (unmount), at which point it tears the session down
+/// gracefully (sends `End`) and drops the sink → the local endpoint.
 pub trait Connector: Send + Sync {
     fn start(
         &self,
@@ -95,14 +95,15 @@ pub trait Connector: Send + Sync {
         sink: Box<dyn MidiSink>,
         status: Arc<Mutex<MountStatus>>,
         notifier: broadcast::Sender<Value>,
-    ) -> Option<AbortHandle>;
+        cancel: Arc<Notify>,
+    );
 }
 
 struct MountEntry {
     /// Shared with the data-path task, which updates state/stats live.
     status: Arc<Mutex<MountStatus>>,
-    /// Aborts the data-path task on unmount (which drops the sink → endpoint).
-    abort: Option<AbortHandle>,
+    /// Signals the data-path task to tear down gracefully on unmount.
+    cancel: Arc<Notify>,
 }
 
 /// Tracks live mounts and drives their creation/teardown.
@@ -234,30 +235,33 @@ impl MountRegistry {
             .send(mount_state_notification(&status.lock().unwrap()));
 
         // Hand the data path off to the connector (spawns the pump task), which
-        // emits the subsequent active/failed/torn-down transitions.
-        let abort = self.connector.start(
+        // emits the subsequent active/failed/torn-down transitions. `cancel`
+        // asks the task to tear the session down gracefully on unmount.
+        let cancel = Arc::new(Notify::new());
+        self.connector.start(
             spec.remote.clone(),
             sink,
             Arc::clone(&status),
             self.notifier.clone(),
+            Arc::clone(&cancel),
         );
 
         self.mounts
             .lock()
             .unwrap()
-            .insert(spec.mount_id.clone(), MountEntry { status, abort });
+            .insert(spec.mount_id.clone(), MountEntry { status, cancel });
         Ok(result)
     }
 
     /// Tear a mount down (§3). Idempotent: an unknown id is a clean no-op.
     pub fn unmount(&self, mount_id: &str) -> serde_json::Value {
         if let Some(entry) = self.mounts.lock().unwrap().remove(mount_id) {
-            // Abort the data-path task; dropping it drops the sink → the
-            // virtual port is removed.
-            if let Some(abort) = entry.abort {
-                abort.abort();
-            }
-            // Announce the teardown (§5) — the aborted task can no longer emit.
+            // Ask the data-path task to stop: it sends `End` (BY) to the remote
+            // so the source does not hold a stale session, then exits — dropping
+            // the sink, which removes the local virtual port.
+            entry.cancel.notify_one();
+            // Announce the teardown (§5) now; the task's own TornDown is a no-op
+            // once the state has already changed.
             transition(&entry.status, &self.notifier, MountState::TornDown, None);
         }
         serde_json::json!({})
@@ -382,8 +386,8 @@ impl Connector for NullConnector {
         _sink: Box<dyn MidiSink>,
         _status: Arc<Mutex<MountStatus>>,
         _notifier: broadcast::Sender<Value>,
-    ) -> Option<AbortHandle> {
-        None
+        _cancel: Arc<Notify>,
+    ) {
     }
 }
 

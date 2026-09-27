@@ -20,8 +20,7 @@ use nmidi_core::network::NetworkSockets;
 use nmidi_core::util::{generate_ssrc, generate_token, get_hostname};
 use nmidi_core::{APPLEMIDI_VERSION, AppleMidiPacket, RtpPacket};
 use serde_json::Value;
-use tokio::sync::broadcast;
-use tokio::task::AbortHandle;
+use tokio::sync::{Notify, broadcast};
 use tracing::{debug, info, warn};
 
 use crate::mounts::{Connector, MidiSink, now_rfc3339, transition};
@@ -64,24 +63,28 @@ impl Connector for RtpConnector {
         sink: Box<dyn MidiSink>,
         status: Arc<Mutex<MountStatus>>,
         notifier: broadcast::Sender<Value>,
-    ) -> Option<AbortHandle> {
-        let handle = tokio::spawn(async move {
-            if let Err(e) = run_pump(remote, sink, Arc::clone(&status), notifier.clone()).await {
+        cancel: Arc<Notify>,
+    ) {
+        tokio::spawn(async move {
+            if let Err(e) =
+                run_pump(remote, sink, Arc::clone(&status), notifier.clone(), cancel).await
+            {
                 warn!("mount pump failed: {e}");
                 transition(&status, &notifier, MountState::Failed, Some(format!("{e}")));
             }
         });
-        Some(handle.abort_handle())
     }
 }
 
-/// Connect to the remote source and pump RTP-MIDI into `sink` until cancelled or
-/// the remote ends the session.
+/// Connect to the remote source and pump RTP-MIDI into `sink` until the remote
+/// ends the session or `cancel` fires (unmount). On either graceful stop we send
+/// `End` (BY) to the remote so it does not hold a stale session until timeout.
 async fn run_pump(
     remote: RemoteEndpoint,
     sink: Box<dyn MidiSink>,
     status: Arc<Mutex<MountStatus>>,
     notifier: broadcast::Sender<Value>,
+    cancel: Arc<Notify>,
 ) -> anyhow::Result<()> {
     // Connect by the IP (never a .local/.lan name) — capmeshd fills remote.addr
     // from the mDNS record.
@@ -107,74 +110,86 @@ async fn run_pump(
         .await?;
     debug!("sent AppleMIDI invitation to {control_addr} / {data_addr}");
 
-    // Await InvitationAccepted, resending on timeout.
+    // Await InvitationAccepted (or a graceful cancel), resending on timeout.
     let mut attempts = 0;
+    let mut cancelled = false;
     loop {
-        match tokio::time::timeout(HANDSHAKE_TIMEOUT, sockets.recv_control()).await {
-            Ok(Ok((AppleMidiPacket::InvitationAccepted { .. }, _))) => break,
-            Ok(Ok((AppleMidiPacket::InvitationRejected { .. }, _))) => {
-                // The remote explicitly declined; retrying would only spin to
-                // timeout, so fail fast with a clear cause.
-                anyhow::bail!("remote rejected the invitation");
-            }
-            Ok(Ok(_)) => continue, // other control packet before accept; keep waiting
-            Ok(Err(e)) => debug!("control recv during handshake: {e}"),
-            Err(_) => {
-                attempts += 1;
-                if attempts >= HANDSHAKE_ATTEMPTS {
-                    anyhow::bail!("no InvitationAccepted after {HANDSHAKE_ATTEMPTS} attempts");
+        tokio::select! {
+            biased;
+            _ = cancel.notified() => { cancelled = true; break; }
+            res = tokio::time::timeout(HANDSHAKE_TIMEOUT, sockets.recv_control()) => match res {
+                Ok(Ok((AppleMidiPacket::InvitationAccepted { .. }, _))) => break,
+                Ok(Ok((AppleMidiPacket::InvitationRejected { .. }, _))) => {
+                    // The remote explicitly declined; retrying would only spin to
+                    // timeout, so fail fast with a clear cause.
+                    anyhow::bail!("remote rejected the invitation");
                 }
-                sockets.send_control(&invitation, &control_addr).await?;
-                sockets
-                    .send_control_on_data(&invitation, &data_addr)
-                    .await?;
+                Ok(Ok(_)) => continue, // other control packet before accept; keep waiting
+                Ok(Err(e)) => debug!("control recv during handshake: {e}"),
+                Err(_) => {
+                    attempts += 1;
+                    if attempts >= HANDSHAKE_ATTEMPTS {
+                        anyhow::bail!("no InvitationAccepted after {HANDSHAKE_ATTEMPTS} attempts");
+                    }
+                    sockets.send_control(&invitation, &control_addr).await?;
+                    sockets
+                        .send_control_on_data(&invitation, &data_addr)
+                        .await?;
+                }
             }
         }
     }
 
-    info!(
-        "mount active: mirroring {} into local virtual port",
-        control_addr
-    );
-    transition(&status, &notifier, MountState::Active, None);
+    if !cancelled {
+        info!(
+            "mount active: mirroring {} into local virtual port",
+            control_addr
+        );
+        transition(&status, &notifier, MountState::Active, None);
 
-    let started = Instant::now();
-    let mut gate = SeqGate::default();
-    loop {
-        tokio::select! {
-            data = sockets.recv_data() => match data {
-                Ok((packet, _)) => {
-                    if gate.admit(packet.header.sequence) {
-                        forward_rtp(&packet, sink.as_ref(), &status);
-                    } else {
-                        debug!("dropping stale/duplicate RTP packet seq {}", packet.header.sequence);
-                    }
-                }
-                Err(e) => debug!("data recv error: {e}"),
-            },
-            control = sockets.recv_control() => match control {
-                Ok((AppleMidiPacket::End { .. }, _)) => {
-                    info!("remote ended the session");
+        let started = Instant::now();
+        let mut gate = SeqGate::default();
+        loop {
+            tokio::select! {
+                biased;
+                _ = cancel.notified() => {
+                    info!("mount unmounted; tearing down session");
                     break;
                 }
-                Ok((AppleMidiPacket::Synchronization { count, timestamp1, .. }, from)) => {
-                    // Minimal clock-sync keep-alive: answer CK0 with CK1 carrying
-                    // our current timestamp (100µs units).
-                    if count == 0 {
-                        let ts = (started.elapsed().as_micros() / 100) as u64;
-                        let reply = AppleMidiPacket::Synchronization {
-                            ssrc,
-                            count: 1,
-                            timestamp1,
-                            timestamp2: ts,
-                            timestamp3: 0,
-                        };
-                        let _ = sockets.send_control(&reply, &from).await;
+                data = sockets.recv_data() => match data {
+                    Ok((packet, _)) => {
+                        if gate.admit(packet.header.sequence) {
+                            forward_rtp(&packet, sink.as_ref(), &status);
+                        } else {
+                            debug!("dropping stale/duplicate RTP packet seq {}", packet.header.sequence);
+                        }
                     }
-                }
-                Ok(_) => {}
-                Err(e) => debug!("control recv error: {e}"),
-            },
+                    Err(e) => debug!("data recv error: {e}"),
+                },
+                control = sockets.recv_control() => match control {
+                    Ok((AppleMidiPacket::End { .. }, _)) => {
+                        info!("remote ended the session");
+                        break;
+                    }
+                    Ok((AppleMidiPacket::Synchronization { count, timestamp1, .. }, from)) => {
+                        // Minimal clock-sync keep-alive: answer CK0 with CK1 carrying
+                        // our current timestamp (100µs units).
+                        if count == 0 {
+                            let ts = (started.elapsed().as_micros() / 100) as u64;
+                            let reply = AppleMidiPacket::Synchronization {
+                                ssrc,
+                                count: 1,
+                                timestamp1,
+                                timestamp2: ts,
+                                timestamp3: 0,
+                            };
+                            let _ = sockets.send_control(&reply, &from).await;
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(e) => debug!("control recv error: {e}"),
+                },
+            }
         }
     }
 
@@ -350,6 +365,7 @@ mod tests {
             Box::new(sink),
             Arc::clone(&status),
             notifier,
+            Arc::new(Notify::new()),
         ));
 
         // Wait for the note to be forwarded (bounded so a failure can't hang).
@@ -434,6 +450,7 @@ mod tests {
             Box::new(RecordingSink::new()),
             Arc::clone(&status),
             notifier,
+            Arc::new(Notify::new()),
         ));
 
         let reply = tokio::time::timeout(Duration::from_secs(5), async {
@@ -457,6 +474,87 @@ mod tests {
             other => panic!("expected Synchronization, got {other:?}"),
         }
         pump.abort();
+    }
+
+    /// Unmount must tear the session down *gracefully*: on cancel the pump sends
+    /// `End` (BY) to the remote so it does not hold a stale session, and the
+    /// mount transitions to `torn-down`.
+    #[tokio::test]
+    async fn pump_cancel_sends_end_to_peer_and_tears_down() {
+        use tokio::net::UdpSocket;
+
+        let fake_ctl = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let fake_ctl_port = fake_ctl.local_addr().unwrap().port();
+
+        let got_end = Arc::new(Mutex::new(false));
+        let got_end_w = Arc::clone(&got_end);
+        tokio::spawn(async move {
+            let mut buf = [0u8; 2048];
+            let (n, from) = fake_ctl.recv_from(&mut buf).await.unwrap();
+            let AppleMidiPacket::Invitation { token, ssrc, .. } =
+                AppleMidiPacket::parse(&buf[..n]).unwrap()
+            else {
+                return;
+            };
+            let accept = AppleMidiPacket::InvitationAccepted {
+                version: APPLEMIDI_VERSION,
+                token,
+                ssrc,
+                name: "fake-peer".to_string(),
+            };
+            fake_ctl.send_to(&accept.to_bytes(), from).await.unwrap();
+            // Wait for the graceful End (BY) that unmount should send.
+            loop {
+                let (n, _) = fake_ctl.recv_from(&mut buf).await.unwrap();
+                if let Ok(AppleMidiPacket::End { .. }) = AppleMidiPacket::parse(&buf[..n]) {
+                    *got_end_w.lock().unwrap() = true;
+                    break;
+                }
+            }
+        });
+
+        let status = connecting_status();
+        let (notifier, _rx) = broadcast::channel(8);
+        let cancel = Arc::new(Notify::new());
+        let remote = RemoteEndpoint {
+            host: None,
+            addr: "127.0.0.1".to_string(),
+            port: fake_ctl_port,
+            port_id: "source-0".to_string(),
+        };
+        let pump = tokio::spawn(run_pump(
+            remote,
+            Box::new(RecordingSink::new()),
+            Arc::clone(&status),
+            notifier,
+            Arc::clone(&cancel),
+        ));
+
+        // Once active, unmount (cancel) and expect a graceful BY at the peer.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if status.lock().unwrap().state == MountState::Active {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("mount reached active");
+        cancel.notify_one();
+
+        let ended = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if *got_end.lock().unwrap() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(ended.is_ok(), "peer did not receive End (BY) on unmount");
+        let _ = pump.await;
+        assert_eq!(status.lock().unwrap().state, MountState::TornDown);
     }
 
     /// A remote that explicitly rejects the invitation must fail the mount
@@ -500,6 +598,7 @@ mod tests {
             Box::new(RecordingSink::new()),
             Arc::clone(&status),
             notifier,
+            Arc::new(Notify::new()),
         );
 
         // A 2s bound is well under the 3×5s handshake timeout, so passing proves
@@ -537,6 +636,7 @@ mod tests {
             Box::new(RecordingSink::new()),
             Arc::clone(&status),
             notifier,
+            Arc::new(Notify::new()),
         );
 
         let notification = tokio::time::timeout(Duration::from_secs(2), rx.recv())
