@@ -432,6 +432,21 @@ impl SurfaceStore {
         }
     }
 
+    /// Set (rotate) or clear an existing surface's attach token: `Some` requires
+    /// that token for HTTP attachment henceforth, `None` reopens the surface.
+    /// Returns `false` if the surface does not exist (create it first). Set only
+    /// over the local-trust control socket, never over HTTP (DESIGN §10.1).
+    pub fn set_token(&self, id: &str, token: Option<String>) -> bool {
+        let mut map = self.inner.lock().expect("store lock");
+        match map.get_mut(id) {
+            Some(state) => {
+                state.attach_token = token;
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Subscribe to a surface's live events, returning the current snapshot and
     /// a receiver. The subscription is registered before the snapshot is taken
     /// (both under the store lock), so no push can slip between them.

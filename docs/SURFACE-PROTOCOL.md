@@ -107,6 +107,7 @@ A **surface view** (the `list-items` result) is the surface's current state:
 |---|---|---|---|
 | `hello` | `{protocol, client}` | `{protocol, daemon, capabilities}` | handshake (§1.1) |
 | `create-surface` | `{surface-id, title?, attach-token?}` | `{id}` | ensure a surface exists; optionally set its title + attach token |
+| `set-token` | `{surface-id, attach-token?}` | `{}` | rotate (string) or clear (null/absent → reopen) an existing surface's attach token; `no-such-surface` if it does not exist |
 | `send-item` | `{surface-id, item, promote?}` | `{id, ts}` | append a display item to the inbox (and, if `promote`, make it the main view) |
 | `set-view` | `{surface-id, item-id?}` | `{}` | select which item the main view shows (`item-id` null/absent clears it) |
 | `list-items` | `{surface-id}` | `SurfaceView` | the surface's current state (title, main view, items) |
@@ -212,9 +213,10 @@ the **same** store, so:
   `send_item` tool (§8), and (as a local convenience) `send-item` over this socket. Any
   of them appears immediately on every attached browser tab (SSE fan-out) and in
   `list-items` / `GET /s/{id}/items` alike — they share one store.
-- An **attach token** set via `create-surface` is enforced on the HTTP side: attaching to a
-  protected surface requires the token (`…/s/{id}?token=<t>`, or an `X-Surface-Token` /
-  `Authorization: Bearer` header). This socket, being local-trust, is never token-gated.
+- An **attach token** set via `create-surface` (or rotated/cleared later via `set-token`) is
+  enforced on the HTTP side: attaching to a protected surface requires the token
+  (`…/s/{id}?token=<t>`, or an `X-Surface-Token` / `Authorization: Bearer` header). This
+  socket, being local-trust, is never token-gated.
 
 ---
 
@@ -222,13 +224,13 @@ the **same** store, so:
 
 - The framing (§1), `hello` with `capabilities:["surface","durable-inbox","attach-fanout"]`.
 - `create-surface` (title + attach token), `send-item` (all item types, `promote`),
-  `set-view`, `list-items`, `list-surfaces`.
+  `set-view`, `list-items`, `list-surfaces`, `clear-items`, `delete-surface`, `set-token`.
 - Durable per-surface inbox (on-disk NDJSON, replayed on restart + compacted), bounded in memory.
-- SSE fan-out of pushes/view-changes to attached tabs.
+  The main-view selection persists across restart (a per-surface sidecar).
+- SSE fan-out of pushes/view-changes to attached tabs, plus a live attach count.
 - An **embedded MCP server** (§8) — the agent-facing data-plane API.
 
-Later: attach-lifecycle notifications (daemon → capmeshd, e.g. attach-count) and a
-`delete-surface`/`clear` method.
+Later: attach-lifecycle notifications (daemon → capmeshd, e.g. pushing the attach count).
 
 ---
 
