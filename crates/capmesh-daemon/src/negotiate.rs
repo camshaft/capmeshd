@@ -12,7 +12,12 @@
 use capmesh_ctl::Format;
 
 /// No format is compatible with both sides (§4.1 step 4 → the `no-common-format` error).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+#[error(
+    "no format compatible with both sides (consumer offered {}, producer offered {})",
+    consumer.len(),
+    producer.len()
+)]
 pub struct NoCommonFormat {
     /// The consuming side's formats (preference-ordered).
     pub consumer: Vec<Format>,
