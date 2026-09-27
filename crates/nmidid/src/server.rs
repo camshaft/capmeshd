@@ -7,11 +7,13 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde_json::Value;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
+use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
@@ -405,12 +407,13 @@ where
     Ok(())
 }
 
-/// Bind the control socket at `path` and serve connections until cancelled.
+/// Bind the control socket at `path` and serve connections until a termination
+/// signal (SIGTERM/SIGINT) arrives, then tear every mount down gracefully.
 ///
 /// Any stale socket file at `path` is removed first. The socket is set to
-/// owner/group read-write (`0o660`) — the local trust boundary (§1.1). Peer
-/// credential enforcement is a later increment. `mounts` is the shared,
-/// daemon-wide mount registry.
+/// owner/group read-write (`0o660`) and each peer is checked against `peers` —
+/// the local trust boundary (§1.1). `mounts` is the shared, daemon-wide mount
+/// registry.
 pub async fn run(
     path: impl AsRef<Path>,
     ports: Arc<dyn PortProvider>,
@@ -442,8 +445,22 @@ pub async fn run(
         if peers.enforcing() { "on" } else { "off" }
     );
 
+    let mut sigterm =
+        signal(SignalKind::terminate()).context("installing SIGTERM handler")?;
+    let mut sigint = signal(SignalKind::interrupt()).context("installing SIGINT handler")?;
+
     loop {
-        let (stream, _addr) = listener.accept().await.context("accepting connection")?;
+        let (stream, _addr) = tokio::select! {
+            accepted = listener.accept() => accepted.context("accepting connection")?,
+            _ = sigterm.recv() => {
+                info!("received SIGTERM, shutting down");
+                break;
+            }
+            _ = sigint.recv() => {
+                info!("received SIGINT, shutting down");
+                break;
+            }
+        };
 
         // Local-trust boundary (§1.1): refuse peers outside the configured
         // owner/group. Test the peer's full group set (primary + supplementary)
@@ -481,6 +498,17 @@ pub async fn run(
             }
         });
     }
+
+    // Graceful shutdown: tear every mount down (each peer receives a BY) and give
+    // the pump tasks a brief window to send it before the runtime stops, then
+    // remove the socket file.
+    let torn = mounts.shutdown_all();
+    if torn > 0 {
+        info!("shutting down: torn down {torn} active mount(s)");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    let _ = std::fs::remove_file(path);
+    Ok(())
 }
 
 #[cfg(test)]
