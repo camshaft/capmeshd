@@ -35,6 +35,12 @@ const HANDSHAKE_ATTEMPTS: u32 = 3;
 /// idle or strict source may time the session out.
 const CK_SYNC_INTERVAL: Duration = Duration::from_secs(10);
 
+/// How long the remote may be silent (no data and no clock-sync response to our
+/// periodic CK0) before the session is declared dead — three missed CK cycles.
+/// A dead session fails the mount so capmeshd re-reconciles, rather than lingering
+/// "active" forever behind a source that vanished.
+const SESSION_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Drops stale or duplicate RTP packets by sequence number, so a reordered or
 /// retransmitted datagram never replays MIDI that has already been played (a
 /// replayed note-on/off would double-trigger the instrument).
@@ -55,6 +61,32 @@ impl SeqGate {
             self.last = Some(seq);
         }
         newer
+    }
+}
+
+/// Tracks whether the remote is still responsive. Any packet received from the
+/// peer (data or control) is activity; if nothing arrives within `timeout` — our
+/// periodic CK0 having gone unanswered — the session is stale and the mount
+/// should fail rather than linger "active" behind a vanished source.
+struct SessionLiveness {
+    last_activity: Instant,
+    timeout: Duration,
+}
+
+impl SessionLiveness {
+    fn new(timeout: Duration) -> Self {
+        SessionLiveness {
+            last_activity: Instant::now(),
+            timeout,
+        }
+    }
+
+    fn record_activity(&mut self) {
+        self.last_activity = Instant::now();
+    }
+
+    fn is_stale(&self, now: Instant) -> bool {
+        now.duration_since(self.last_activity) > self.timeout
     }
 }
 
@@ -159,6 +191,7 @@ async fn run_pump(
         // As the session initiator, drive clock-sync periodically. The first
         // tick fires immediately, sending the initial CK0 as soon as we go active.
         let mut ck_timer = tokio::time::interval(CK_SYNC_INTERVAL);
+        let mut live = SessionLiveness::new(SESSION_TIMEOUT);
         loop {
             tokio::select! {
                 biased;
@@ -167,6 +200,11 @@ async fn run_pump(
                     break;
                 }
                 _ = ck_timer.tick() => {
+                    // If the remote has gone silent through our clock-sync cycles,
+                    // treat the session as dead so the mount fails and re-reconciles.
+                    if live.is_stale(Instant::now()) {
+                        anyhow::bail!("remote unresponsive for {SESSION_TIMEOUT:?}");
+                    }
                     let ck0 = AppleMidiPacket::Synchronization {
                         ssrc,
                         count: 0,
@@ -178,6 +216,7 @@ async fn run_pump(
                 }
                 data = sockets.recv_data() => match data {
                     Ok((packet, _)) => {
+                        live.record_activity();
                         if gate.admit(packet.header.sequence) {
                             forward_rtp(&packet, sink.as_ref(), &status);
                         } else {
@@ -192,6 +231,7 @@ async fn run_pump(
                         break;
                     }
                     Ok((AppleMidiPacket::Synchronization { count, timestamp1, timestamp2, .. }, from)) => {
+                        live.record_activity();
                         // AppleMIDI clock-sync (100µs units). Answer a peer's CK0
                         // with CK1, and complete our own exchange by answering the
                         // peer's CK1 (a response to our CK0) with CK2.
@@ -219,7 +259,7 @@ async fn run_pump(
                             _ => {}
                         }
                     }
-                    Ok(_) => {}
+                    Ok(_) => live.record_activity(),
                     Err(e) => debug!("control recv error: {e}"),
                 },
             }
@@ -322,6 +362,21 @@ mod tests {
         assert!(!g.admit(101)); // duplicate dropped
         assert!(!g.admit(50)); // stale (out-of-order older) dropped
         assert!(g.admit(102)); // resume forward progress
+    }
+
+    #[test]
+    fn session_liveness_flags_a_silent_peer_and_resets_on_activity() {
+        let start = Instant::now();
+        let mut live = SessionLiveness {
+            last_activity: start,
+            timeout: Duration::from_secs(30),
+        };
+        assert!(!live.is_stale(start + Duration::from_secs(29)));
+        assert!(live.is_stale(start + Duration::from_secs(31)));
+        // Fresh activity resets the staleness clock.
+        live.last_activity = start + Duration::from_secs(31);
+        assert!(!live.is_stale(start + Duration::from_secs(40)));
+        assert!(live.is_stale(start + Duration::from_secs(62)));
     }
 
     #[test]
