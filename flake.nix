@@ -17,8 +17,15 @@
             version = "0.1.0";
             src = self;
             cargoLock.lockFile = ./Cargo.lock;
-            # doCheck (default true) runs `cargo test` in the sandbox — the unit tests
-            # for the discovery TXT schema and config parser are pure, no network.
+            # Scope to the capmeshd crate only — do NOT build the whole workspace. This
+            # decouples this package (which links no system libraries) from sibling
+            # daemon crates (e.g. the incoming `nmidid`, which links ALSA/CoreMIDI via
+            # midir and needs its own buildInputs in packages.nmidid). Adding such a
+            # member no longer turns `nix flake check` red here.
+            cargoBuildFlags = [ "-p" "capmeshd" ];
+            cargoTestFlags = [ "-p" "capmeshd" ];
+            # doCheck (default true) runs `cargo test -p capmeshd` in the sandbox — the
+            # discovery TXT-schema and config-parser unit tests are pure, no network.
             meta = {
               description = "LAN capability mesh: stateless control-plane daemon (MIDI-first)";
               license = pkgs.lib.licenses.mit;
@@ -33,7 +40,7 @@
           checks.clippy = capmeshd.overrideAttrs (old: {
             pname = "${old.pname}-clippy";
             nativeBuildInputs = (old.nativeBuildInputs or [ ]) ++ [ pkgs.clippy ];
-            buildPhase = "cargo clippy --all-targets --release -- -D warnings";
+            buildPhase = "cargo clippy -p capmeshd --all-targets --release -- -D warnings";
             installPhase = "touch $out";
             doCheck = false;
           });
