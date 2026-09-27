@@ -196,11 +196,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "capmesh-model"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "capmeshd"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "capmesh-discovery",
+ "capmesh-model",
  "clap",
  "hostname",
  "mdns-sd",
