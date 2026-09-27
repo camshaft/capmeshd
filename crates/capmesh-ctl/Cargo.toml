@@ -1,0 +1,13 @@
+[package]
+name = "capmesh-ctl"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "capmesh-ctl client: the JSON-RPC/NDLJSON Unix-socket transport to a data-plane daemon"
+
+[dependencies]
+capmesh-model = { path = "../capmesh-model" }
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

@@ -1,13 +1,14 @@
-//! The `capmesh-ctl` client — capmeshd's side of the data-plane control socket
-//! (docs/CONTROL-PROTOCOL.md). capmeshd is the CLIENT: it issues JSON-RPC 2.0 requests
-//! over a newline-delimited-JSON (NDJSON) Unix-domain-socket connection to a first-party
+//! The `capmesh-ctl` client — the caller's side of a data-plane control socket
+//! (docs/CONTROL-PROTOCOL.md). The client issues JSON-RPC 2.0 requests over a
+//! newline-delimited-JSON (NDJSON) Unix-domain-socket connection to a first-party
 //! data-plane daemon (the first being `nmidid`), which replies with a matching `result`
 //! or `error` and may emit unsolicited notifications.
 //!
-//! This is the `midi` adapter's transport to `nmidid`. The value types on the wire (the
-//! port descriptor, mount shapes, and notification enum) live in the `capmesh-model` crate
-//! and are re-exported here so callers keep naming them as `ctl::<Type>`; this module owns
-//! only the transport — the connection, the framing, and the JSON-RPC call loop.
+//! This is the transport capmeshd's `midi` adapter drives against `nmidid`. The value
+//! types on the wire (the port descriptor, mount shapes, and notification enum) live in the
+//! `capmesh-model` crate and are re-exported here so callers keep naming them as
+//! `capmesh_ctl::<Type>`; this crate owns only the transport — the connection, the framing,
+//! and the JSON-RPC call loop.
 
 use serde::{Deserialize, Serialize};
 use std::path::Path;

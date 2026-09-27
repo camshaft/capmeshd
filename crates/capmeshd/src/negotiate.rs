@@ -8,7 +8,7 @@
 //! milestone (§4.3); until then differing formats are incompatible. An empty compatible set
 //! is refused with [`NoCommonFormat`] (§4.1 step 4), carrying both sides for diagnosis.
 
-use crate::ctl::Format;
+use capmesh_ctl::Format;
 
 /// No format is compatible with both sides (§4.1 step 4 → the `no-common-format` error).
 #[derive(Debug, Clone, PartialEq)]

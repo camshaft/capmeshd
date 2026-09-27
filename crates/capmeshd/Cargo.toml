@@ -11,7 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 capmesh-discovery = { path = "../capmesh-discovery" }
-capmesh-model = { path = "../capmesh-model" }
+capmesh-ctl = { path = "../capmesh-ctl" }
 tokio.workspace = true
 mdns-sd.workspace = true
 serde.workspace = true
@@ -19,7 +19,6 @@ serde_json.workspace = true
 toml.workspace = true
 clap.workspace = true
 anyhow.workspace = true
-thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 hostname.workspace = true
