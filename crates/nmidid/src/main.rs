@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use clap::Parser;
+use nmidid::mounts::{MidirMounter, MountRegistry};
 use nmidid::ports::MidirPortProvider;
 use nmidid::server;
 use tracing::{Level, info};
@@ -38,5 +39,6 @@ async fn main() -> Result<()> {
     info!("Starting nmidid, control socket at {}", args.socket);
 
     let ports = Arc::new(MidirPortProvider);
-    server::run(&args.socket, ports).await
+    let mounts = Arc::new(MountRegistry::new(Arc::new(MidirMounter), ports.clone()));
+    server::run(&args.socket, ports, mounts).await
 }

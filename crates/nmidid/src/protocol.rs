@@ -155,3 +155,91 @@ pub fn error_response(id: Value, err: &DaemonError) -> Value {
         "error": err.to_error_object(),
     })
 }
+
+// ---------------------------------------------------------------------------
+// Mount wire types (§3) — the `mount` / `unmount` / `mount-status` methods.
+// ---------------------------------------------------------------------------
+
+/// Which end of a mount the daemon materializes (§3.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MountRole {
+    /// Create a local virtual **source** fed by the remote source (the
+    /// keyboard-shows-up case). The only role implemented in M0a.
+    MirrorSource,
+    /// Create a local virtual **sink** that forwards to the remote sink.
+    MirrorSink,
+    /// Connect an existing local **real** port to the remote (no virtual endpoint).
+    Link,
+}
+
+/// The local endpoint the daemon owns/creates (§3.1).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct LocalEndpoint {
+    /// Create a virtual endpoint (requires the port's `virtualizable`).
+    #[serde(default)]
+    pub r#virtual: bool,
+    /// Display name for the virtual device.
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+/// The remote peer this host connects to — DIRECT, p2p (§3.1).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct RemoteEndpoint {
+    #[serde(default)]
+    pub host: Option<String>,
+    /// ALWAYS the IP from the mDNS record, never a `.local`/`.lan` name.
+    pub addr: String,
+    pub port: u16,
+    pub port_id: String,
+}
+
+/// A mount request carrying the negotiated format (§3.1).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct MountSpec {
+    /// capmeshd-assigned id; the reconciler's idempotency key.
+    pub mount_id: String,
+    pub role: MountRole,
+    pub local: LocalEndpoint,
+    pub remote: RemoteEndpoint,
+    /// The CHOSEN format — result of negotiation (§4), not a list.
+    pub format: Format,
+}
+
+/// The lifecycle state of a mount (§3.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MountState {
+    Pending,
+    Connecting,
+    Active,
+    Degraded,
+    Failed,
+    TornDown,
+}
+
+/// Per-mount counters (§3.2).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct MountStats {
+    pub bytes_in: u64,
+    pub bytes_out: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_event: Option<String>,
+}
+
+/// A live mount's status (§3.2).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct MountStatus {
+    pub mount_id: String,
+    pub state: MountState,
+    pub since: String,
+    pub stats: MountStats,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
