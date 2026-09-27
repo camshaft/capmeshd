@@ -61,6 +61,10 @@ struct SurfaceState {
     title: String,
     items: VecDeque<InboxItem>,
     current_view: Option<String>,
+    /// Optional per-surface attach token (DESIGN §10.1). When set, HTTP access to
+    /// this surface requires it; `None` means the surface is open. Set via the
+    /// (local-trust) control socket, never over HTTP.
+    attach_token: Option<String>,
     tx: broadcast::Sender<SurfaceEvent>,
 }
 
@@ -72,6 +76,7 @@ impl SurfaceState {
             id,
             items: VecDeque::new(),
             current_view: None,
+            attach_token: None,
             tx,
         }
     }
@@ -233,14 +238,29 @@ impl SurfaceStore {
     }
 
     /// Ensure a surface exists (creating it if absent), optionally setting its
-    /// title. Backs the control-socket `create-surface` method.
-    pub fn ensure(&self, id: &str, title: Option<String>) {
+    /// title and attach token. Backs the control-socket `create-surface` method.
+    /// A `None` field leaves the existing value unchanged (idempotent re-create).
+    pub fn ensure(&self, id: &str, title: Option<String>, attach_token: Option<String>) {
         let mut map = self.inner.lock().expect("store lock");
         let state = map
             .entry(id.to_string())
             .or_insert_with(|| SurfaceState::new(id.to_string()));
         if let Some(t) = title {
             state.title = t;
+        }
+        if attach_token.is_some() {
+            state.attach_token = attach_token;
+        }
+    }
+
+    /// Decide whether an HTTP request presenting `presented` may access surface
+    /// `id`. An absent or token-less surface is open (returns `true`); a
+    /// token-protected surface requires an exact match (DESIGN §10.1 attach auth).
+    pub fn authorize_attach(&self, id: &str, presented: Option<&str>) -> bool {
+        let map = self.inner.lock().expect("store lock");
+        match map.get(id).and_then(|s| s.attach_token.as_deref()) {
+            None => true,
+            Some(expected) => presented == Some(expected),
         }
     }
 
@@ -408,6 +428,25 @@ mod tests {
             Some(a.entry.id.as_str())
         );
         assert!(store.set_view("s", Some("nope")).is_none());
+    }
+
+    #[test]
+    fn authorize_attach_gates_only_tokened_surfaces() {
+        let store = SurfaceStore::in_memory();
+        // Absent surface: open.
+        assert!(store.authorize_attach("ghost", None));
+        // Token-less surface: open.
+        store.ensure("open", None, None);
+        assert!(store.authorize_attach("open", None));
+        // Tokened surface: requires an exact match.
+        store.ensure("sec", Some("Secret".to_string()), Some("k".to_string()));
+        assert!(!store.authorize_attach("sec", None));
+        assert!(!store.authorize_attach("sec", Some("x")));
+        assert!(store.authorize_attach("sec", Some("k")));
+        // A None token on re-ensure leaves the existing token intact.
+        store.ensure("sec", Some("Renamed".to_string()), None);
+        assert!(store.authorize_attach("sec", Some("k")));
+        assert!(!store.authorize_attach("sec", None));
     }
 
     #[test]

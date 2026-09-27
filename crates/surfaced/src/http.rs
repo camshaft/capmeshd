@@ -19,8 +19,8 @@ use std::sync::Arc;
 
 use axum::{
     Json, Router,
-    extract::{FromRef, Path, State},
-    http::{StatusCode, header},
+    extract::{FromRef, FromRequestParts, Path, State},
+    http::{StatusCode, header, request::Parts},
     response::{
         Html, IntoResponse, Response, Sse,
         sse::{Event, KeepAlive},
@@ -121,20 +121,74 @@ fn bad_id() -> Response {
     (StatusCode::BAD_REQUEST, "invalid surface id\n").into_response()
 }
 
+/// The attach token a request presents, from (in order) the `X-Surface-Token`
+/// header, an `Authorization: Bearer <t>` header, or a `?token=<t>` query param.
+/// Use a URL-safe token — the query value is not percent-decoded.
+struct AttachToken(Option<String>);
+
+impl<S: Send + Sync> FromRequestParts<S> for AttachToken {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        if let Some(v) = parts
+            .headers
+            .get("x-surface-token")
+            .and_then(|v| v.to_str().ok())
+        {
+            return Ok(AttachToken(Some(v.to_string())));
+        }
+        if let Some(t) = parts
+            .headers
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "))
+        {
+            return Ok(AttachToken(Some(t.to_string())));
+        }
+        if let Some(q) = parts.uri.query() {
+            for pair in q.split('&') {
+                if let Some(t) = pair.strip_prefix("token=") {
+                    return Ok(AttachToken(Some(t.to_string())));
+                }
+            }
+        }
+        Ok(AttachToken(None))
+    }
+}
+
+/// The 401 for a token-protected surface accessed without a valid token.
+fn unauthorized() -> Response {
+    (StatusCode::UNAUTHORIZED, "attach token required\n").into_response()
+}
+
 async fn health() -> &'static str {
     "surfaced: ok\n"
 }
 
-async fn page(Path(id): Path<String>, State(state): State<AppState>) -> Response {
+async fn page(
+    Path(id): Path<String>,
+    State(state): State<AppState>,
+    AttachToken(tok): AttachToken,
+) -> Response {
     if !SurfaceStore::valid_id(&id) {
         return bad_id();
+    }
+    if !state.store.authorize_attach(&id, tok.as_deref()) {
+        return unauthorized();
     }
     Html(state.page_html.to_string()).into_response()
 }
 
-async fn list_items(Path(id): Path<String>, State(store): State<Arc<SurfaceStore>>) -> Response {
+async fn list_items(
+    Path(id): Path<String>,
+    State(store): State<Arc<SurfaceStore>>,
+    AttachToken(tok): AttachToken,
+) -> Response {
     if !SurfaceStore::valid_id(&id) {
         return bad_id();
+    }
+    if !store.authorize_attach(&id, tok.as_deref()) {
+        return unauthorized();
     }
     Json(store.snapshot(&id)).into_response()
 }
@@ -142,10 +196,14 @@ async fn list_items(Path(id): Path<String>, State(store): State<Arc<SurfaceStore
 async fn push_item(
     Path(id): Path<String>,
     State(store): State<Arc<SurfaceStore>>,
+    AttachToken(tok): AttachToken,
     Json(req): Json<PushRequest>,
 ) -> Response {
     if !SurfaceStore::valid_id(&id) {
         return bad_id();
+    }
+    if !store.authorize_attach(&id, tok.as_deref()) {
+        return unauthorized();
     }
     let pushed = store.push(&id, req.item, req.promote);
     pushed.broadcast();
@@ -159,10 +217,14 @@ async fn push_item(
 async fn set_view(
     Path(id): Path<String>,
     State(store): State<Arc<SurfaceStore>>,
+    AttachToken(tok): AttachToken,
     Json(req): Json<ViewRequest>,
 ) -> Response {
     if !SurfaceStore::valid_id(&id) {
         return bad_id();
+    }
+    if !store.authorize_attach(&id, tok.as_deref()) {
+        return unauthorized();
     }
     match store.set_view(&id, req.item_id.as_deref()) {
         Some(tx) => {
@@ -173,9 +235,16 @@ async fn set_view(
     }
 }
 
-async fn events(Path(id): Path<String>, State(store): State<Arc<SurfaceStore>>) -> Response {
+async fn events(
+    Path(id): Path<String>,
+    State(store): State<Arc<SurfaceStore>>,
+    AttachToken(tok): AttachToken,
+) -> Response {
     if !SurfaceStore::valid_id(&id) {
         return bad_id();
+    }
+    if !store.authorize_attach(&id, tok.as_deref()) {
+        return unauthorized();
     }
     // Subscribe first, then snapshot (both under the store lock) so no push can
     // slip between the snapshot and the live stream.
@@ -398,6 +467,75 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(push.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn token_protected_surface_requires_a_valid_token() {
+        let store = Arc::new(SurfaceStore::in_memory());
+        store.ensure("secret", None, Some("s3cr3t".to_string()));
+        let app = router(store);
+
+        // No token → 401 on the page and the data endpoints.
+        for uri in ["/s/secret", "/s/secret/events", "/s/secret/items"] {
+            let r = app
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(r.status(), StatusCode::UNAUTHORIZED, "{uri}");
+        }
+
+        // Wrong token → 401.
+        let wrong = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/s/secret?token=nope")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
+
+        // Correct token via query → 200 page.
+        let ok = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/s/secret?token=s3cr3t")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), StatusCode::OK);
+
+        // Correct token via X-Surface-Token header → 200 items.
+        let via_header = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/s/secret/items")
+                    .header("x-surface-token", "s3cr3t")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(via_header.status(), StatusCode::OK);
+
+        // A token-less surface stays open without a token.
+        let open = app
+            .oneshot(
+                Request::builder()
+                    .uri("/s/open/items")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(open.status(), StatusCode::OK);
     }
 
     #[test]
