@@ -252,6 +252,7 @@ Tools:
 | `list_surfaces` | — | list every registered surface (id, title, item-count, current-view) |
 | `list_items` | `{surface-id}` | the display items on a surface |
 | `send_item` | `{surface-id, item, promote?}` | post a display item (created if new); `promote` (default `true`) also shows it in the main view |
+| `set_view` | `{surface-id, item-id?}` | focus which existing item the main view shows (omit/null to clear) — re-focus without pushing |
 | `remove_item` | `{surface-id, item-id}` | prune one item from the inbox by id (the `id` from `list_items`) |
 | `clear_surface` | `{surface-id}` | empty a surface's inbox (the surface itself stays) |
 | `delete_surface` | `{surface-id}` | delete a surface entirely (inbox + on-disk log) |

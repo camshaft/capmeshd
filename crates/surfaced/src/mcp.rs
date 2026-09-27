@@ -9,6 +9,9 @@
 //! - `list_surfaces` — every registered surface (id, title, item count, view).
 //! - `list_items` — the display items on one surface.
 //! - `send_item` — post a display item to a surface (creating it if new).
+//! - `set_view` — focus which existing item the main view shows (or clear it).
+//! - `remove_item` — prune one item from the inbox by id.
+//! - `clear_surface` / `delete_surface` — empty, or delete, a surface.
 //!
 //! This module is transport-agnostic: [`dispatch`] maps one JSON-RPC message to
 //! its response (or `None` for a notification). The HTTP glue + the optional
@@ -16,7 +19,7 @@
 
 use serde_json::{Value, json};
 
-use crate::inbox::SurfaceStore;
+use crate::inbox::{SurfaceStore, broadcast_view};
 use crate::item::DisplayItem;
 
 /// The MCP protocol version this server implements.
@@ -100,6 +103,18 @@ fn tools_list() -> Value {
             }
         },
         {
+            "name": "set_view",
+            "description": "Focus which existing item the surface's main view shows, without pushing a new item. `item-id` is the id from list_items; omit or null to clear the main view. Errors if the surface or item is unknown.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "surface-id": { "type": "string" },
+                    "item-id": { "type": "string" }
+                },
+                "required": ["surface-id"]
+            }
+        },
+        {
             "name": "remove_item",
             "description": "Remove one item from a surface's inbox by id (prune a stale item without clearing the whole surface). `item-id` is the id from list_items.",
             "inputSchema": {
@@ -136,6 +151,7 @@ fn tools_call(store: &SurfaceStore, params: &Value) -> Value {
             Err(e) => tool_error(e),
         },
         "send_item" => send_item(store, &args),
+        "set_view" => set_view(store, &args),
         "remove_item" => remove_item(store, &args),
         "clear_surface" => match surface_id(&args) {
             Ok(id) => {
@@ -174,6 +190,25 @@ fn send_item(store: &SurfaceStore, args: &Value) -> Value {
         "posted item {} to surface '{}'",
         pushed.entry.id, id
     ))
+}
+
+fn set_view(store: &SurfaceStore, args: &Value) -> Value {
+    let id = match surface_id(args) {
+        Ok(id) => id,
+        Err(e) => return tool_error(e),
+    };
+    let item_id = args.get("item-id").and_then(Value::as_str);
+    match store.set_view(&id, item_id) {
+        Some(tx) => {
+            // Fan the focus change out to attached tabs (same as the control path).
+            broadcast_view(&tx, item_id.map(str::to_string));
+            match item_id {
+                Some(i) => tool_text(format!("main view set to item {i} on '{id}'")),
+                None => tool_text(format!("cleared main view on '{id}'")),
+            }
+        }
+        None => tool_error(format!("no such surface or item on '{id}'")),
+    }
 }
 
 fn remove_item(store: &SurfaceStore, args: &Value) -> Value {
@@ -257,6 +292,7 @@ mod tests {
             "list_surfaces",
             "list_items",
             "send_item",
+            "set_view",
             "remove_item",
             "clear_surface",
             "delete_surface",
@@ -313,6 +349,34 @@ mod tests {
         let items_text = li["result"]["content"][0]["text"].as_str().unwrap();
         assert!(items_text.contains("pdf"));
         assert!(items_text.contains("\"page\": 348"));
+    }
+
+    #[test]
+    fn set_view_tool_focuses_and_clears() {
+        let store = SurfaceStore::in_memory();
+        // Two items; b is promoted (the current view). Focus a via set_view.
+        let a = store.push("phone", crate::item::DisplayItem::Text { body: "a".into() }, false);
+        store.push("phone", crate::item::DisplayItem::Text { body: "b".into() }, true);
+        let out = dispatch(
+            &store,
+            &req(2, "tools/call", json!({"name":"set_view",
+                "arguments":{"surface-id":"phone","item-id":a.entry.id}})),
+        )
+        .unwrap();
+        assert!(out["result"]["isError"].as_bool() != Some(true));
+        assert_eq!(store.snapshot("phone").current_view.as_deref(), Some(a.entry.id.as_str()));
+
+        // Clearing (no item-id) resets the view to none.
+        dispatch(&store, &req(3, "tools/call", json!({"name":"set_view","arguments":{"surface-id":"phone"}}))).unwrap();
+        assert_eq!(store.snapshot("phone").current_view, None);
+
+        // An unknown item is a tool error.
+        let bad = dispatch(
+            &store,
+            &req(4, "tools/call", json!({"name":"set_view","arguments":{"surface-id":"phone","item-id":"nope"}})),
+        )
+        .unwrap();
+        assert_eq!(bad["result"]["isError"], true);
     }
 
     #[test]
