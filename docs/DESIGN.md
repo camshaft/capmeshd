@@ -298,14 +298,19 @@ a stray/third-party advert is never auto-wired).
 
 ## 7. The MCP surface
 
-Thin MCP server (Rust; `rmcp` / official SDK), **Streamable HTTP** transport (long-running daemon,
-matches Home Assistant's proven pattern) + stdio for local dev. Runs as a mesh client (§2).
+Two pieces, matching the control/data split (§2): capmeshd exposes its **own control tools** as a
+small embedded MCP server (one backend among many), and a separate **MCP gateway** data-plane
+daemon is the single agent-facing endpoint that federates every MCP server on the mesh — capmeshd's
+included. capmeshd is the control plane throughout: it discovers the MCP servers, understands their
+transports, and drives the gateway; it never carries MCP request/response traffic itself.
 
-capmeshd's MCP surface is **control plane + service discovery only** — it wires and inspects mounts;
-it never carries or pushes data. Moving data (pushing a display item to a surface, streaming MIDI)
-is the **data-plane daemon's** job, and each data daemon exposes its own data verbs on its own MCP.
-So the surface item-push verb lives on `surfaced`'s embedded MCP (`send_item`, alongside
-`list_surfaces` / `list_items` — see §10.1), **not** here.
+### 7.1 capmesh's own control MCP (a backend)
+
+capmeshd runs a thin embedded MCP server (Streamable HTTP; stdio for local dev) exposing its
+control plane — it wires and inspects mounts, it never carries or pushes data. Moving data (pushing
+a display item, streaming MIDI) is each data-plane daemon's own MCP (e.g. `surfaced`'s `send_item`,
+§10.1), never here. capmeshd advertises this server on the mesh as a `cap=mcp` capability, so the
+gateway (§7.2) federates it exactly like any other MCP backend.
 
 - **Tools** (all control-plane)
   - `discover(kind?, dir?, host?)` → capabilities (id, kind, dir, host, summary).
@@ -319,8 +324,35 @@ So the surface item-push verb lives on `surfaced`'s embedded MCP (`send_item`, a
   live state).
 - **Prompts** — worked examples ("connect the studio keyboard to the SuperCollider host temporarily").
 
+### 7.2 The MCP gateway (a data-plane daemon)
+
+The gateway is a **data-plane daemon** (peer of `nmidid`, `surfaced`) that capmeshd discovers and
+drives (§2, §4). It is the **single `/mcp` endpoint an agent connects to**, and it does the
+data-plane work: it acts as an MCP client to each federated upstream, merges their `tools/list`
+under a namespace (`board__create_task`, `kb__search`, …), routes each `tools/call` to the owning
+upstream, and emits `notifications/tools/list_changed` when the federated set changes. **capmeshd
+never sits in the MCP data path** — it only tells the gateway *what* to federate and *how to reach
+it*.
+
+**capmeshd owns the routing knowledge** (it is the control plane and it understands the transports):
+it keeps the MCP **route registry** — each upstream's id, endpoint URL, transport (`streamable-http`
+| `stdio`), and MCP protocol revision — and drives the gateway over the gateway's control socket to
+federate / defederate a route. Two ways a route enters the registry:
+
+- **Explicit (the floor):** a `register` endpoint on capmeshd — *"route MCP for upstream X → URL Y
+  over transport T"* — for a statically-known or operator-added server.
+- **Automatic (the magic):** capmeshd's mesh discovery sees a `cap=mcp` advertisement and calls that
+  *same* register path itself. This is §6.1 auto-mount for MCP — a new MCP server appearing on the
+  LAN is federated into the gateway with no configuration, exactly as a new MIDI source auto-mounts.
+
+The gateway serves MCP protocol revision `2026-07-28`, so a v2 client picks up `tools/list_changed`
+mid-session (a newly-advertised capability's tools become usable without reconnecting). Nginx (the
+TLS/Access front door) repoints `/mcp` at the gateway; the per-service `/kb/ /board/ /surfaced/`
+prefixes stay as direct fallbacks.
+
 This is precisely the "mDNS + generic connect/disconnect MCP server" the landscape survey found
-nobody has built.
+nobody has built — with the aggregation factored into its own dumb data-plane daemon so capmeshd
+stays pure control plane.
 
 ---
 
@@ -507,8 +539,13 @@ the reconciler derives desired mounts from discovery events. **Exit (the headlin
 MIDI keyboard into the laptop and it appears, unasked, as a virtual MIDI input on the desktop* — and
 disappears when unplugged. A new kind = one adapter module + a §4.1 config entry.
 
-**M2 — MCP server.** Wrap the control API in the §7 MCP server (Streamable HTTP). **Exit:** an agent
-discovers and wires MIDI mounts over the mesh with no bespoke glue.
+**M2 — MCP surface.** (a) Wrap capmesh's control API in its own §7.1 embedded MCP server (Streamable
+HTTP), advertised as a `cap=mcp` capability. (b) Build the §7.2 **MCP gateway** data-plane daemon
+plus capmeshd's MCP **route registry** + `register` endpoint that drives it; federate the mesh's MCP
+servers (kb / board / surfaced / capmesh) behind one `/mcp`, with `cap=mcp` auto-registration
+mirroring §6.1 auto-mount. **Exit:** an agent connects to one endpoint, sees every mesh MCP server's
+tools namespaced under one `tools/list`, wires MIDI mounts over the mesh with no bespoke glue, and a
+newly-advertised MCP server appears mid-session via `tools/list_changed`.
 
 **M2.5 — Browser surface (agent-facing; operator-prioritized).** Build `surfaced` (§10.1): the
 HTTP/WS server, the durable per-surface **inbox store** + on-disk persistence, the attachment page
