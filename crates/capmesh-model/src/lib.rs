@@ -40,6 +40,16 @@ pub struct PortDescriptor {
     pub formats: Vec<Format>,
 }
 
+impl PortDescriptor {
+    /// Whether this port satisfies an optional direction selector (§7): `None` matches any port;
+    /// `Some(d)` requires the port's `dir` to equal `d`. A port with no advertised `dir` matches
+    /// only the `None` selector. This is a per-port (descriptor-stage) check — the coarse
+    /// `_capmesh._tcp` advert cannot carry a usable direction, so `dir` is matched here, not there.
+    pub fn matches_dir(&self, dir: Option<&str>) -> bool {
+        dir.is_none_or(|d| self.dir.as_deref() == Some(d))
+    }
+}
+
 /// `hello` result (§1.2).
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct HelloResult {
@@ -282,6 +292,24 @@ mod tests {
             Some(&serde_json::json!(0))
         );
         assert_eq!(pd.formats[1].codec, "midi1");
+    }
+
+    #[test]
+    fn port_matches_dir_selector() {
+        let src: PortDescriptor = serde_json::from_str(
+            r#"{"port-id":"kbd-0","kind":"stream","dir":"source","type":"midi","name":"kbd"}"#,
+        )
+        .unwrap();
+        let undirected: PortDescriptor = serde_json::from_str(
+            r#"{"port-id":"rpc-0","kind":"rpc","type":"control-api","name":"ctl"}"#,
+        )
+        .unwrap();
+
+        assert!(src.matches_dir(None)); // no selector → any port
+        assert!(src.matches_dir(Some("source"))); // matching direction
+        assert!(!src.matches_dir(Some("sink"))); // wrong direction
+        assert!(undirected.matches_dir(None)); // a dir-less port matches only the None selector
+        assert!(!undirected.matches_dir(Some("source")));
     }
 
     #[test]
