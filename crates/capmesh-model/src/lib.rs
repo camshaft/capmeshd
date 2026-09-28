@@ -266,6 +266,44 @@ pub struct CapabilitiesResponse {
     pub caps: Vec<CapabilityDescriptor>,
 }
 
+/// How the MCP gateway reaches a federated MCP upstream (DESIGN §7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum McpTransport {
+    /// Streamable HTTP — the long-running-daemon default.
+    StreamableHttp,
+    /// Local stdio (dev / same-host servers).
+    Stdio,
+}
+
+/// One federated MCP upstream (DESIGN §7.2): capmeshd's control-plane record of an MCP server the
+/// gateway serves. Carried on the `register` endpoint and in the config derived for the gateway.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpRoute {
+    /// Stable upstream id — also the gateway's `tools/list` namespace prefix (`<id>__<tool>`), so
+    /// it must not contain the `__` separator. Unique within the route registry.
+    pub id: String,
+    /// Where the gateway reaches it: an endpoint URL for `streamable-http`, a command for `stdio`.
+    pub url: String,
+    /// The transport the gateway speaks to this upstream.
+    pub transport: McpTransport,
+    /// The MCP protocol revision the upstream negotiates, if known (e.g. `2026-07-28`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol_rev: Option<String>,
+}
+
+impl McpRoute {
+    /// Whether `id` is a valid upstream id / namespace prefix: non-empty and made only of lowercase
+    /// ascii letters, digits, or `-`. This rules out the `__` namespace separator and whitespace,
+    /// so `<id>__<tool>` stays unambiguous to parse back on the gateway.
+    pub fn valid_id(id: &str) -> bool {
+        !id.is_empty()
+            && id
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -481,6 +519,34 @@ mod tests {
         assert_eq!(v["ports"][0]["type"], "midi");
         let back: CapabilityDescriptor = serde_json::from_value(v).unwrap();
         assert_eq!(back, cap);
+    }
+
+    #[test]
+    fn mcp_route_round_trips_with_wire_names() {
+        let r = McpRoute {
+            id: "board".into(),
+            url: "http://h/board/mcp".into(),
+            transport: McpTransport::StreamableHttp,
+            protocol_rev: Some("2026-07-28".into()),
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(json.contains("\"transport\":\"streamable-http\"")); // kebab-case enum
+        assert_eq!(serde_json::from_str::<McpRoute>(&json).unwrap(), r);
+        // stdio round-trips, and protocol-rev is omittable.
+        let stdio: McpRoute =
+            serde_json::from_str(r#"{"id":"local","url":"cmd","transport":"stdio"}"#).unwrap();
+        assert_eq!(stdio.transport, McpTransport::Stdio);
+        assert_eq!(stdio.protocol_rev, None);
+    }
+
+    #[test]
+    fn mcp_route_valid_id_rules_out_ambiguous_prefixes() {
+        assert!(McpRoute::valid_id("board"));
+        assert!(McpRoute::valid_id("capmesh-1"));
+        assert!(!McpRoute::valid_id("")); // empty
+        assert!(!McpRoute::valid_id("Board")); // uppercase
+        assert!(!McpRoute::valid_id("a b")); // whitespace
+        assert!(!McpRoute::valid_id("a_b")); // underscore → would collide with the __ separator
     }
 
     #[test]

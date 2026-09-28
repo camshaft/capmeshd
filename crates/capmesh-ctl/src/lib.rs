@@ -19,8 +19,9 @@ use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 // The capmesh-ctl value types live in `capmesh-model`; re-export them so the client's
 // callers (main, reconcile, negotiate) keep referring to them as `ctl::<Type>`.
 pub use capmesh_model::{
-    Format, HelloResult, ListPortsResult, LocalEndpoint, MountResult, MountRole, MountSpec,
-    MountState, MountStatus, MountStatusResult, Notification, PortDescriptor, RemoteEndpoint,
+    Format, HelloResult, ListPortsResult, LocalEndpoint, McpRoute, McpTransport, MountResult,
+    MountRole, MountSpec, MountState, MountStatus, MountStatusResult, Notification, PortDescriptor,
+    RemoteEndpoint,
 };
 
 /// The `data` object of a JSON-RPC error — carries the machine `code` (§6).
