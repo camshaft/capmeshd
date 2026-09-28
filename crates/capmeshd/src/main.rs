@@ -120,6 +120,14 @@ enum Cmd {
         /// Select by exact capability id; pins one capability when kind/host are ambiguous.
         #[arg(long)]
         id: Option<String>,
+        /// Restrict to a remote port direction (`source | sink`); defaults to the direction the
+        /// role implies (mirror-source→source, mirror-sink→sink), so a device exposing both binds
+        /// the right one.
+        #[arg(long)]
+        dir: Option<String>,
+        /// Bind a specific remote port-id; defaults to the first port matching kind + direction.
+        #[arg(long)]
+        port: Option<String>,
         /// The role the local daemon materializes (§3.1).
         #[arg(long, default_value = "mirror-source")]
         role: String,
@@ -288,6 +296,8 @@ async fn main() -> Result<()> {
             kind,
             host,
             id,
+            dir,
+            port,
             role,
             local_name,
             local_codecs,
@@ -299,6 +309,8 @@ async fn main() -> Result<()> {
                 kind.as_deref(),
                 host.as_deref(),
                 id.as_deref(),
+                dir.as_deref(),
+                port.as_deref(),
                 role,
                 local_name.clone(),
                 local_codecs,
@@ -1145,6 +1157,8 @@ async fn cmd_connect_discover(
     kind: Option<&str>,
     host: Option<&str>,
     id: Option<&str>,
+    dir: Option<&str>,
+    port: Option<&str>,
     role: &str,
     local_name: Option<String>,
     local_codecs: &[String],
@@ -1167,8 +1181,11 @@ async fn cmd_connect_discover(
         .await
         .with_context(|| format!("fetch descriptor for capability {}", advert.id))?;
 
+    // Bind the port direction the role implies unless the caller pinned `--dir`, so a device that
+    // exposes both a source and a sink port mounts the one the role means (§3.1).
+    let dir = dir.or_else(|| automount::dir_for_role(role));
     let local = codecs_to_formats(local_codecs);
-    let plan = automount::plan_mount(role, kind, None, None, &cap.ports, &local)
+    let plan = automount::plan_mount(role, kind, dir, port, &cap.ports, &local)
         .map_err(|e| anyhow::anyhow!("cannot plan a mount for {}: {e}", advert.id))?;
     info!(port_id = %plan.port_id, codec = %plan.format.codec, "planned mount");
 

@@ -44,6 +44,20 @@ pub fn role_for_action(action: &str) -> Option<MountRole> {
     }
 }
 
+/// The remote port direction a role binds (§3.1), when it is not given explicitly: a
+/// `mirror-source` mirrors the remote's **source** locally, a `mirror-sink` forwards to the
+/// remote's **sink**, and `link` binds an existing local port so it leaves the direction
+/// unconstrained (`None`). Used to default the port selector for a discovery-driven connect so a
+/// device that exposes *both* a source and a sink port binds the one the role means, not whichever
+/// the descriptor lists first. An unknown action also yields `None` (rejected later by planning).
+pub fn dir_for_role(action: &str) -> Option<&'static str> {
+    match action {
+        "mirror-local" | "mirror-source" => Some("source"),
+        "mirror-sink" => Some("sink"),
+        _ => None,
+    }
+}
+
 /// Plan an auto-mount (§6.1): choose the first advertised port matching the selector
 /// (`kind`↔port type, `dir`, `port` id — each `None` matches anything), map `action` to a
 /// role, and negotiate the format from the local codecs (consumer) against that port's
@@ -256,6 +270,15 @@ mod tests {
         assert_eq!(role_for_action("mirror-sink"), Some(MountRole::MirrorSink));
         assert_eq!(role_for_action("link"), Some(MountRole::Link));
         assert_eq!(role_for_action("nonsense"), None);
+    }
+
+    #[test]
+    fn dir_for_role_maps_the_role_to_the_remote_port_direction() {
+        assert_eq!(dir_for_role("mirror-source"), Some("source"));
+        assert_eq!(dir_for_role("mirror-local"), Some("source")); // alias
+        assert_eq!(dir_for_role("mirror-sink"), Some("sink"));
+        assert_eq!(dir_for_role("link"), None); // link leaves direction unconstrained
+        assert_eq!(dir_for_role("nonsense"), None);
     }
 
     #[test]
