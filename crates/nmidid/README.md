@@ -40,6 +40,14 @@ exposes `allowedGroups` / `allowedUids` / `allowedGids` for the same policy — 
 `allowedGroups = [ "capmesh" ]` to let capmeshd's client reach the socket while
 refusing others.
 
+Two gates apply, in order. First the **file permissions**: the socket is `0o660`,
+so a client running as a different user (e.g. capmeshd under a systemd
+`DynamicUser`) can only *open* it if it shares the socket's group — set the
+module's `socketGroup = "capmesh"` so the socket is group-owned by the shared
+group. Then the **peer-credential** check (`allowedGroups`, above) decides whether
+that connection is served. Leaving `socketGroup` unset runs nmidid as `root:root`,
+so only root (or a same-user client) can connect.
+
 ### Control methods (capmeshd → daemon)
 
 `hello` · `list-ports` · `describe-port` · `mount` · `unmount` · `mount-status`

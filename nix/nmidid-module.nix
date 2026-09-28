@@ -31,6 +31,23 @@ in
       description = "Log verbosity.";
     };
 
+    socketGroup = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      example = "capmesh";
+      description = ''
+        Group that owns the control socket (and its runtime directory), set as the
+        service's primary group. The socket is mode `0660`, so a client running as
+        a different user (e.g. capmeshd under a systemd `DynamicUser`) can only
+        open it if it shares this group. Set to the shared `capmesh` group — the
+        one `services.capmesh` declares and capmeshd joins via `SupplementaryGroups`
+        — so co-located capmeshd can reach the socket. This is the file-permission
+        gate that precedes the peer-credential check (`allowedGroups`, §1.1). When
+        null, nmidid runs as `root:root` and only root (or a same-user client) can
+        connect. The group must exist (declared elsewhere).
+      '';
+    };
+
     allowedUids = lib.mkOption {
       type = lib.types.listOf lib.types.int;
       default = [ ];
@@ -91,6 +108,12 @@ in
         # Local-trust socket: owner/group only (CONTROL-PROTOCOL §1.1).
         UMask = "0117";
         SupplementaryGroups = [ "audio" ];
+        # Group-own the socket (and RuntimeDirectory) so a co-located client in
+        # this group can open the 0660 socket — the file-permission gate that
+        # precedes the peer-credential check. `audio` stays available as a
+        # supplementary group for the virtual-MIDI devices.
+      } // lib.optionalAttrs (cfg.socketGroup != null) {
+        Group = cfg.socketGroup;
       };
     };
   };
