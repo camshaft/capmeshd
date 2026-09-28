@@ -90,8 +90,9 @@
           # source; the `sc` (SuperCollider) host discovers it and auto-mounts it — unasked — onto
           # its local nmidid. Asserting capmeshd's "auto-mount issued" log on `sc` proves the whole
           # SC-side path end-to-end: mDNS discovery → descriptor fetch → AppleMIDI control-port
-          # correlation (by IP) → plan → issue-and-accept. (The RTP data-plane "active + bytes-in"
-          # assertion is a v-nmidid-owned follow-up.)
+          # correlation (by IP) → plan → issue-and-accept — then that the RTP data plane actually
+          # flows: the mount reaches `Active` and bytes arrive (SuperCollider would hear the notes).
+          # The `--no-notes` / `--reject` / dead-peer variants are a later slice.
           packages.rehearsal-m0 =
             let
               # Shared per-host bits: the mDNS substrate (capmesh advertise/browse relies on Avahi)
@@ -102,6 +103,9 @@
                 services.avahi.publish.enable = true;
                 services.avahi.publish.userServices = true;
                 boot.kernelModules = [ "snd-virmidi" ];
+                # The capmeshd CLI on PATH so the testScript can query mount-status (root is
+                # admitted by nmidid's peer policy — it always allows its own uid).
+                environment.systemPackages = [ config.services.capmesh.package ];
                 services.nmidid = {
                   enable = true;
                   socket = "/run/nmidid/nmidid.sock";
@@ -174,6 +178,21 @@
                 # a missing apple-midi record would log "awaiting" instead.
                 sc.wait_until_succeeds(
                     "journalctl -u capmesh.service | grep -q 'auto-mount issued'", timeout=120
+                )
+
+                # The RTP data plane flows: the SC-host nmidid completes the AppleMIDI handshake to
+                # the fake source and the mount reaches Active. Query nmidid via `capmeshd
+                # mount-status` (root is admitted by nmidid's peer policy). The CLI logs the state
+                # enum via Debug, so the on-the-wire "active" prints as `state=Active`.
+                sc.wait_until_succeeds(
+                    "capmeshd mount-status --socket /run/nmidid/nmidid.sock 2>&1 | grep -q 'state=Active'",
+                    timeout=90,
+                )
+                # ...and notes actually arrive: fake-source streams every 100ms, so bytes-in climbs
+                # off zero (the CLI logs the `bytes-in` stat as the field `bytes_in=<n>`).
+                sc.wait_until_succeeds(
+                    "capmeshd mount-status --socket /run/nmidid/nmidid.sock 2>&1 | grep -Eq 'bytes_in=[1-9]'",
+                    timeout=90,
                 )
               '';
             };
