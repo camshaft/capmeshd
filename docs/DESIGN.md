@@ -378,19 +378,26 @@ The module runs `capmeshd`, relies on the already-enabled Avahi (and can publish
 `_moonraker._tcp` record Moonraker omits), opens the right firewall ports, and installs
 `permanentMounts` into desired-state. `colmena apply --on @printer` pushes to every tagged host.
 
-**Enabling the local-socket trust boundary (§8).** `services.capmesh` places capmeshd's process in
-a shared `capmesh` group (`SupplementaryGroups`, keeping the `DynamicUser` sandbox) and declares the
-group. To turn peer-credential enforcement on for a data-plane daemon, authorize that group **by
-name** — for `nmidid`:
+**Co-deploying capmeshd with a data-plane daemon (§8).** `services.capmesh` places capmeshd's
+process in a shared `capmesh` group (`SupplementaryGroups`, keeping the `DynamicUser` sandbox) and
+declares the group. Reaching a data-plane daemon's control socket then has **two gates** — set both
+on the daemon for the co-deploy:
 
 ```nix
-services.nmidid.allowedGroups = [ config.services.capmesh.group ];   # default "capmesh" on both sides
+services.nmidid.socketGroup   = config.services.capmesh.group;   # gate 1: file perms
+services.nmidid.allowedGroups = [ config.services.capmesh.group ]; # gate 2: peer-cred (§8)
 ```
 
-The daemon resolves each name to a gid from `/etc/group` at startup (an unresolved name is a fatal,
-fail-closed start error) and matches the connecting peer's **full** group set, so the DynamicUser
-capmeshd client is admitted while a co-resident non-`capmesh` process is refused — with no numeric
-gid pinned anywhere. Enforcement defaults **off** (empty `allowedGroups`), so it is opt-in per host.
+1. **File permissions (runs first, always).** The control socket is mode `0660`; a non-root process
+   can only open it if it shares the socket's **group**. `socketGroup` makes that group own the
+   socket, so the DynamicUser capmeshd (which holds `capmesh` as a supplementary group) can open it.
+   Its default (`null`) leaves the socket `root:root` — capmeshd **cannot connect at all**, even with
+   peer-cred enforcement off. So `socketGroup` is required for the co-deploy regardless of enforcement.
+2. **Peer credentials (opt-in).** `allowedGroups` turns on `SO_PEERCRED` enforcement: the daemon
+   resolves each name to a gid from `/etc/group` at startup (an unresolved name is a fatal,
+   fail-closed start error) and matches the peer's **full** group set, so the capmeshd client is
+   admitted while a co-resident non-`capmesh` process is refused — no numeric gid pinned anywhere.
+   Enforcement defaults **off** (empty `allowedGroups`), so it is opt-in per host.
 
 Hosts today: Linux `gateway` / `green-machine` / `i7-machine`; macOS `camerons-mini` /
 `camerons-work-mbp`. **The mesh is cross-OS from day one** — the MIDI plugin creates virtual ports
