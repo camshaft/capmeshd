@@ -103,6 +103,10 @@ in
           ++ lib.concatMap (grp: [ "--allow-group" grp ]) cfg.allowedGroups
         );
         RuntimeDirectory = "nmidid";
+        # Owner + group only: with `socketGroup` set, only root and that group can
+        # traverse to the socket; others cannot even see it (the socket itself is
+        # 0660, so this is defense-in-depth on the local-trust boundary, §1.1).
+        RuntimeDirectoryMode = "0750";
         Restart = "on-failure";
         RestartSec = 2;
         # Local-trust socket: owner/group only (CONTROL-PROTOCOL §1.1).
