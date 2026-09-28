@@ -293,4 +293,67 @@ mod tests {
         assert_eq!(theirs.formats[0].codec, "midi1");
         assert_eq!(theirs.formats[0].params["group"], Value::from(0));
     }
+
+    /// The `mount-status` result and the §5 `mount-state` notification nmidid emits
+    /// are read by capmeshd's client, which deserializes them into the canonical
+    /// `capmesh-model` mount types — and that is exactly how the M0 rehearsal harness
+    /// observes the data plane (mount `state` reaching `active`, `stats.bytes-in`
+    /// growing, and the failure `detail`). These are two independent structs, so
+    /// guard the wire the same way [`port_descriptor_wire_matches_capmesh_model`]
+    /// does: the fields the reconciler and the harness read must survive a round-trip
+    /// into `capmesh_model`. This fails CI if either side renames a mount-status field
+    /// (e.g. `bytes-in` ↔ `bytes_in`) and the wire silently drifts.
+    #[test]
+    fn mount_status_wire_matches_capmesh_model() {
+        // (1) The `mount-status` result shape `{"mounts": [MountStatus, ...]}` (§3.2),
+        //     which a root-run `capmeshd mount-status` reads on the SC host.
+        let active = MountStatus {
+            mount_id: "m1".to_string(),
+            state: MountState::Active,
+            since: "2026-09-27T18:07:52Z".to_string(),
+            stats: MountStats {
+                bytes_in: 10432,
+                bytes_out: 0,
+                last_event: None,
+            },
+            detail: None,
+        };
+        let result_json = serde_json::json!({ "mounts": [serde_json::to_value(&active).unwrap()] });
+        let theirs: capmesh_model::MountStatusResult =
+            serde_json::from_value(result_json).expect("mount-status result parses as capmesh-model");
+        assert_eq!(theirs.mounts.len(), 1);
+        assert_eq!(theirs.mounts[0].state, capmesh_model::MountState::Active);
+        assert_eq!(
+            theirs.mounts[0]
+                .stats
+                .as_ref()
+                .expect("stats present")
+                .bytes_in,
+            10432,
+            "mount-status stats.bytes-in must survive into capmesh-model"
+        );
+
+        // (2) The unsolicited §5 `mount-state` notification, which capmeshd subscribes
+        //     to — including the failure `detail` the reject/unresponsive scenarios read.
+        let failed = MountStatus {
+            mount_id: "m1".to_string(),
+            state: MountState::Failed,
+            since: "2026-09-27T18:07:52Z".to_string(),
+            stats: MountStats::default(),
+            detail: Some("remote rejected the invitation".to_string()),
+        };
+        let notif = crate::mounts::mount_state_notification(&failed);
+        let parsed = capmesh_model::Notification::from_method(
+            notif["method"].as_str().unwrap(),
+            notif["params"].clone(),
+        )
+        .expect("mount-state notification parses as capmesh-model");
+        match parsed {
+            capmesh_model::Notification::MountState { state, detail, .. } => {
+                assert_eq!(state, capmesh_model::MountState::Failed);
+                assert_eq!(detail.as_deref(), Some("remote rejected the invitation"));
+            }
+            other => panic!("expected a MountState notification, got {other:?}"),
+        }
+    }
 }
