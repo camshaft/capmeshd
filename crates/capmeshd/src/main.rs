@@ -441,7 +441,7 @@ async fn main() -> Result<()> {
     // Auto-mounts issued so far, keyed by the source peer's mDNS fullname, so a `ServiceRemoved`
     // can tear down its `while-advertised` mounts (§6.1). `permanent` mounts stay tracked and
     // mounted across advert removal.
-    let active_mounts: ActiveMounts = Arc::new(Mutex::new(HashMap::new()));
+    let active_mounts: ActiveMounts = Arc::new(Mutex::new(MountRegistry::default()));
 
     // Peers whose auto-mount matched but await their AppleMIDI control port (§6.1). Drained +
     // re-tried when the peer's `_apple-midi._udp` record resolves, so a capmesh advert that
@@ -476,6 +476,10 @@ async fn main() -> Result<()> {
                                             cap = %format!("{}/{}", advert.cap, advert.dir),
                                             "resolved capmesh peer"
                                         );
+                                        // Mark the advert live *before* spawning, so an issuance
+                                        // that outraces a `ServiceRemoved` sees the removal (§6.1).
+                                        let fullname = svc.get_fullname().to_string();
+                                        active_mounts.lock().unwrap().live.insert(fullname.clone());
                                         // Issue any matching auto-mounts off the browse loop:
                                         // fetching the descriptor is network I/O.
                                         tokio::spawn(try_auto_mount(
@@ -483,7 +487,7 @@ async fn main() -> Result<()> {
                                             advert,
                                             addr,
                                             svc.get_port(),
-                                            svc.get_fullname().to_string(),
+                                            fullname,
                                         ));
                                     }
                                     Err(e) => info!(
@@ -506,11 +510,12 @@ async fn main() -> Result<()> {
                         // `permanent` ones (they outlive the advert, like a permanent mount).
                         let torn = {
                             let mut reg = active_mounts.lock().unwrap();
-                            match reg.remove(&fullname) {
+                            reg.live.remove(&fullname);
+                            match reg.active.remove(&fullname) {
                                 Some(mounts) => {
                                     let (to_unmount, retain) = teardown_on_unadvertise(mounts);
                                     if !retain.is_empty() {
-                                        reg.insert(fullname.clone(), retain);
+                                        reg.active.insert(fullname.clone(), retain);
                                     }
                                     to_unmount
                                 }
@@ -576,10 +581,22 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Auto-mounts issued so far, keyed by the source peer's mDNS fullname (§6.1) — consulted by
-/// `ServiceRemoved` to honor each mount's [`Lifetime`]. Shared across the browse loop and every
-/// spawned issuance task.
-type ActiveMounts = Arc<Mutex<HashMap<String, Vec<ActiveAutoMount>>>>;
+/// The auto-mount registry (§6.1): which source adverts are currently live on the mesh, and the
+/// mounts issued so far per source peer's mDNS fullname. Both live behind one lock so a
+/// `ServiceRemoved` and a still-in-flight `try_auto_mount` for the same peer serialize — closing
+/// the race where a mount issued *after* its advert was removed would otherwise be tracked but
+/// never torn down (the removal's teardown already ran against an empty entry).
+#[derive(Default)]
+struct MountRegistry {
+    /// Fullnames of adverts currently present on the mesh (inserted on `ServiceResolved`, removed
+    /// on `ServiceRemoved`). Consulted at issuance to detect an advert that vanished mid-mount.
+    live: std::collections::HashSet<String>,
+    /// Issued auto-mounts keyed by the source peer's fullname — consulted by `ServiceRemoved` to
+    /// honor each mount's [`Lifetime`].
+    active: HashMap<String, Vec<ActiveAutoMount>>,
+}
+/// Shared across the browse loop and every spawned issuance task (cheap `Arc` clone).
+type ActiveMounts = Arc<Mutex<MountRegistry>>;
 
 /// The shared, cheaply-cloneable context every auto-mount task needs: the rules+sockets+codecs,
 /// the AppleMIDI control-port map, the issued-mount registry (for lifetime teardown), and the
@@ -692,15 +709,30 @@ async fn try_auto_mount(
                 // Track the mount only once it is actually issued, so a `while-advertised`
                 // teardown never chases a mount that never landed (§6.1).
                 if issue_mount(socket, spec).await {
-                    let mut reg = active_mounts.lock().unwrap();
-                    automount::track_active_mount(
-                        reg.entry(fullname.clone()).or_default(),
-                        ActiveAutoMount {
-                            mount_id,
-                            kind: advert.cap.clone(),
-                            lifetime,
-                        },
-                    );
+                    // Decide against advert liveness under the registry lock, so this serializes
+                    // with a racing `ServiceRemoved` (§6.1): if the source advert vanished during
+                    // the fetch/mount, undo a `while-advertised` mount rather than orphan it.
+                    let outcome = {
+                        let mut reg = active_mounts.lock().unwrap();
+                        let live = reg.live.contains(&fullname);
+                        let outcome = automount::resolve_issue_race(live, lifetime);
+                        if outcome == automount::RaceOutcome::Track {
+                            automount::track_active_mount(
+                                reg.active.entry(fullname.clone()).or_default(),
+                                ActiveAutoMount {
+                                    mount_id: mount_id.clone(),
+                                    kind: advert.cap.clone(),
+                                    lifetime,
+                                },
+                            );
+                        }
+                        outcome
+                    };
+                    if outcome == automount::RaceOutcome::CompensateUnmount {
+                        warn!(mount_id = %mount_id, %fullname,
+                            "auto-mount: source advert removed during issuance; unmounting the orphaned mount");
+                        issue_unmount(socket, &mount_id).await;
+                    }
                 }
             }
             AutoMountOutcome::AwaitingControlPort => {

@@ -179,6 +179,31 @@ pub fn teardown_on_unadvertise(
         .partition(|m| m.lifetime.tears_down_on_unadvertise())
 }
 
+/// Whether a just-issued auto-mount should be kept or immediately undone, decided against whether
+/// the source advert is still live at the moment issuance completes (§6.1). A `ServiceRemoved`
+/// can race an in-flight issuance: if the advert went away during the descriptor fetch/mount, a
+/// `while-advertised` mount must be undone — it would otherwise be tracked against a peer fullname
+/// that has already had its (empty) teardown run and will never see another removal, so it would
+/// never be torn down. A `permanent` mount is kept regardless, since it outlives advert removal by
+/// design.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RaceOutcome {
+    /// Track and keep the mount.
+    Track,
+    /// The advert was removed mid-issuance; unmount what was just issued.
+    CompensateUnmount,
+}
+
+/// Decide a just-issued auto-mount's fate against advert liveness + its [`Lifetime`] — see
+/// [`RaceOutcome`]. Pure, so the daemon's issuance glue is one call under the registry lock.
+pub fn resolve_issue_race(advert_still_live: bool, lifetime: Lifetime) -> RaceOutcome {
+    if advert_still_live || !lifetime.tears_down_on_unadvertise() {
+        RaceOutcome::Track
+    } else {
+        RaceOutcome::CompensateUnmount
+    }
+}
+
 /// Record one just-issued auto-mount in a peer's tracking vec, keyed by `mount_id` (§6.1). A
 /// `mount_id` is the data-plane idempotency key, so the same mount can be re-issued by concurrent
 /// resolve tasks or by two rules matching one advert; this keeps the registry at one entry per
@@ -530,6 +555,29 @@ mod tests {
         assert_eq!(
             tracked.iter().map(|m| m.mount_id.as_str()).collect::<Vec<_>>(),
             ["kbd-0", "kbd-1"]
+        );
+    }
+
+    #[test]
+    fn resolve_issue_race_compensates_only_a_vanished_while_advertised_mount() {
+        // Advert still live at issuance → always track, whatever the lifetime.
+        assert_eq!(
+            resolve_issue_race(true, Lifetime::WhileAdvertised),
+            RaceOutcome::Track
+        );
+        assert_eq!(
+            resolve_issue_race(true, Lifetime::Permanent),
+            RaceOutcome::Track
+        );
+        // Advert removed during issuance: a while-advertised mount is undone (it would otherwise
+        // leak, tracked against an already-torn-down fullname); a permanent mount persists.
+        assert_eq!(
+            resolve_issue_race(false, Lifetime::WhileAdvertised),
+            RaceOutcome::CompensateUnmount
+        );
+        assert_eq!(
+            resolve_issue_race(false, Lifetime::Permanent),
+            RaceOutcome::Track
         );
     }
 
