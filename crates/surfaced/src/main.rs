@@ -13,6 +13,7 @@ use tracing_subscriber::FmtSubscriber;
 
 #[derive(Parser, Debug)]
 #[command(name = "surfaced")]
+#[command(version)]
 #[command(about = "Browser surface data-plane daemon — durable, scriptable display sinks")]
 struct Args {
     /// Address the HTTP/SSE server binds (attachment pages + push path).
@@ -107,4 +108,19 @@ async fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Args;
+    use clap::CommandFactory;
+
+    #[test]
+    fn cli_is_valid_and_exposes_version() {
+        // Validates the whole arg definition (catches a clap misconfiguration).
+        Args::command().debug_assert();
+        // `--version` is wired, so a deployed binary can be identified from the
+        // shell (complements the `/health` version field).
+        assert!(Args::command().get_version().is_some());
+    }
 }
