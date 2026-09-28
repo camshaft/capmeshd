@@ -72,28 +72,9 @@
               mainProgram = "surfaced";
             };
           };
-        in
-        {
-          packages.default = capmeshd;
-          packages.capmeshd = capmeshd;
-          packages.nmidid = nmidid;
-          packages.surfaced = surfaced;
-
-          # M0 rehearsal harness (nixosTest). Exposed under `packages` (NOT `checks`) because a
-          # NixOS VM test requires the `kvm` system feature, so it runs on a KVM-capable CI host
-          # (`nix build .#packages.<system>.rehearsal-m0`), not in a plain `nix flake check`.
-          # Locally verifiable up to the boot step: `nix build .#packages.<system>.rehearsal-m0.driver`
-          # builds both guest systems + the test driver and type-checks/lints the testScript
-          # without KVM.
-          #
-          # The cross-host M0 headline path (docs/M0-DEMO.md): a `source` host advertises a MIDI
-          # source; the `sc` (SuperCollider) host discovers it and auto-mounts it — unasked — onto
-          # its local nmidid. Asserting capmeshd's "auto-mount issued" log on `sc` proves the whole
-          # SC-side path end-to-end: mDNS discovery → descriptor fetch → AppleMIDI control-port
-          # correlation (by IP) → plan → issue-and-accept — then that the RTP data plane actually
-          # flows: the mount reaches `Active` and bytes arrive (SuperCollider would hear the notes).
-          # The `--no-notes` / `--reject` / dead-peer variants are a later slice.
-          packages.rehearsal-m0 =
+          # A scenario builder shared by every rehearsal package: the two-host cross-mesh topology
+          # is fixed; only the fake source's flags and the trailing assertions vary per scenario.
+          rehearsalScenarios =
             let
               # Shared per-host bits: the mDNS substrate (capmesh advertise/browse relies on Avahi)
               # and virtual MIDI so nmidid has real ports to project into a descriptor.
@@ -118,84 +99,119 @@
                   advertise.midi.socket = config.services.nmidid.socket;
                 };
               };
-            in
-            pkgs.testers.runNixOSTest {
-              name = "capmesh-m0-rehearsal";
-              nodes = {
-                # The source host: a self-contained fake RTP-MIDI source (advertises
-                # `_apple-midi._udp` itself) plus a capmeshd advertising the `_capmesh._tcp`
-                # midi/source capability (descriptor projected from the local nmidid). The two
-                # records are correlated by IP on the SC side. No automount here — it only serves.
-                source = { config, ... }: {
-                  imports = [ midiHost ];
-                  services.capmesh.hostId = "source-host";
-                  # The RTP-MIDI session the SC host pulls from: control port 5008, data 5009,
-                  # streaming notes so bytes-in grows. Advertises `_apple-midi._udp` on the LAN.
-                  systemd.services.fake-source = {
-                    wantedBy = [ "multi-user.target" ];
-                    after = [ "network-online.target" "avahi-daemon.service" ];
-                    wants = [ "network-online.target" ];
-                    serviceConfig = {
-                      ExecStart = "${config.services.nmidid.package}/bin/nmidi-fake-source"
-                        + " --bind 0.0.0.0 --port 5008 --note-interval-ms 100";
-                      Restart = "on-failure";
-                      RestartSec = 2;
-                    };
+              # The source host: a self-contained fake RTP-MIDI source (advertises
+              # `_apple-midi._udp` itself, `fakeSourceArgs` selects its behavior) plus a capmeshd
+              # advertising `_capmesh._tcp` midi/source (descriptor projected from the local
+              # nmidid). The two records correlate by IP on the SC side. No automount — it serves.
+              sourceNode = fakeSourceArgs: { config, ... }: {
+                imports = [ midiHost ];
+                services.capmesh.hostId = "source-host";
+                systemd.services.fake-source = {
+                  wantedBy = [ "multi-user.target" ];
+                  after = [ "network-online.target" "avahi-daemon.service" ];
+                  wants = [ "network-online.target" ];
+                  serviceConfig = {
+                    ExecStart = "${config.services.nmidid.package}/bin/nmidi-fake-source"
+                      + " --bind 0.0.0.0 --port 5008 ${fakeSourceArgs}";
+                    Restart = "on-failure";
+                    RestartSec = 2;
                   };
                 };
-                # The SuperCollider host: the co-deploy that auto-mounts a discovered MIDI source.
-                sc = { ... }: {
-                  imports = [ midiHost ];
-                  services.capmesh.hostId = "sc-host";
-                  services.capmesh.automount = [{
-                    match = { kind = "midi"; dir = "source"; };
-                    action = "mirror-local";
-                    lifetime = "while-advertised";
-                  }];
-                };
               };
-              testScript = ''
+              # The SuperCollider host: the co-deploy that auto-mounts a discovered MIDI source.
+              scNode = { ... }: {
+                imports = [ midiHost ];
+                services.capmesh.hostId = "sc-host";
+                services.capmesh.automount = [{
+                  match = { kind = "midi"; dir = "source"; };
+                  action = "mirror-local";
+                  lifetime = "while-advertised";
+                }];
+              };
+              # Shared prologue: both hosts boot, the source advertises, and the SC host discovers
+              # the peer and auto-issues the mount to its nmidid. "auto-mount issued" only logs when
+              # discovery + descriptor fetch + AppleMIDI control-port correlation + plan all succeed
+              # (a missing apple-midi record logs "awaiting" instead) — so it proves the SC-side path
+              # regardless of what the RTP data plane then does. Each scenario's `tail` asserts the
+              # data-plane outcome via `capmeshd mount-status --json` (stable kebab-case wire names).
+              prologue = ''
                 start_all()
-
-                # Both hosts come up (co-deploy: data-plane daemon, then control plane).
                 for m in (source, sc):
                     m.wait_for_unit("nmidid.service")
                     m.wait_for_unit("capmesh.service")
-                    m.wait_for_open_port(7420)  # capmesh mesh control endpoint
+                    m.wait_for_open_port(7420)
                 source.wait_for_unit("fake-source.service")
-
-                # The SC host renders the auto-mount headline rule (§6.1).
                 sc.succeed("grep -q '\\[\\[automount\\]\\]' /etc/capmesh/capmesh.toml")
-
-                # The SC host discovers the source peer over mDNS.
                 sc.wait_until_succeeds(
                     "journalctl -u capmesh.service | grep -q 'resolved capmesh peer'", timeout=90
                 )
-
-                # ...and auto-issues a mirror-source mount to its local nmidid. This one line proves
-                # the whole SC-side path: only a successful descriptor fetch + AppleMIDI control-port
-                # correlation (by IP) + plan lets `evaluate` reach Mount and log "auto-mount issued";
-                # a missing apple-midi record would log "awaiting" instead.
                 sc.wait_until_succeeds(
                     "journalctl -u capmesh.service | grep -q 'auto-mount issued'", timeout=120
                 )
-
-                # The RTP data plane flows: the SC-host nmidid completes the AppleMIDI handshake to
-                # the fake source and the mount reaches active. Query nmidid via `capmeshd
-                # mount-status --json` (root is admitted by nmidid's peer policy) — stable
-                # kebab-case wire names on stdout, not the human log format.
-                sc.wait_until_succeeds(
-                    "capmeshd mount-status --socket /run/nmidid/nmidid.sock --json | grep -q '\"state\":\"active\"'",
-                    timeout=90,
-                )
-                # ...and notes actually arrive: fake-source streams every 100ms, so bytes-in climbs
-                # off zero.
-                sc.wait_until_succeeds(
-                    "capmeshd mount-status --socket /run/nmidid/nmidid.sock --json | grep -Eq '\"bytes-in\":[1-9]'",
-                    timeout=90,
-                )
               '';
+            in
+            { name, fakeSourceArgs, tail }: pkgs.testers.runNixOSTest {
+              inherit name;
+              nodes = { source = sourceNode fakeSourceArgs; sc = scNode; };
+              testScript = prologue + tail;
             };
+
+        in
+        {
+          packages.default = capmeshd;
+          packages.capmeshd = capmeshd;
+          packages.nmidid = nmidid;
+          packages.surfaced = surfaced;
+
+          # M0 rehearsal harness (nixosTest), cross-host (docs/M0-DEMO.md): a `source` host
+          # advertises a MIDI source; the `sc` (SuperCollider) host discovers it and auto-mounts it
+          # — unasked — onto its local nmidid. Exposed under `packages` (NOT `checks`) because a
+          # NixOS VM test requires the `kvm` system feature, so each scenario runs on a KVM-capable
+          # CI host (`nix build .#packages.<system>.rehearsal-m0[-reject]`), not in a plain
+          # `nix flake check`. Locally verifiable up to the boot step:
+          # `nix build .#packages.<system>.rehearsal-m0.driver` builds both guests + the test driver
+          # and type-checks/lints the testScript without KVM.
+          #
+          # Scenarios (built by `rehearsalScenarios`, which fixes the topology and varies only the
+          # fake source's flags + the trailing assertion):
+          #   rehearsal-m0        — source streams notes → mount active + bytes-in > 0 (headline).
+          #   rehearsal-m0-reject — source refuses the invitation → mount failed, detail "rejected".
+          # The `--no-notes` (keepalive) and dead-peer (unresponsive) scenarios are a later slice.
+          # Happy path: the source streams notes, the mount reaches active and bytes flow — the M0
+          # headline (SuperCollider would hear the keyboard).
+          packages.rehearsal-m0 = rehearsalScenarios {
+            name = "capmesh-m0-rehearsal";
+            fakeSourceArgs = "--note-interval-ms 100";
+            tail = ''
+
+              sc.wait_until_succeeds(
+                  "capmeshd mount-status --socket /run/nmidid/nmidid.sock --json | grep -q '\"state\":\"active\"'",
+                  timeout=90,
+              )
+              sc.wait_until_succeeds(
+                  "capmeshd mount-status --socket /run/nmidid/nmidid.sock --json | grep -Eq '\"bytes-in\":[1-9]'",
+                  timeout=90,
+              )
+            '';
+          };
+
+          # Negative path: the source refuses the AppleMIDI invitation → the mount fails and
+          # surfaces the rejection detail (visible in the mount-status --json `detail` field).
+          packages.rehearsal-m0-reject = rehearsalScenarios {
+            name = "capmesh-m0-reject";
+            fakeSourceArgs = "--reject";
+            tail = ''
+
+              sc.wait_until_succeeds(
+                  "capmeshd mount-status --socket /run/nmidid/nmidid.sock --json | grep -q '\"state\":\"failed\"'",
+                  timeout=90,
+              )
+              sc.wait_until_succeeds(
+                  "capmeshd mount-status --socket /run/nmidid/nmidid.sock --json | grep -q rejected",
+                  timeout=90,
+              )
+            '';
+          };
 
           checks.clippy = capmeshd.overrideAttrs (old: {
             pname = "${old.pname}-clippy";
