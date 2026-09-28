@@ -12,7 +12,9 @@ mod config;
 
 use anyhow::{Context, Result};
 use capmesh_ctl::{CtlClient, CtlError, Format, LocalEndpoint, MountRole, MountSpec, RemoteEndpoint};
-use capmesh_daemon::automount::{self, AutoMountOutcome, Remote};
+use capmesh_daemon::automount::{
+    self, ActiveAutoMount, AutoMountOutcome, Lifetime, Remote, teardown_on_unadvertise,
+};
 use capmesh_daemon::negotiate;
 use capmesh_daemon::reconcile::{self, Reconciler};
 use capmesh_discovery::{self as discovery, AppleMidiPeers};
@@ -359,6 +361,11 @@ async fn main() -> Result<()> {
         }],
     });
 
+    // Auto-mounts issued so far, keyed by the source peer's mDNS fullname, so a `ServiceRemoved`
+    // can tear down its `while-advertised` mounts (§6.1). `permanent` mounts stay tracked and
+    // mounted across advert removal.
+    let active_mounts: ActiveMounts = Arc::new(Mutex::new(HashMap::new()));
+
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
@@ -387,6 +394,8 @@ async fn main() -> Result<()> {
                                             addr,
                                             svc.get_port(),
                                             Arc::clone(&apple_peers),
+                                            svc.get_fullname().to_string(),
+                                            Arc::clone(&active_mounts),
                                         ));
                                     }
                                     Err(e) => info!(
@@ -405,6 +414,32 @@ async fn main() -> Result<()> {
                     }
                     Ok(ServiceEvent::ServiceRemoved(_ty, fullname)) => {
                         info!(%fullname, "capmesh peer removed");
+                        // Tear down this peer's `while-advertised` auto-mounts (§6.1); retain any
+                        // `permanent` ones (they outlive the advert, like a permanent mount).
+                        let torn = {
+                            let mut reg = active_mounts.lock().unwrap();
+                            match reg.remove(&fullname) {
+                                Some(mounts) => {
+                                    let (to_unmount, retain) = teardown_on_unadvertise(mounts);
+                                    if !retain.is_empty() {
+                                        reg.insert(fullname.clone(), retain);
+                                    }
+                                    to_unmount
+                                }
+                                None => Vec::new(),
+                            }
+                        };
+                        for m in torn {
+                            if let Some(socket) = auto.sockets.get(&m.kind) {
+                                let socket = socket.clone();
+                                tokio::spawn(async move {
+                                    issue_unmount(&socket, &m.mount_id).await;
+                                });
+                            } else {
+                                warn!(kind = %m.kind, mount_id = %m.mount_id,
+                                    "auto-mount teardown: no local socket for this kind; skipping");
+                            }
+                        }
                     }
                     Ok(_) => {}
                     Err(e) => {
@@ -436,6 +471,11 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// Auto-mounts issued so far, keyed by the source peer's mDNS fullname (§6.1) — consulted by
+/// `ServiceRemoved` to honor each mount's [`Lifetime`]. Shared across the browse loop and every
+/// spawned issuance task.
+type ActiveMounts = Arc<Mutex<HashMap<String, Vec<ActiveAutoMount>>>>;
+
 /// The auto-mount inputs shared into each spawned issuance task: the config's rules, the
 /// per-kind `capmesh-ctl` sockets to issue against, and the local side's preferred codecs.
 struct AutoMount {
@@ -454,6 +494,8 @@ async fn try_auto_mount(
     addr: IpAddr,
     ep: u16,
     apple_peers: Arc<Mutex<AppleMidiPeers>>,
+    fullname: String,
+    active_mounts: ActiveMounts,
 ) {
     // Coarse match on the advert (kind/dir) before paying for a descriptor fetch.
     let matched: Vec<&Automount> = auto
@@ -499,12 +541,23 @@ async fn try_auto_mount(
             remote,
         ) {
             AutoMountOutcome::Mount(spec) => {
-                info!(
-                    mount_id = %spec.mount_id,
-                    lifetime = rule.lifetime.as_deref().unwrap_or("while-advertised"),
-                    "auto-mount: issuing"
-                );
-                issue_mount(socket, spec).await;
+                let lifetime = Lifetime::from_config(rule.lifetime.as_deref());
+                let mount_id = spec.mount_id.clone();
+                info!(mount_id = %mount_id, ?lifetime, "auto-mount: issuing");
+                // Track the mount only once it is actually issued, so a `while-advertised`
+                // teardown never chases a mount that never landed (§6.1).
+                if issue_mount(socket, spec).await {
+                    active_mounts
+                        .lock()
+                        .unwrap()
+                        .entry(fullname.clone())
+                        .or_default()
+                        .push(ActiveAutoMount {
+                            mount_id,
+                            kind: advert.cap.clone(),
+                            lifetime,
+                        });
+                }
             }
             AutoMountOutcome::AwaitingControlPort => info!(
                 %addr,
@@ -520,7 +573,8 @@ async fn try_auto_mount(
 
 /// Issue one mount against a data-plane daemon's `capmesh-ctl` socket. Best-effort: the mount is
 /// idempotent on its `mount-id`, so a transient failure is retried by the next resolve tick.
-async fn issue_mount(socket: &Path, spec: MountSpec) {
+/// Returns `true` if the mount was issued (so the caller can track it for lifetime teardown).
+async fn issue_mount(socket: &Path, spec: MountSpec) -> bool {
     let mount_id = spec.mount_id.clone();
     let result = async {
         let mut client = CtlClient::connect(socket).await?;
@@ -529,8 +583,31 @@ async fn issue_mount(socket: &Path, spec: MountSpec) {
     }
     .await;
     match result {
-        Ok(r) => info!(mount_id = %r.mount_id, state = ?r.state, "auto-mount issued"),
-        Err(e) => warn!(%mount_id, socket = %socket.display(), "auto-mount: mount failed: {e:#}"),
+        Ok(r) => {
+            info!(mount_id = %r.mount_id, state = ?r.state, "auto-mount issued");
+            true
+        }
+        Err(e) => {
+            warn!(%mount_id, socket = %socket.display(), "auto-mount: mount failed: {e:#}");
+            false
+        }
+    }
+}
+
+/// Tear one auto-mount down against a data-plane daemon's `capmesh-ctl` socket (§6.1, the
+/// `while-advertised` path). Best-effort, mirroring [`issue_mount`]: a transient failure is
+/// logged; the reconciler's drift pass is the backstop.
+async fn issue_unmount(socket: &Path, mount_id: &str) {
+    let result = async {
+        let mut client = CtlClient::connect(socket).await?;
+        client.hello().await?;
+        client.unmount(mount_id).await
+    }
+    .await;
+    match result {
+        Ok(()) => info!(%mount_id, "auto-mount torn down (source unadvertised)"),
+        Err(e) => warn!(%mount_id, socket = %socket.display(),
+            "auto-mount teardown: unmount failed: {e:#}"),
     }
 }
 
