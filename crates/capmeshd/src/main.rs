@@ -22,7 +22,7 @@ use capmesh_daemon::negotiate;
 use capmesh_daemon::reconcile::{self, Reconciler};
 use capmesh_discovery::{self as discovery, AppleMidiPeers, PendingAutoMounts, PendingPeer};
 use capmesh_mesh::server::CapabilityProvider;
-use capmesh_model::CapabilityDescriptor;
+use capmesh_model::{CapabilityDescriptor, PortDescriptor};
 use clap::{Parser, Subcommand};
 use config::{Automount, Config};
 use discovery::{CapabilityAdvert, ServiceAdvertiser};
@@ -912,16 +912,45 @@ async fn probe_ctl(socket: &Path, watch: bool) -> Result<()> {
 /// Browse `_capmesh._tcp` for `timeout_secs`, then print the discovered capabilities that
 /// match the optional filters (§7 discover). Peers are keyed by the IP from their mDNS
 /// record (§5). Deduped by capability id (a peer may resolve more than once).
-async fn cmd_discover(
+/// A capability found on the mesh by [`discover_capabilities`]: the coarse advert, where it was
+/// resolved (IP + mesh-endpoint port), its fetched typed descriptor (`None` if the peer's mesh
+/// endpoint could not be reached), and the descriptor ports that matched the requested `dir`.
+#[derive(Debug, Clone)]
+struct DiscoveredCapability {
+    advert: CapabilityAdvert,
+    addr: IpAddr,
+    port: u16,
+    descriptor: Option<CapabilityDescriptor>,
+    ports: Vec<PortDescriptor>,
+}
+
+/// The descriptor ports that satisfy an optional `dir` selector (§7). Pulled out of the discover
+/// loop as a pure helper so the coarse-advert-vs-descriptor direction split is testable: the
+/// coarse `_capmesh._tcp` advert can't carry a usable `dir`, so direction is matched here against
+/// the fetched descriptor's real ports, never at the advert stage.
+fn matching_ports(cap: &CapabilityDescriptor, dir: Option<&str>) -> Vec<PortDescriptor> {
+    cap.ports
+        .iter()
+        .filter(|p| p.matches_dir(dir))
+        .cloned()
+        .collect()
+}
+
+/// Browse the mesh for up to `timeout_secs` and return the capabilities matching `kind`/`host`
+/// (the coarse advert filter) with their fetched descriptors and `dir`-matched ports (§5, §7).
+/// Direction can only be confirmed from the descriptor, so a `dir` filter drops a capability
+/// whose descriptor exposes no port in that direction — and also one whose descriptor could not be
+/// fetched; an unfiltered browse keeps a descriptor-less capability as its coarse advert. This is
+/// the shared substrate for the `discover` CLI verb and (M2) the `discover`/`describe` MCP tools.
+async fn discover_capabilities(
     timeout_secs: u64,
     kind: Option<&str>,
     dir: Option<&str>,
     host: Option<&str>,
-) -> Result<()> {
+) -> Result<Vec<DiscoveredCapability>> {
     let events = discovery::browse().context("start mDNS browse")?;
-    info!(timeout_secs, "discovering capmesh capabilities");
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
-    let mut seen: std::collections::BTreeMap<String, (CapabilityAdvert, std::net::IpAddr, u16)> =
+    let mut seen: std::collections::BTreeMap<String, (CapabilityAdvert, IpAddr, u16)> =
         std::collections::BTreeMap::new();
 
     loop {
@@ -930,8 +959,8 @@ async fn cmd_discover(
             ev = events.recv_async() => match ev {
                 Ok(ServiceEvent::ServiceResolved(svc)) => {
                     // Filter on kind + host at the advert stage only — the coarse advert's `dir`
-                    // is always `duplex`, so `--dir` is applied against the descriptor's real
-                    // ports below, after the fetch (mirrors the auto-mount coarse/plan split).
+                    // is always `duplex`, so `dir` is applied against the descriptor's real ports
+                    // after the fetch (mirrors the auto-mount coarse/plan split).
                     if let (Some(addr), Ok(advert)) =
                         (discovery::resolved_addr(&svc), discovery::advert_from_resolved(&svc))
                         && advert.matches(kind, None, host)
@@ -945,63 +974,96 @@ async fn cmd_discover(
         }
     }
 
-    if seen.is_empty() {
-        info!("no capmesh capabilities discovered");
-    }
-    for (advert, addr, port) in seen.values() {
+    let mut out = Vec::new();
+    for (advert, addr, port) in seen.into_values() {
         // Resolve the coarse advert's `descr` pointer into the full typed descriptor over the
         // peer's mesh control endpoint (docs/MESH-PROTOCOL.md). A peer that doesn't serve the
-        // endpoint (or is momentarily down) still shows as the coarse advert.
-        match capmesh_mesh::fetch_capability(*addr, *port, &advert.descr).await {
+        // endpoint (or is momentarily down) still surfaces as the coarse advert.
+        match capmesh_mesh::fetch_capability(addr, port, &advert.descr).await {
             Ok(cap) => {
-                // Apply `--dir` against the real ports; skip a capability with no matching port.
-                let ports: Vec<_> = cap.ports.iter().filter(|p| p.matches_dir(dir)).collect();
+                let ports = matching_ports(&cap, dir);
                 if dir.is_some() && ports.is_empty() {
                     continue;
                 }
-                info!(
-                    host = %advert.host,
-                    cap = %advert.cap,
-                    id = %advert.id,
-                    %addr,
+                out.push(DiscoveredCapability {
+                    advert,
+                    addr,
                     port,
-                    ports = ports.len(),
-                    "capability"
-                );
-                for p in ports {
-                    let codecs = p
-                        .formats
-                        .iter()
-                        .map(|f| f.codec.as_str())
-                        .collect::<Vec<_>>()
-                        .join(",");
-                    info!(
-                        id = %advert.id,
-                        port_id = %p.port_id,
-                        dir = p.dir.as_deref().unwrap_or("-"),
-                        r#type = %p.type_,
-                        name = %p.name,
-                        codecs = %codecs,
-                        "  port"
-                    );
-                }
+                    descriptor: Some(cap),
+                    ports,
+                });
             }
-            // Without the descriptor we cannot confirm a `--dir` match, so a dir-filtered
-            // discover skips it; an unfiltered discover still lists the coarse advert.
-            Err(e) if dir.is_none() => info!(
-                host = %advert.host,
-                cap = %advert.cap,
-                dir = %advert.dir,
-                id = %advert.id,
-                %addr,
-                port,
-                descr = %advert.descr,
-                "capability (descriptor unavailable: {e})"
-            ),
+            Err(e) if dir.is_none() => {
+                debug!(id = %advert.id, descr = %advert.descr, "descriptor unavailable: {e:#}");
+                out.push(DiscoveredCapability {
+                    advert,
+                    addr,
+                    port,
+                    descriptor: None,
+                    ports: Vec::new(),
+                });
+            }
+            // Without the descriptor a `dir` match cannot be confirmed, so a dir-filtered browse
+            // skips it.
             Err(e) => debug!(
                 id = %advert.id,
-                "skipping (descriptor unavailable, cannot confirm --dir match): {e:#}"
+                "skipping (descriptor unavailable, cannot confirm dir match): {e:#}"
             ),
+        }
+    }
+    Ok(out)
+}
+
+async fn cmd_discover(
+    timeout_secs: u64,
+    kind: Option<&str>,
+    dir: Option<&str>,
+    host: Option<&str>,
+) -> Result<()> {
+    info!(timeout_secs, "discovering capmesh capabilities");
+    let found = discover_capabilities(timeout_secs, kind, dir, host).await?;
+    if found.is_empty() {
+        info!("no capmesh capabilities discovered");
+    }
+    for d in &found {
+        if d.descriptor.is_some() {
+            info!(
+                host = %d.advert.host,
+                cap = %d.advert.cap,
+                id = %d.advert.id,
+                addr = %d.addr,
+                port = d.port,
+                ports = d.ports.len(),
+                "capability"
+            );
+            for p in &d.ports {
+                let codecs = p
+                    .formats
+                    .iter()
+                    .map(|f| f.codec.as_str())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                info!(
+                    id = %d.advert.id,
+                    port_id = %p.port_id,
+                    dir = p.dir.as_deref().unwrap_or("-"),
+                    r#type = %p.type_,
+                    name = %p.name,
+                    codecs = %codecs,
+                    "  port"
+                );
+            }
+        } else {
+            info!(
+                host = %d.advert.host,
+                cap = %d.advert.cap,
+                dir = %d.advert.dir,
+                id = %d.advert.id,
+                addr = %d.addr,
+                port = d.port,
+                descr = %d.advert.descr,
+                "capability (descriptor unavailable)"
+            );
         }
     }
     Ok(())
@@ -1393,6 +1455,33 @@ mod tests {
             ep: 7420,
             descr: format!("/caps/{host}-{cap}"),
         }
+    }
+
+    #[test]
+    fn matching_ports_applies_the_dir_selector_against_the_descriptor() {
+        // A descriptor with one source port and one sink port. `dir` is matched here (the coarse
+        // advert can't carry it), so the filter picks the requested direction; `None` keeps all.
+        let cap: CapabilityDescriptor = serde_json::from_str(
+            r#"{"id":"h-midi","host":"h","kind":"midi","dir":"duplex","ports":[
+                {"port-id":"kbd-0","kind":"stream","dir":"source","type":"midi","name":"kbd"},
+                {"port-id":"spk-0","kind":"stream","dir":"sink","type":"midi","name":"spk"}
+            ]}"#,
+        )
+        .unwrap();
+
+        let all = matching_ports(&cap, None);
+        assert_eq!(all.len(), 2);
+
+        let sources = matching_ports(&cap, Some("source"));
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].port_id, "kbd-0");
+
+        let sinks = matching_ports(&cap, Some("sink"));
+        assert_eq!(sinks.len(), 1);
+        assert_eq!(sinks[0].port_id, "spk-0");
+
+        // A direction the descriptor doesn't expose yields nothing (→ discover drops it).
+        assert!(matching_ports(&cap, Some("duplex")).is_empty());
     }
 
     #[test]
