@@ -114,8 +114,39 @@ rehearsal assertions:
 Removing the source's `_capmesh._tcp` advert mid-session exercises the `while-advertised`
 teardown: capmeshd issues an unmount and the local virtual port disappears.
 
+## The rehearsal harness (M0-exit gate)
+
+The end-to-end gate is a two-guest `nixosTest` (a `source` node running `nmidi-fake-source` + a
+capmeshd advertising the MIDI source, and an `sc` node auto-mounting it), exposed as `packages`
+rather than `checks` because a NixOS VM test requires the `kvm` system feature — so it runs on a
+**KVM-capable host**, not in a plain `nix flake check`. Four scenarios cover the assertion matrix:
+
+| Package | Fake source | Asserts |
+|---|---|---|
+| `rehearsal-m0` | streams notes | mount `active` + `bytes-in > 0` (SuperCollider hears the notes) |
+| `rehearsal-m0-reject` | `--reject` | mount `failed`, detail contains `rejected` |
+| `rehearsal-m0-keepalive` | `--no-notes` | mount stays `active` past the session timeout, `bytes-in == 0` |
+| `rehearsal-m0-deadpeer` | streams, then stopped | mount `failed`, detail contains `unresponsive` |
+
+Run one (or all) on a KVM host:
+
+```sh
+nix build .#packages.aarch64-linux.rehearsal-m0
+nix build .#packages.aarch64-linux.rehearsal-m0-{reject,keepalive,deadpeer}
+```
+
+Without KVM you can still validate everything up to the boot step — the guest systems build and
+the testScript is type-checked and linted:
+
+```sh
+nix build .#packages.aarch64-linux.rehearsal-m0.driver
+```
+
+The scenarios observe the mount via `capmeshd mount-status --json` (stable kebab-case wire names);
+the failure/keepalive assertion strings are drift-guarded against the daemon wire by nmidid's CI.
+
 ## Status
 
-The SuperCollider-host side is complete and gate-checked (`nix flake check`). The remaining
-M0-exit gate is the end-to-end CI rehearsal harness (a `nixosTest` with two guests / a virtual
-MIDI source), which requires a KVM-capable venue to run.
+The SuperCollider-host side is complete and gate-checked (`nix flake check`), and the full
+rehearsal matrix above is authored and verified up to the boot step. The one remaining M0-exit
+step is to **run** the harness on a KVM-capable venue.
