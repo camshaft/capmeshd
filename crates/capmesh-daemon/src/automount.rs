@@ -112,6 +112,59 @@ pub fn build_mount_spec(
     }
 }
 
+/// How long a derived auto-mount lives (DESIGN §6.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Lifetime {
+    /// Torn down when the source capability stops being advertised (the default). This is the
+    /// mesh's ergonomic case: unplug the source and the local virtual device disappears.
+    #[default]
+    WhileAdvertised,
+    /// Survives advert removal — kept until explicitly unmounted, like a permanent mount (§9).
+    Permanent,
+}
+
+impl Lifetime {
+    /// Classify a rule's optional `lifetime` string (§6.1). `None` and any unrecognized value
+    /// fall back to the default [`Lifetime::WhileAdvertised`] (matching the daemon's prior
+    /// stringly-typed handling); only `"permanent"` selects [`Lifetime::Permanent`].
+    pub fn from_config(s: Option<&str>) -> Self {
+        match s {
+            Some("permanent") => Lifetime::Permanent,
+            _ => Lifetime::WhileAdvertised,
+        }
+    }
+
+    /// Whether a mount with this lifetime is torn down when its source's advert is removed (§6.1).
+    pub fn tears_down_on_unadvertise(self) -> bool {
+        matches!(self, Lifetime::WhileAdvertised)
+    }
+}
+
+/// A live auto-mount the daemon has issued, tracked so it can honor the mount's [`Lifetime`]
+/// when the source's advert is removed (§6.1). The daemon keys these by the source peer's mDNS
+/// fullname — the identifier carried by both the resolve and the remove event.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ActiveAutoMount {
+    /// The data-plane `mount-id` to unmount.
+    pub mount_id: String,
+    /// The capability kind, selecting which local data-plane socket to unmount against.
+    pub kind: String,
+    /// The mount's lifetime — decides whether advert removal tears it down.
+    pub lifetime: Lifetime,
+}
+
+/// Partition a peer's active auto-mounts when its advert is removed (§6.1): the first returned
+/// vec is the `while-advertised` mounts to tear down, the second the `permanent` ones to retain
+/// (they outlive the advert). Pure, so the daemon's `ServiceRemoved` handler is one call plus
+/// the unmount I/O.
+pub fn teardown_on_unadvertise(
+    mounts: Vec<ActiveAutoMount>,
+) -> (Vec<ActiveAutoMount>, Vec<ActiveAutoMount>) {
+    mounts
+        .into_iter()
+        .partition(|m| m.lifetime.tears_down_on_unadvertise())
+}
+
 /// The resolved remote coordinates for an auto-mount, gathered by the discovery layer: the
 /// idempotency `mount_id`, the peer's host-id and IP, its AppleMIDI **control** port (`None`
 /// until the peer's `_apple-midi._udp` record has been seen), and the local virtual name.
@@ -378,6 +431,47 @@ mod tests {
             remote(None), // no _apple-midi._udp record seen yet
         );
         assert_eq!(outcome, AutoMountOutcome::AwaitingControlPort);
+    }
+
+    #[test]
+    fn lifetime_from_config_defaults_to_while_advertised() {
+        assert_eq!(Lifetime::from_config(None), Lifetime::WhileAdvertised);
+        assert_eq!(
+            Lifetime::from_config(Some("while-advertised")),
+            Lifetime::WhileAdvertised
+        );
+        assert_eq!(Lifetime::from_config(Some("permanent")), Lifetime::Permanent);
+        // An unrecognized value falls back to the default rather than failing the mount.
+        assert_eq!(Lifetime::from_config(Some("forever?")), Lifetime::WhileAdvertised);
+    }
+
+    #[test]
+    fn only_while_advertised_tears_down_on_unadvertise() {
+        assert!(Lifetime::WhileAdvertised.tears_down_on_unadvertise());
+        assert!(!Lifetime::Permanent.tears_down_on_unadvertise());
+    }
+
+    #[test]
+    fn teardown_partitions_while_advertised_from_permanent() {
+        let m = |id: &str, lifetime| ActiveAutoMount {
+            mount_id: id.into(),
+            kind: "midi".into(),
+            lifetime,
+        };
+        let mounts = vec![
+            m("a", Lifetime::WhileAdvertised),
+            m("b", Lifetime::Permanent),
+            m("c", Lifetime::WhileAdvertised),
+        ];
+        let (to_unmount, to_retain) = teardown_on_unadvertise(mounts);
+        assert_eq!(
+            to_unmount.iter().map(|m| m.mount_id.as_str()).collect::<Vec<_>>(),
+            ["a", "c"]
+        );
+        assert_eq!(
+            to_retain.iter().map(|m| m.mount_id.as_str()).collect::<Vec<_>>(),
+            ["b"]
+        );
     }
 
     #[test]
