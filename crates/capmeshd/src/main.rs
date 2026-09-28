@@ -12,19 +12,21 @@ mod config;
 
 use anyhow::{Context, Result};
 use capmesh_ctl::{CtlClient, CtlError, Format, LocalEndpoint, MountRole, MountSpec, RemoteEndpoint};
+use capmesh_daemon::automount::{self, AutoMountOutcome, Remote};
 use capmesh_daemon::negotiate;
 use capmesh_daemon::reconcile::{self, Reconciler};
-use capmesh_discovery as discovery;
+use capmesh_discovery::{self as discovery, AppleMidiPeers};
 use capmesh_mesh::server::CapabilityProvider;
 use capmesh_model::CapabilityDescriptor;
 use clap::{Parser, Subcommand};
-use config::Config;
+use config::{Automount, Config};
 use discovery::{CapabilityAdvert, ServiceAdvertiser};
 use mdns_sd::ServiceEvent;
+use std::collections::HashMap;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use tracing::{info, warn};
+use std::sync::{Arc, Mutex};
+use tracing::{debug, info, warn};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -337,6 +339,26 @@ async fn main() -> Result<()> {
     let events = discovery::browse().context("start mDNS browse")?;
     info!("browsing {} for peers", discovery::SERVICE_TYPE);
 
+    // Also browse `_apple-midi._udp` to learn MIDI peers' data-plane control ports, correlated
+    // to capmesh nodes by IP (DESIGN §5); auto-mount reads this when issuing a MIDI mount.
+    let apple_events = discovery::browse_apple_midi().context("start AppleMIDI browse")?;
+    let apple_peers = Arc::new(Mutex::new(AppleMidiPeers::new()));
+
+    // The auto-mount rules + per-kind control sockets + local codecs, shared into each spawned
+    // issuance task (§6.1).
+    let auto = Arc::new(AutoMount {
+        rules: cfg.automount.clone(),
+        sockets: cfg
+            .dataplane
+            .iter()
+            .filter_map(|(k, dp)| dp.socket.clone().map(|s| (k.clone(), s)))
+            .collect(),
+        local_codecs: vec![Format {
+            codec: "midi1".to_string(),
+            params: serde_json::Map::new(),
+        }],
+    });
+
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
@@ -357,7 +379,15 @@ async fn main() -> Result<()> {
                                             cap = %format!("{}/{}", advert.cap, advert.dir),
                                             "resolved capmesh peer"
                                         );
-                                        note_automount_candidates(&cfg, &advert, addr);
+                                        // Issue any matching auto-mounts off the browse loop:
+                                        // fetching the descriptor is network I/O.
+                                        tokio::spawn(try_auto_mount(
+                                            Arc::clone(&auto),
+                                            advert,
+                                            addr,
+                                            svc.get_port(),
+                                            Arc::clone(&apple_peers),
+                                        ));
                                     }
                                     Err(e) => info!(
                                         fullname = %svc.get_fullname(),
@@ -383,6 +413,21 @@ async fn main() -> Result<()> {
                     }
                 }
             }
+            aev = apple_events.recv_async() => {
+                match aev {
+                    Ok(ServiceEvent::ServiceResolved(svc)) => {
+                        if let Some(addr) = discovery::resolved_addr(&svc) {
+                            let control_port = svc.get_port();
+                            apple_peers.lock().unwrap().observe(addr, control_port);
+                            debug!(%addr, control_port, "observed AppleMIDI peer");
+                        }
+                    }
+                    // A removed record leaves a stale entry until re-observed; harmless — a mount
+                    // to a vanished peer just fails and the reconciler/dead-peer detection handle it.
+                    Ok(_) => {}
+                    Err(e) => warn!("AppleMIDI browse channel closed: {e}"),
+                }
+            }
         }
     }
 
@@ -391,25 +436,101 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Match a freshly-resolved peer advert against the config's auto-mount selectors (§6.1) and
-/// log each candidate. This is the discovery-driven half of auto-mount: the coarse advert
-/// carries `kind`/`dir` (matched here), but not the per-port descriptor. Issuing the derived
-/// mount needs the remote port's data-plane port, port-id, and formats — the mesh descriptor
-/// fetch that lands in a later slice — so a matched candidate is surfaced, not yet mounted.
-/// A selector that constrains `port` is intentionally skipped at this stage (no port-id yet).
-fn note_automount_candidates(cfg: &Config, advert: &CapabilityAdvert, addr: IpAddr) {
-    for am in &cfg.automount {
-        if am.selector.matches(&advert.cap, &advert.dir, None) {
-            info!(
-                cap = %advert.cap,
-                dir = %advert.dir,
-                host = %advert.host,
-                %addr,
-                action = %am.action,
-                lifetime = am.lifetime.as_deref().unwrap_or("while-advertised"),
-                "auto-mount candidate matched (§6.1); awaiting descriptor fetch to issue the mount"
-            );
+/// The auto-mount inputs shared into each spawned issuance task: the config's rules, the
+/// per-kind `capmesh-ctl` sockets to issue against, and the local side's preferred codecs.
+struct AutoMount {
+    rules: Vec<Automount>,
+    sockets: HashMap<String, PathBuf>,
+    local_codecs: Vec<Format>,
+}
+
+/// Discovery-driven auto-mount (§6.1): for a freshly-resolved capmesh peer, issue any matching
+/// auto-mount rule. Fetches the peer's descriptor over the mesh endpoint (MESH-PROTOCOL.md),
+/// plans + assembles the mount ([`automount::evaluate`]) using the AppleMIDI control port
+/// correlated by IP, and issues it against the local data-plane daemon's `capmesh-ctl` socket.
+async fn try_auto_mount(
+    auto: Arc<AutoMount>,
+    advert: CapabilityAdvert,
+    addr: IpAddr,
+    ep: u16,
+    apple_peers: Arc<Mutex<AppleMidiPeers>>,
+) {
+    // Coarse match on the advert (kind/dir) before paying for a descriptor fetch.
+    let matched: Vec<&Automount> = auto
+        .rules
+        .iter()
+        .filter(|r| r.selector.matches(&advert.cap, &advert.dir, None))
+        .collect();
+    if matched.is_empty() {
+        return;
+    }
+
+    let Some(socket) = auto.sockets.get(&advert.cap) else {
+        warn!(kind = %advert.cap, "auto-mount: no local data-plane socket configured for this kind");
+        return;
+    };
+
+    let cap = match capmesh_mesh::fetch_capability(addr, ep, &advert.descr).await {
+        Ok(cap) => cap,
+        Err(e) => {
+            warn!(%addr, descr = %advert.descr, "auto-mount: descriptor fetch failed: {e:#}");
+            return;
         }
+    };
+
+    // The AppleMIDI control port for this peer (by IP); may be unknown until its record resolves.
+    let control_port = apple_peers.lock().unwrap().control_port(&addr);
+
+    for rule in matched {
+        let remote = Remote {
+            mount_id: advert.id.clone(),
+            host: advert.host.clone(),
+            addr,
+            control_port,
+            local_name: Some(format!("{} {}", advert.host, advert.cap)),
+        };
+        match automount::evaluate(
+            &rule.action,
+            rule.selector.kind.as_deref(),
+            rule.selector.dir.as_deref(),
+            rule.selector.port.as_deref(),
+            &cap.ports,
+            &auto.local_codecs,
+            remote,
+        ) {
+            AutoMountOutcome::Mount(spec) => {
+                info!(
+                    mount_id = %spec.mount_id,
+                    lifetime = rule.lifetime.as_deref().unwrap_or("while-advertised"),
+                    "auto-mount: issuing"
+                );
+                issue_mount(socket, spec).await;
+            }
+            AutoMountOutcome::AwaitingControlPort => info!(
+                %addr,
+                host = %advert.host,
+                "auto-mount: matched, awaiting the peer's _apple-midi._udp record to learn its control port"
+            ),
+            AutoMountOutcome::Skip(e) => {
+                debug!(action = %rule.action, "auto-mount: rule does not apply: {e}")
+            }
+        }
+    }
+}
+
+/// Issue one mount against a data-plane daemon's `capmesh-ctl` socket. Best-effort: the mount is
+/// idempotent on its `mount-id`, so a transient failure is retried by the next resolve tick.
+async fn issue_mount(socket: &Path, spec: MountSpec) {
+    let mount_id = spec.mount_id.clone();
+    let result = async {
+        let mut client = CtlClient::connect(socket).await?;
+        client.hello().await?;
+        client.mount(&spec).await
+    }
+    .await;
+    match result {
+        Ok(r) => info!(mount_id = %r.mount_id, state = ?r.state, "auto-mount issued"),
+        Err(e) => warn!(%mount_id, socket = %socket.display(), "auto-mount: mount failed: {e:#}"),
     }
 }
 
