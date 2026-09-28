@@ -66,6 +66,48 @@ struct Args {
     log_level: String,
 }
 
+/// The control-plane reply this source sends for an inbound AppleMIDI packet, if
+/// any. Pure (no I/O), so the accept / reject / clock-sync behavior is testable:
+/// an invitation is accepted (`OK`) or, in `reject` mode, declined (`NO`); a `CK0`
+/// clock-sync probe is answered with `CK1` carrying our timestamp; anything else
+/// (e.g. `End`) has no reply.
+fn control_reply(
+    packet: &AppleMidiPacket,
+    reject: bool,
+    ssrc: u32,
+    name: &str,
+    ts: u64,
+) -> Option<AppleMidiPacket> {
+    match packet {
+        AppleMidiPacket::Invitation { token, .. } if reject => {
+            Some(AppleMidiPacket::InvitationRejected {
+                version: APPLEMIDI_VERSION,
+                token: *token,
+                ssrc,
+                name: name.to_string(),
+            })
+        }
+        AppleMidiPacket::Invitation { token, .. } => Some(AppleMidiPacket::InvitationAccepted {
+            version: APPLEMIDI_VERSION,
+            token: *token,
+            ssrc,
+            name: name.to_string(),
+        }),
+        AppleMidiPacket::Synchronization {
+            count: 0,
+            timestamp1,
+            ..
+        } => Some(AppleMidiPacket::Synchronization {
+            ssrc,
+            count: 1,
+            timestamp1: *timestamp1,
+            timestamp2: ts,
+            timestamp3: 0,
+        }),
+        _ => None,
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -136,38 +178,18 @@ async fn main() -> Result<()> {
             recv = control.recv_from(&mut buf) => {
                 let (n, from) = recv.context("control recv")?;
                 let Ok(packet) = AppleMidiPacket::parse(&buf[..n]) else { continue };
+                let ts = (started.elapsed().as_micros() / 100) as u64;
+                if let Some(reply) = control_reply(&packet, args.reject, ssrc, &args.name, ts) {
+                    control.send_to(&reply.to_bytes(), from).await.context("send control reply")?;
+                }
+                // Session-state side effects (kept out of the pure reply logic).
                 match packet {
-                    AppleMidiPacket::Invitation { token, .. } if args.reject => {
-                        let no = AppleMidiPacket::InvitationRejected {
-                            version: APPLEMIDI_VERSION,
-                            token,
-                            ssrc,
-                            name: args.name.clone(),
-                        };
-                        control.send_to(&no.to_bytes(), from).await.context("send reject")?;
+                    AppleMidiPacket::Invitation { .. } if args.reject => {
                         info!("rejected session from {from}");
                     }
-                    AppleMidiPacket::Invitation { token, .. } => {
-                        let accept = AppleMidiPacket::InvitationAccepted {
-                            version: APPLEMIDI_VERSION,
-                            token,
-                            ssrc,
-                            name: args.name.clone(),
-                        };
-                        control.send_to(&accept.to_bytes(), from).await.context("send accept")?;
+                    AppleMidiPacket::Invitation { .. } => {
                         peer_data = Some(SocketAddr::new(from.ip(), from.port() + 1));
                         info!("accepted session from {from}; streaming MIDI");
-                    }
-                    AppleMidiPacket::Synchronization { count: 0, timestamp1, .. } => {
-                        let ts = (started.elapsed().as_micros() / 100) as u64;
-                        let reply = AppleMidiPacket::Synchronization {
-                            ssrc,
-                            count: 1,
-                            timestamp1,
-                            timestamp2: ts,
-                            timestamp3: 0,
-                        };
-                        control.send_to(&reply.to_bytes(), from).await.context("send CK1")?;
                     }
                     AppleMidiPacket::End { .. } => {
                         info!("peer ended the session");
@@ -195,5 +217,100 @@ async fn main() -> Result<()> {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SSRC: u32 = 0xDEAD_BEEF;
+    const NAME: &str = "test-source";
+    const TS: u64 = 1234;
+
+    fn invitation(token: u32) -> AppleMidiPacket {
+        AppleMidiPacket::Invitation {
+            version: APPLEMIDI_VERSION,
+            token,
+            ssrc: 0x0102_0304,
+            name: "inviter".to_string(),
+        }
+    }
+
+    #[test]
+    fn an_invitation_is_accepted_by_default() {
+        let reply = control_reply(&invitation(42), false, SSRC, NAME, TS);
+        match reply {
+            Some(AppleMidiPacket::InvitationAccepted {
+                token, ssrc, name, ..
+            }) => {
+                assert_eq!(token, 42, "reply echoes the inviter's token");
+                assert_eq!(ssrc, SSRC, "reply carries our ssrc");
+                assert_eq!(name, NAME, "reply carries our name");
+            }
+            other => panic!("expected InvitationAccepted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_invitation_is_rejected_in_reject_mode() {
+        let reply = control_reply(&invitation(42), true, SSRC, NAME, TS);
+        match reply {
+            Some(AppleMidiPacket::InvitationRejected { token, ssrc, .. }) => {
+                assert_eq!(token, 42, "rejection echoes the inviter's token");
+                assert_eq!(ssrc, SSRC);
+            }
+            other => panic!("expected InvitationRejected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_ck0_probe_is_answered_with_ck1() {
+        let ck0 = AppleMidiPacket::Synchronization {
+            ssrc: 0x0102_0304,
+            count: 0,
+            timestamp1: 999,
+            timestamp2: 0,
+            timestamp3: 0,
+        };
+        let reply = control_reply(&ck0, false, SSRC, NAME, TS);
+        match reply {
+            Some(AppleMidiPacket::Synchronization {
+                ssrc,
+                count,
+                timestamp1,
+                timestamp2,
+                ..
+            }) => {
+                assert_eq!(ssrc, SSRC, "CK1 carries our ssrc");
+                assert_eq!(count, 1, "CK0 is answered with count 1 (CK1)");
+                assert_eq!(timestamp1, 999, "CK1 echoes the peer's timestamp1");
+                assert_eq!(timestamp2, TS, "CK1 stamps our receive time in timestamp2");
+            }
+            other => panic!("expected Synchronization CK1, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_non_zero_sync_count_has_no_reply() {
+        // Only CK0 opens a probe we answer; a CK1/CK2 in flight is not re-answered.
+        let ck2 = AppleMidiPacket::Synchronization {
+            ssrc: 0x0102_0304,
+            count: 2,
+            timestamp1: 1,
+            timestamp2: 2,
+            timestamp3: 3,
+        };
+        assert!(control_reply(&ck2, false, SSRC, NAME, TS).is_none());
+    }
+
+    #[test]
+    fn an_end_packet_has_no_reply() {
+        let end = AppleMidiPacket::End {
+            version: APPLEMIDI_VERSION,
+            token: 42,
+            ssrc: 0x0102_0304,
+        };
+        assert!(control_reply(&end, false, SSRC, NAME, TS).is_none());
     }
 }
