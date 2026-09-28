@@ -13,17 +13,20 @@
 //! [`SurfaceStore`], so a control-socket push and an HTTP push are identical and
 //! both fan out to attached tabs.
 
-use std::path::Path;
-use std::sync::Arc;
+use std::{path::Path, sync::Arc};
 
 use anyhow::{Context, Result};
 use serde_json::{Map, Value};
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
-use tokio::net::UnixListener;
+use tokio::{
+    io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader},
+    net::UnixListener,
+};
 use tracing::{debug, info, warn};
 
-use crate::inbox::{SurfaceStore, broadcast_view};
-use crate::item::DisplayItem;
+use crate::{
+    inbox::{SurfaceStore, broadcast_view},
+    item::DisplayItem,
+};
 
 /// The single-integer protocol major version this daemon speaks.
 pub const PROTOCOL_MAJOR: u32 = 1;
@@ -214,13 +217,16 @@ impl Session {
 
     fn handle_remove_item(&self, params: &Value) -> Result<Value, CtlError> {
         let id = surface_id(params)?;
-        let item_id = params.get("item-id").and_then(Value::as_str).ok_or_else(|| {
-            CtlError::protocol(
-                INVALID_PARAMS,
-                "invalid-params",
-                "remove-item requires 'item-id'",
-            )
-        })?;
+        let item_id = params
+            .get("item-id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                CtlError::protocol(
+                    INVALID_PARAMS,
+                    "invalid-params",
+                    "remove-item requires 'item-id'",
+                )
+            })?;
         if self.store.remove_item(&id, item_id) {
             Ok(Value::Object(Map::new()))
         } else {

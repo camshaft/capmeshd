@@ -19,8 +19,10 @@
 
 use serde_json::{Value, json};
 
-use crate::inbox::{SurfaceStore, broadcast_view};
-use crate::item::DisplayItem;
+use crate::{
+    inbox::{SurfaceStore, broadcast_view},
+    item::DisplayItem,
+};
 
 /// The MCP protocol version this server implements.
 const PROTOCOL_VERSION: &str = "2024-11-05";
@@ -355,25 +357,52 @@ mod tests {
     fn set_view_tool_focuses_and_clears() {
         let store = SurfaceStore::in_memory();
         // Two items; b is promoted (the current view). Focus a via set_view.
-        let a = store.push("phone", crate::item::DisplayItem::Text { body: "a".into() }, false);
-        store.push("phone", crate::item::DisplayItem::Text { body: "b".into() }, true);
+        let a = store.push(
+            "phone",
+            crate::item::DisplayItem::Text { body: "a".into() },
+            false,
+        );
+        store.push(
+            "phone",
+            crate::item::DisplayItem::Text { body: "b".into() },
+            true,
+        );
         let out = dispatch(
             &store,
-            &req(2, "tools/call", json!({"name":"set_view",
-                "arguments":{"surface-id":"phone","item-id":a.entry.id}})),
+            &req(
+                2,
+                "tools/call",
+                json!({"name":"set_view",
+                "arguments":{"surface-id":"phone","item-id":a.entry.id}}),
+            ),
         )
         .unwrap();
         assert!(out["result"]["isError"].as_bool() != Some(true));
-        assert_eq!(store.snapshot("phone").current_view.as_deref(), Some(a.entry.id.as_str()));
+        assert_eq!(
+            store.snapshot("phone").current_view.as_deref(),
+            Some(a.entry.id.as_str())
+        );
 
         // Clearing (no item-id) resets the view to none.
-        dispatch(&store, &req(3, "tools/call", json!({"name":"set_view","arguments":{"surface-id":"phone"}}))).unwrap();
+        dispatch(
+            &store,
+            &req(
+                3,
+                "tools/call",
+                json!({"name":"set_view","arguments":{"surface-id":"phone"}}),
+            ),
+        )
+        .unwrap();
         assert_eq!(store.snapshot("phone").current_view, None);
 
         // An unknown item is a tool error.
         let bad = dispatch(
             &store,
-            &req(4, "tools/call", json!({"name":"set_view","arguments":{"surface-id":"phone","item-id":"nope"}})),
+            &req(
+                4,
+                "tools/call",
+                json!({"name":"set_view","arguments":{"surface-id":"phone","item-id":"nope"}}),
+            ),
         )
         .unwrap();
         assert_eq!(bad["result"]["isError"], true);
@@ -382,11 +411,19 @@ mod tests {
     #[test]
     fn remove_item_tool_prunes_one() {
         let store = SurfaceStore::in_memory();
-        let pushed = store.push("phone", crate::item::DisplayItem::Text { body: "a".into() }, true);
+        let pushed = store.push(
+            "phone",
+            crate::item::DisplayItem::Text { body: "a".into() },
+            true,
+        );
         let out = dispatch(
             &store,
-            &req(2, "tools/call", json!({"name":"remove_item",
-                "arguments":{"surface-id":"phone","item-id":pushed.entry.id}})),
+            &req(
+                2,
+                "tools/call",
+                json!({"name":"remove_item",
+                "arguments":{"surface-id":"phone","item-id":pushed.entry.id}}),
+            ),
         )
         .unwrap();
         assert!(out["result"]["isError"].as_bool() != Some(true));
@@ -394,8 +431,12 @@ mod tests {
         // Removing an unknown item is a tool error.
         let bad = dispatch(
             &store,
-            &req(3, "tools/call", json!({"name":"remove_item",
-                "arguments":{"surface-id":"phone","item-id":"nope"}})),
+            &req(
+                3,
+                "tools/call",
+                json!({"name":"remove_item",
+                "arguments":{"surface-id":"phone","item-id":"nope"}}),
+            ),
         )
         .unwrap();
         assert_eq!(bad["result"]["isError"], true);

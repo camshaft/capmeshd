@@ -90,13 +90,28 @@ mod tests {
     fn pdf_page_is_optional_and_round_trips() {
         // No page: the field is omitted from the wire form entirely.
         let plain: DisplayItem = serde_json::from_str(r#"{"type":"pdf","url":"u"}"#).unwrap();
-        assert_eq!(plain, DisplayItem::Pdf { url: "u".into(), page: None });
-        assert_eq!(serde_json::to_string(&plain).unwrap(), r#"{"type":"pdf","url":"u"}"#);
+        assert_eq!(
+            plain,
+            DisplayItem::Pdf {
+                url: "u".into(),
+                page: None
+            }
+        );
+        assert_eq!(
+            serde_json::to_string(&plain).unwrap(),
+            r#"{"type":"pdf","url":"u"}"#
+        );
 
         // With a page: carried through and shown in the feed summary.
         let paged: DisplayItem =
             serde_json::from_str(r#"{"type":"pdf","url":"u","page":42}"#).unwrap();
-        assert_eq!(paged, DisplayItem::Pdf { url: "u".into(), page: Some(42) });
+        assert_eq!(
+            paged,
+            DisplayItem::Pdf {
+                url: "u".into(),
+                page: Some(42)
+            }
+        );
         assert!(paged.summary().contains("p.42"));
     }
 }

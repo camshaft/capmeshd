@@ -1,13 +1,10 @@
 //! `surfaced` — serve durable browser surfaces over HTTP/SSE (DESIGN §10.1).
 
-use std::net::SocketAddr;
-use std::sync::Arc;
+use std::{net::SocketAddr, sync::Arc};
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use surfaced::ctl;
-use surfaced::http::router_with_base;
-use surfaced::inbox::SurfaceStore;
+use surfaced::{ctl, http::router_with_base, inbox::SurfaceStore};
 use tracing::{Level, info};
 use tracing_subscriber::FmtSubscriber;
 
