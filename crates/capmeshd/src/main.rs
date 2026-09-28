@@ -418,6 +418,7 @@ async fn main() -> Result<()> {
     // The auto-mount rules + per-kind control sockets + local codecs, shared into each spawned
     // issuance task (§6.1).
     let auto = Arc::new(AutoMount {
+        own_host: host_id.clone(),
         rules: cfg.automount.clone(),
         sockets: cfg
             .dataplane
@@ -584,12 +585,34 @@ struct MountCtx {
     pending: Arc<Mutex<PendingAutoMounts>>,
 }
 
-/// The auto-mount inputs shared into each spawned issuance task: the config's rules, the
-/// per-kind `capmesh-ctl` sockets to issue against, and the local side's preferred codecs.
+/// The auto-mount inputs shared into each spawned issuance task: this host's own id (to skip
+/// self-adverts), the config's rules, the per-kind `capmesh-ctl` sockets to issue against, and
+/// the local side's preferred codecs.
 struct AutoMount {
+    own_host: String,
     rules: Vec<Automount>,
     sockets: HashMap<String, PathBuf>,
     local_codecs: Vec<Format>,
+}
+
+/// The auto-mount rules that apply to a freshly-resolved advert (§6.1): none if the advert is
+/// this daemon's own — a node never mirrors the capability it itself advertises, and it would
+/// otherwise discover its own `_capmesh._tcp` record over multicast and try to mount itself —
+/// otherwise the rules whose `kind` coarse-matches. `dir`/`port` are deliberately not matched
+/// here (the coarse advert can't carry them); they are applied against the fetched descriptor's
+/// real ports by `plan_mount` in `evaluate`.
+fn rules_for_advert<'a>(
+    rules: &'a [Automount],
+    own_host: &str,
+    advert: &CapabilityAdvert,
+) -> Vec<&'a Automount> {
+    if advert.host == own_host {
+        return Vec::new();
+    }
+    rules
+        .iter()
+        .filter(|r| r.selector.coarse_matches(&advert.cap))
+        .collect()
 }
 
 /// Discovery-driven auto-mount (§6.1): for a freshly-resolved capmesh peer, issue any matching
@@ -614,16 +637,9 @@ async fn try_auto_mount(
         pending,
     } = ctx;
 
-    // Coarse pre-fetch filter on KIND only — the host-level advert's `dir` is always the coarse
-    // `duplex` and its port-ids are unknown until the descriptor is fetched, so a `dir`/`port`
-    // selector is applied later against the real ports by `plan_mount` in `evaluate`. Filtering
-    // on `dir`/`port` here would reject a rule (e.g. `dir = "source"`) before the fetch that
-    // could satisfy it.
-    let matched: Vec<&Automount> = auto
-        .rules
-        .iter()
-        .filter(|r| r.selector.coarse_matches(&advert.cap))
-        .collect();
+    // The rules that apply to this advert: skip our own advert, then coarse-filter on kind
+    // (dir/port defer to the descriptor stage). See [`rules_for_advert`].
+    let matched = rules_for_advert(&auto.rules, &auto.own_host, &advert);
     if matched.is_empty() {
         return;
     }
@@ -1308,6 +1324,49 @@ async fn connect_and_hello(socket: &Path) -> Result<CtlClient> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rule(kind: Option<&str>) -> Automount {
+        Automount {
+            selector: config::MatchSelector {
+                kind: kind.map(String::from),
+                port: None,
+                dir: Some("source".into()),
+            },
+            action: "mirror-local".into(),
+            lifetime: Some("while-advertised".into()),
+        }
+    }
+
+    fn advert(host: &str, cap: &str) -> CapabilityAdvert {
+        CapabilityAdvert {
+            cap: cap.into(),
+            dir: "duplex".into(),
+            id: format!("{host}-{cap}"),
+            host: host.into(),
+            ep: 7420,
+            descr: format!("/caps/{host}-{cap}"),
+        }
+    }
+
+    #[test]
+    fn rules_for_advert_skips_our_own_advert() {
+        let rules = vec![rule(Some("midi"))];
+        // A node must not auto-mount the capability it itself advertises, even though the rule's
+        // kind matches — it would discover its own `_capmesh._tcp` record over multicast.
+        assert!(rules_for_advert(&rules, "sc-host", &advert("sc-host", "midi")).is_empty());
+    }
+
+    #[test]
+    fn rules_for_advert_matches_a_foreign_peer_by_kind() {
+        let rules = vec![rule(Some("midi"))];
+        // A foreign peer whose kind matches → the rule applies (dir/port defer to the descriptor).
+        assert_eq!(
+            rules_for_advert(&rules, "sc-host", &advert("source-host", "midi")).len(),
+            1
+        );
+        // Wrong kind → no rule applies, even for a foreign peer.
+        assert!(rules_for_advert(&rules, "sc-host", &advert("source-host", "audio")).is_empty());
+    }
 
     /// `caps_for_kind` builds a capability descriptor from a data-plane daemon's live
     /// `list-ports` (the mesh endpoint's per-request projection). Exercised against a fake
