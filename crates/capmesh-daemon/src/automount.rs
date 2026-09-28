@@ -179,6 +179,19 @@ pub fn teardown_on_unadvertise(
         .partition(|m| m.lifetime.tears_down_on_unadvertise())
 }
 
+/// Record one just-issued auto-mount in a peer's tracking vec, keyed by `mount_id` (§6.1). A
+/// `mount_id` is the data-plane idempotency key, so the same mount can be re-issued by concurrent
+/// resolve tasks or by two rules matching one advert; this keeps the registry at one entry per
+/// `mount_id` so `ServiceRemoved` teardown never fires a redundant unmount. Returns `true` if the
+/// mount was newly tracked, `false` if an entry with that `mount_id` was already present.
+pub fn track_active_mount(tracked: &mut Vec<ActiveAutoMount>, mount: ActiveAutoMount) -> bool {
+    if tracked.iter().any(|m| m.mount_id == mount.mount_id) {
+        return false;
+    }
+    tracked.push(mount);
+    true
+}
+
 /// The resolved remote coordinates for an auto-mount, gathered by the discovery layer: the
 /// idempotency `mount_id`, the peer's host-id and IP, its AppleMIDI **control** port (`None`
 /// until the peer's `_apple-midi._udp` record has been seen), and the local virtual name.
@@ -494,6 +507,29 @@ mod tests {
         assert_eq!(
             to_retain.iter().map(|m| m.mount_id.as_str()).collect::<Vec<_>>(),
             ["b"]
+        );
+    }
+
+    #[test]
+    fn track_active_mount_dedups_on_mount_id() {
+        let m = |id: &str| ActiveAutoMount {
+            mount_id: id.into(),
+            kind: "midi".into(),
+            lifetime: Lifetime::WhileAdvertised,
+        };
+        let mut tracked = Vec::new();
+
+        // First issuance of a mount-id is tracked.
+        assert!(track_active_mount(&mut tracked, m("kbd-0")));
+        // A distinct mount-id (a second capability on the same peer) is also tracked.
+        assert!(track_active_mount(&mut tracked, m("kbd-1")));
+        // Re-issuing the same mount-id — a concurrent resolve task or a second matching rule —
+        // is a no-op, so `ServiceRemoved` teardown never fires a redundant unmount.
+        assert!(!track_active_mount(&mut tracked, m("kbd-0")));
+
+        assert_eq!(
+            tracked.iter().map(|m| m.mount_id.as_str()).collect::<Vec<_>>(),
+            ["kbd-0", "kbd-1"]
         );
     }
 

@@ -1,12 +1,15 @@
 //! capmeshd — the LAN capability mesh control-plane daemon (DESIGN.md).
 //!
-//! M0b slice: stateless control plane, MIDI-first. The default invocation runs the
-//! daemon: it loads the §4.1 TOML config, advertises this host's configured capability
-//! kinds over `_capmesh._tcp`, and browses the mesh — logging discovered peers by the IP
-//! from their mDNS record (§5). The `probe-ctl` subcommand drives a data-plane daemon's
-//! `capmesh-ctl` socket ([`ctl`]) directly (hello + list-ports), the first integration
-//! point of the `midi` adapter against a live `nmidid`. The desired-mount reconciler and
-//! the control API land in following slices.
+//! Stateless control plane, MIDI-first. The default invocation runs the daemon: it loads the
+//! §4.1 TOML config, advertises this host's configured capability kinds over `_capmesh._tcp`,
+//! browses the mesh (correlating each peer's `_apple-midi._udp` control port by IP, §5), and
+//! auto-mounts any discovered peer matching an `[[automount]]` rule — fetching the peer's typed
+//! descriptor, negotiating a format, and issuing the mount to the local data-plane daemon, then
+//! tearing `while-advertised` mounts down when the source's advert is removed (§6.1). The
+//! subcommands drive a data-plane daemon's `capmesh-ctl` socket ([`ctl`]) directly: `probe-ctl`
+//! (hello + list-ports), `connect`/`connect-discover` (mount by explicit coordinates or by mesh
+//! selector), `mount-status`, and `unmount`. Desired (`permanent`) mounts are reconciled by
+//! [`reconcile::Reconciler`].
 
 mod config;
 
@@ -689,16 +692,15 @@ async fn try_auto_mount(
                 // Track the mount only once it is actually issued, so a `while-advertised`
                 // teardown never chases a mount that never landed (§6.1).
                 if issue_mount(socket, spec).await {
-                    active_mounts
-                        .lock()
-                        .unwrap()
-                        .entry(fullname.clone())
-                        .or_default()
-                        .push(ActiveAutoMount {
+                    let mut reg = active_mounts.lock().unwrap();
+                    automount::track_active_mount(
+                        reg.entry(fullname.clone()).or_default(),
+                        ActiveAutoMount {
                             mount_id,
                             kind: advert.cap.clone(),
                             lifetime,
-                        });
+                        },
+                    );
                 }
             }
             AutoMountOutcome::AwaitingControlPort => {
