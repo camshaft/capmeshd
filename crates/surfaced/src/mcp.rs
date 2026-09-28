@@ -1,4 +1,10 @@
-//! An embedded **MCP server** so an agent can drive surfaces (DESIGN §7 `send`).
+//! An embedded **MCP server** so an agent can drive surfaces (DESIGN §7.1 / §10.1).
+//!
+//! This is a data-plane daemon's own MCP: per DESIGN §7.1 each data daemon exposes
+//! its own data verbs on its own MCP (surfaced's are `send_item` / `list_surfaces`
+//! / `list_items`, §10.1), while the control-plane and the federating MCP gateway
+//! (§7.2) are separate concerns — capmeshd advertises this server as a `cap=mcp`
+//! backend and the gateway federates it; surfaced only serves it.
 //!
 //! surfaced exposes a Model Context Protocol endpoint at `/mcp` (Streamable HTTP:
 //! the agent POSTs JSON-RPC 2.0 messages and gets a JSON response). It shares the
