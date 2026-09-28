@@ -103,6 +103,39 @@ enum Cmd {
         #[arg(long)]
         mount_id: Option<String>,
     },
+    /// Discover a capability by selector and connect it in one command (§6.1/§7): browses the
+    /// mesh, selects the single matching capability, learns its address, port, control port, and
+    /// codecs by itself, then mounts. The discovery-driven form of `connect` — no manual
+    /// `--remote-addr`/`--remote-port`/`--remote-port-id`/`--remote-codec`.
+    ConnectDiscover {
+        /// Path to the local data-plane daemon's Unix control socket (e.g. /run/nmidid.sock).
+        #[arg(long)]
+        socket: PathBuf,
+        /// Select by capability kind (e.g. `midi`); omit to match any kind.
+        #[arg(long)]
+        kind: Option<String>,
+        /// Select by advertising host-id; omit to match any host.
+        #[arg(long)]
+        host: Option<String>,
+        /// Select by exact capability id; pins one capability when kind/host are ambiguous.
+        #[arg(long)]
+        id: Option<String>,
+        /// The role the local daemon materializes (§3.1).
+        #[arg(long, default_value = "mirror-source")]
+        role: String,
+        /// Display name for the local virtual device (mirror roles).
+        #[arg(long)]
+        local_name: Option<String>,
+        /// Local codecs in preference order (the consuming side); defaults to [midi1].
+        #[arg(long = "local-codec")]
+        local_codecs: Vec<String>,
+        /// How long to browse for the capability + its data-plane record before giving up.
+        #[arg(long, default_value_t = 5)]
+        timeout_secs: u64,
+        /// Mount id (idempotency key); defaults to the capability id.
+        #[arg(long)]
+        mount_id: Option<String>,
+    },
     /// Establish a mount on a daemon (§3): create/attach a p2p link to a remote port.
     Mount(MountArgs),
     /// Tear a mount down (§3).
@@ -246,6 +279,30 @@ async fn main() -> Result<()> {
                 local_name.clone(),
                 local_codecs,
                 remote_codecs,
+                mount_id.clone(),
+            )
+            .await;
+        }
+        Some(Cmd::ConnectDiscover {
+            socket,
+            kind,
+            host,
+            id,
+            role,
+            local_name,
+            local_codecs,
+            timeout_secs,
+            mount_id,
+        }) => {
+            return cmd_connect_discover(
+                socket,
+                kind.as_deref(),
+                host.as_deref(),
+                id.as_deref(),
+                role,
+                local_name.clone(),
+                local_codecs,
+                *timeout_secs,
                 mount_id.clone(),
             )
             .await;
@@ -1012,6 +1069,108 @@ async fn cmd_connect(
     let mut client = connect_and_hello(socket).await?;
     let res = client.mount(&spec).await.context("mount")?;
     info!(mount_id = %res.mount_id, state = ?res.state, "connected");
+    Ok(())
+}
+
+/// Browse the mesh for `timeout_secs`, collecting resolved capmesh adverts (deduped by id, with
+/// their address + control endpoint) and the AppleMIDI control ports seen, correlated by IP (§5).
+/// The discovery-driven connect uses this to learn a target's coordinates from mDNS alone.
+async fn discover_targets(
+    timeout_secs: u64,
+) -> Result<(Vec<(CapabilityAdvert, IpAddr, u16)>, AppleMidiPeers)> {
+    let events = discovery::browse().context("start capmesh mDNS browse")?;
+    let apple_events = discovery::browse_apple_midi().context("start AppleMIDI browse")?;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    let mut seen: std::collections::BTreeMap<String, (CapabilityAdvert, IpAddr, u16)> =
+        std::collections::BTreeMap::new();
+    let mut apple = AppleMidiPeers::new();
+
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep_until(deadline) => break,
+            ev = events.recv_async() => match ev {
+                Ok(ServiceEvent::ServiceResolved(svc)) => {
+                    if let (Some(addr), Ok(advert)) =
+                        (discovery::resolved_addr(&svc), discovery::advert_from_resolved(&svc))
+                    {
+                        seen.insert(advert.id.clone(), (advert, addr, svc.get_port()));
+                    }
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            },
+            aev = apple_events.recv_async() => match aev {
+                Ok(ServiceEvent::ServiceResolved(svc)) => {
+                    if let Some(addr) = discovery::resolved_addr(&svc) {
+                        apple.observe(addr, svc.get_port());
+                    }
+                }
+                Ok(_) => {}
+                Err(_) => {}
+            },
+        }
+    }
+    Ok((seen.into_values().collect(), apple))
+}
+
+/// Discover a capability by selector and connect it in one command (§6.1/§7). Browses the mesh,
+/// [`select_one`](discovery::select_one)s the single matching capability (erroring on none or
+/// ambiguity rather than guessing), fetches its descriptor, plans the mount against the local
+/// codecs, correlates the AppleMIDI control port by IP, and issues the mount — the manual
+/// `connect` with every remote coordinate learned from discovery.
+#[allow(clippy::too_many_arguments)]
+async fn cmd_connect_discover(
+    socket: &Path,
+    kind: Option<&str>,
+    host: Option<&str>,
+    id: Option<&str>,
+    role: &str,
+    local_name: Option<String>,
+    local_codecs: &[String],
+    timeout_secs: u64,
+    mount_id: Option<String>,
+) -> Result<()> {
+    info!(timeout_secs, ?kind, ?host, ?id, "discovering a capability to connect");
+    let (targets, apple) = discover_targets(timeout_secs).await?;
+    let adverts: Vec<CapabilityAdvert> = targets.iter().map(|(a, _, _)| a.clone()).collect();
+    let chosen = discovery::select_one(&adverts, kind, None, host, id)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let (advert, addr, ep) = targets
+        .iter()
+        .find(|(a, _, _)| a.id == chosen.id)
+        .expect("the chosen advert came from the discovered targets");
+    info!(host = %advert.host, cap = %advert.cap, id = %advert.id, %addr, ep,
+        "selected capability");
+
+    let cap = capmesh_mesh::fetch_capability(*addr, *ep, &advert.descr)
+        .await
+        .with_context(|| format!("fetch descriptor for capability {}", advert.id))?;
+
+    let local = codecs_to_formats(local_codecs);
+    let plan = automount::plan_mount(role, kind, None, None, &cap.ports, &local)
+        .map_err(|e| anyhow::anyhow!("cannot plan a mount for {}: {e}", advert.id))?;
+    info!(port_id = %plan.port_id, codec = %plan.format.codec, "planned mount");
+
+    let control_port = apple.control_port(addr).ok_or_else(|| {
+        anyhow::anyhow!(
+            "no _apple-midi._udp record seen for {addr} within {timeout_secs}s; \
+             the peer's data-plane control port is unknown (try a longer --timeout-secs)"
+        )
+    })?;
+
+    let mount_id = mount_id.unwrap_or_else(|| advert.id.clone());
+    let spec = automount::build_mount_spec(
+        plan,
+        mount_id,
+        advert.host.clone(),
+        *addr,
+        control_port,
+        local_name,
+    );
+
+    let mut client = connect_and_hello(socket).await?;
+    let res = client.mount(&spec).await.context("mount")?;
+    info!(mount_id = %res.mount_id, state = ?res.state, "connected (discovered)");
     Ok(())
 }
 
