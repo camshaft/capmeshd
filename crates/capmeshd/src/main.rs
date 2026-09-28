@@ -860,9 +860,12 @@ async fn cmd_discover(
             _ = tokio::time::sleep_until(deadline) => break,
             ev = events.recv_async() => match ev {
                 Ok(ServiceEvent::ServiceResolved(svc)) => {
+                    // Filter on kind + host at the advert stage only — the coarse advert's `dir`
+                    // is always `duplex`, so `--dir` is applied against the descriptor's real
+                    // ports below, after the fetch (mirrors the auto-mount coarse/plan split).
                     if let (Some(addr), Ok(advert)) =
                         (discovery::resolved_addr(&svc), discovery::advert_from_resolved(&svc))
-                        && advert.matches(kind, dir, host)
+                        && advert.matches(kind, None, host)
                     {
                         seen.insert(advert.id.clone(), (advert, addr, svc.get_port()));
                     }
@@ -882,16 +885,21 @@ async fn cmd_discover(
         // endpoint (or is momentarily down) still shows as the coarse advert.
         match capmesh_mesh::fetch_capability(*addr, *port, &advert.descr).await {
             Ok(cap) => {
+                // Apply `--dir` against the real ports; skip a capability with no matching port.
+                let ports: Vec<_> = cap.ports.iter().filter(|p| p.matches_dir(dir)).collect();
+                if dir.is_some() && ports.is_empty() {
+                    continue;
+                }
                 info!(
                     host = %advert.host,
                     cap = %advert.cap,
                     id = %advert.id,
                     %addr,
                     port,
-                    ports = cap.ports.len(),
+                    ports = ports.len(),
                     "capability"
                 );
-                for p in &cap.ports {
+                for p in ports {
                     let codecs = p
                         .formats
                         .iter()
@@ -909,7 +917,9 @@ async fn cmd_discover(
                     );
                 }
             }
-            Err(e) => info!(
+            // Without the descriptor we cannot confirm a `--dir` match, so a dir-filtered
+            // discover skips it; an unfiltered discover still lists the coarse advert.
+            Err(e) if dir.is_none() => info!(
                 host = %advert.host,
                 cap = %advert.cap,
                 dir = %advert.dir,
@@ -918,6 +928,10 @@ async fn cmd_discover(
                 port,
                 descr = %advert.descr,
                 "capability (descriptor unavailable: {e})"
+            ),
+            Err(e) => debug!(
+                id = %advert.id,
+                "skipping (descriptor unavailable, cannot confirm --dir match): {e:#}"
             ),
         }
     }
