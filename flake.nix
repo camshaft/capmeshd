@@ -79,6 +79,61 @@
           packages.nmidid = nmidid;
           packages.surfaced = surfaced;
 
+          # M0 rehearsal harness (nixosTest). Exposed under `packages` (NOT `checks`) because a
+          # NixOS VM test requires the `kvm` system feature, so it runs on a KVM-capable CI host
+          # (`nix build .#packages.<system>.rehearsal-m0`), not in a plain `nix flake check`.
+          # Locally verifiable up to the boot step: `nix build .#packages.<system>.rehearsal-m0.driver`
+          # builds the guest system + test driver and type-checks/lints the testScript without KVM.
+          #
+          # This first slice is the SuperCollider-host co-deploy smoke (docs/M0-DEMO.md): the
+          # capmesh + nmidid co-deploy boots, both services come up, and the auto-mount rule is
+          # rendered into the daemon config. The cross-host discovery→auto-mount→active e2e (with a
+          # fake MIDI source node) is the next slice, pending the source-node topology with v-nmidid.
+          packages.rehearsal-m0 = pkgs.testers.runNixOSTest {
+            name = "capmesh-m0-rehearsal";
+            nodes.sc = { config, ... }: {
+              imports = [ self.nixosModules.capmesh self.nixosModules.nmidid ];
+              # mDNS substrate (the capmesh module's advertise/browse relies on Avahi) and virtual
+              # MIDI so nmidid has ports to serve.
+              services.avahi.enable = true;
+              services.avahi.publish.enable = true;
+              services.avahi.publish.userServices = true;
+              boot.kernelModules = [ "snd-virmidi" ];
+
+              services.nmidid = {
+                enable = true;
+                socket = "/run/nmidid/nmidid.sock";
+                socketGroup = config.services.capmesh.group;
+                allowedGroups = [ config.services.capmesh.group ];
+              };
+              services.capmesh = {
+                enable = true;
+                hostId = "sc-host";
+                advertise.midi.enable = true;
+                advertise.midi.socket = config.services.nmidid.socket;
+                automount = [{
+                  match = { kind = "midi"; dir = "source"; };
+                  action = "mirror-local";
+                  lifetime = "while-advertised";
+                }];
+              };
+            };
+            testScript = ''
+              sc.start()
+              # The co-deploy comes up: the data-plane daemon, then the control plane.
+              sc.wait_for_unit("nmidid.service")
+              sc.wait_for_unit("capmesh.service")
+              # The rendered §4.1 config carries the auto-mount headline rule (§6.1).
+              sc.succeed("test -f /etc/capmesh/capmesh.toml")
+              sc.succeed("grep -q '\\[\\[automount\\]\\]' /etc/capmesh/capmesh.toml")
+              sc.succeed("grep -q 'action = \"mirror-local\"' /etc/capmesh/capmesh.toml")
+              # capmeshd serves its mesh control endpoint on the advertised port (7420).
+              sc.wait_for_open_port(7420)
+              # The control plane is browsing + serving (not crash-looping).
+              sc.succeed("systemctl is-active capmesh.service")
+            '';
+          };
+
           checks.clippy = capmeshd.overrideAttrs (old: {
             pname = "${old.pname}-clippy";
             nativeBuildInputs = (old.nativeBuildInputs or [ ]) ++ [ pkgs.clippy ];
