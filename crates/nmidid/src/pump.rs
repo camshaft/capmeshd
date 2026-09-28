@@ -1,16 +1,29 @@
 //! The RTP-MIDI data-path pump for a `mirror-source` mount.
 //!
-//! [`RtpConnector`] spawns a task that acts as the AppleMIDI *inviter*: it
-//! completes the `IN`/`OK` handshake to the remote source, then receives
-//! RTP-MIDI and forwards each MIDI message into the mount's local virtual sink,
-//! driving the mount `connecting → active` and accumulating `bytes-in`. This is
-//! the piece that makes a remote keyboard actually play a local instrument.
+//! [`RtpConnector`] spawns a task that acts as the AppleMIDI *inviter* and makes
+//! a remote keyboard play a local instrument. Its lifecycle:
 //!
-//! Packets are gated by RTP sequence number ([`SeqGate`]) so a reordered or
-//! duplicated datagram never replays already-played MIDI; the rest forward as
-//! they arrive. Timestamp-accurate scheduling (full AppleMIDI clock sync) is a
-//! refinement: today we respond to the remote's clock-sync probes minimally,
-//! which is correct for live play.
+//! 1. **Handshake.** Invite the remote's control channel (`IN`) and await `OK`,
+//!    retrying on timeout; an explicit `NO` fails the mount immediately. Only
+//!    once the control channel is accepted do we invite the data channel (the
+//!    order AppleMIDI expects). The mount is `connecting` until this completes,
+//!    then `active`.
+//! 2. **Forwarding.** Each received RTP-MIDI message is forwarded into the local
+//!    virtual sink, accumulating `bytes-in`. Packets are gated by RTP sequence
+//!    number ([`SeqGate`]) so a reordered or duplicated datagram never replays
+//!    already-played MIDI. (MIDI running status is expanded during parsing in
+//!    `nmidi-core`.)
+//! 3. **Clock-sync.** As the session initiator we *drive* clock-sync: we send our
+//!    own `CK0` periodically and complete the exchange on the peer's `CK1` with
+//!    `CK2`, and we also answer a peer-initiated `CK0` with `CK1`. This is the
+//!    keep-alive a live session relies on. (Timestamp-accurate *scheduling* —
+//!    offset-based playout — is a deliberate non-goal; we forward as packets
+//!    arrive, which is correct for live play.)
+//! 4. **Liveness.** If the remote goes silent past the session timeout (no data
+//!    and no clock-sync response), the mount fails so capmeshd re-reconciles.
+//! 5. **Teardown.** On unmount/daemon-shutdown (cancel) or a remote `End`, we send
+//!    `End` (BY) to the peer and drop the sink (releasing the virtual port),
+//!    transitioning the mount `torn-down`.
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
