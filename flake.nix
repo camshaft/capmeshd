@@ -209,6 +209,67 @@
               cp rendered.toml $out
             '';
 
+          # The M0 demo's single-host co-deploy (docs/M0-DEMO.md): capmeshd + nmidid on the
+          # SuperCollider host, wired so the auto-mount headline path works and both §9 trust
+          # gates (file-perm + peer-cred) admit the co-located capmeshd. Gate-checks the runbook.
+          checks.m0-demo-codeploy =
+            let
+              demo = nixpkgs.lib.nixosSystem {
+                inherit system;
+                modules = [
+                  self.nixosModules.capmesh
+                  self.nixosModules.nmidid
+                  ({ config, ... }: {
+                    boot.loader.grub.enable = false;
+                    fileSystems."/" = { device = "none"; fsType = "tmpfs"; };
+                    system.stateVersion = "24.11";
+                    # MIDI data-plane daemon: its 0660 control socket is group-owned by the shared
+                    # capmesh group (file-perm gate) and it admits peers in that group (peer-cred).
+                    services.nmidid = {
+                      enable = true;
+                      socket = "/run/nmidid/nmidid.sock";
+                      socketGroup = config.services.capmesh.group;
+                      allowedGroups = [ config.services.capmesh.group ];
+                    };
+                    # Control plane: advertise the local MIDI capability and auto-mount a remote
+                    # MIDI source as a local virtual source (the M0 headline path).
+                    services.capmesh = {
+                      enable = true;
+                      hostId = "sc-host";
+                      advertise.midi.enable = true;
+                      advertise.midi.socket = config.services.nmidid.socket;
+                      automount = [{
+                        match = { kind = "midi"; dir = "source"; };
+                        action = "mirror-local";
+                        lifetime = "while-advertised";
+                      }];
+                    };
+                  })
+                ];
+              };
+              nmididExec = toString (demo.config.systemd.services.nmidid.serviceConfig.ExecStart or "");
+              nmididGroup = toString (demo.config.systemd.services.nmidid.serviceConfig.Group or "");
+              capmeshSup = toString (demo.config.systemd.services.capmesh.serviceConfig.SupplementaryGroups or [ ]);
+            in
+            pkgs.runCommand "capmesh-m0-demo-codeploy"
+              {
+                inherit nmididExec nmididGroup capmeshSup;
+              } ''
+              cp ${demo.config.environment.etc."capmesh/capmesh.toml".source} rendered.toml
+              cat rendered.toml
+              # The auto-mount headline path is configured on the SC host.
+              grep -q '\[\[automount\]\]' rendered.toml
+              grep -q 'action = "mirror-local"' rendered.toml
+              # §9 co-deploy: both gates point at the one shared group, so the co-located capmeshd
+              # (SupplementaryGroups=capmesh) can open nmidid's 0660 socket AND pass its peer-cred check.
+              printf 'nmidid Group=%s capmesh sup=%s\n  nmidid ExecStart=%s\n' \
+                "$nmididGroup" "$capmeshSup" "$nmididExec"
+              [ "$nmididGroup" = "capmesh" ]
+              [ "$capmeshSup" = "capmesh" ]
+              echo "$nmididExec" | grep -q -- '--allow-group capmesh'
+              cp rendered.toml $out
+            '';
+
           devShells.default = pkgs.mkShell {
             packages = [ pkgs.cargo pkgs.rustc pkgs.clippy pkgs.rustfmt pkgs.rust-analyzer ];
           };
