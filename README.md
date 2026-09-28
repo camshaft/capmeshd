@@ -41,8 +41,11 @@ phased plan from MIDI outward. The daemon↔daemon control wire is frozen in
 [`docs/CONTROL-PROTOCOL.md`](docs/CONTROL-PROTOCOL.md) (capmesh-ctl).
 
 **First milestone (M0):** a physical MIDI device plugged into one host plays a SuperCollider
-instance on another host, cross-OS (CoreMIDI ↔ ALSA), wired from one command — proving the whole
-shape end-to-end.
+instance on another host, cross-OS (CoreMIDI ↔ ALSA), wired from one command — or, with an
+`automount` rule, appearing **unasked** as the source comes on the LAN. See the
+[M0 demo runbook](docs/M0-DEMO.md) for the deployable config and the step-by-step. The
+peer-to-peer descriptor-fetch wire (how a browser resolves a coarse advert into a typed
+capability) is [`docs/MESH-PROTOCOL.md`](docs/MESH-PROTOCOL.md).
 
 ## Usage
 
@@ -60,8 +63,9 @@ Global options: `--config` (path to the §4.1 TOML, default `/etc/capmesh/capmes
 | Command | What it does |
 | --- | --- |
 | *(none)* | Run the daemon: advertise this host's capabilities, browse the mesh, and reconcile the config's permanent mounts. |
-| `discover` | Browse the mesh and list discovered capabilities (§7). Filter with `--kind` / `--dir` / `--host`; `--timeout-secs` bounds the browse. |
-| `connect` | Negotiate a format then mount a remote source onto a local mount in one step (§4, §7). |
+| `discover` | Browse the mesh and list discovered capabilities (§7). Filter with `--kind` / `--host`; `--dir` filters on the descriptor's real ports; `--timeout-secs` bounds the browse. |
+| `connect` | Negotiate a format then mount a remote source onto a local mount in one step (§4, §7), given the remote coordinates (`--remote-addr`/`--remote-port`/`--remote-port-id`) explicitly. |
+| `connect-discover` | Discover a capability by `--kind`/`--host`/`--id` and mount it in one command — learns the address, control port, port, and codecs itself (§6.1/§7). The port direction defaults from `--role`; `--dir`/`--port` override it. |
 | `mount` | Establish a mount on a daemon (§3): create/attach a p2p link to a remote port. |
 | `unmount` | Tear a mount down by `--mount-id` (§3). |
 | `mount-status` | Print live mounts on a daemon (§3); restrict with `--mount-id`. |
@@ -80,7 +84,11 @@ capmeshd probe-ctl --socket /run/nmidid.sock
 # Discover MIDI sources on the mesh.
 capmeshd discover --kind midi --dir source
 
-# Mount a remote source locally (addr is the peer's mDNS IP, never a .local name).
+# Discover + mount a capability in one command — no manual coordinates (learns addr, control
+# port, port, and codecs itself; binds the source port for a mirror-source role).
+capmeshd connect-discover --socket /run/nmidid.sock --kind midi --role mirror-source
+
+# Or mount a remote source by explicit coordinates (addr is the peer's mDNS IP, never a .local name).
 capmeshd mount --socket /run/nmidid.sock \
   --remote-host green-machine --remote-addr 192.168.1.23 \
   --remote-port 5004 --remote-port-id kbd-0
@@ -94,9 +102,12 @@ capmeshd reconcile --socket /run/nmidid.sock \
 ## Deploy (NixOS)
 
 The flake ships a `services.capmesh` module (`nixosModules.capmesh`, also `.default`). It renders
-the §4.1 TOML declaratively and runs `capmeshd` as a systemd service; `permanentMounts` are
-reconciled every boot for self-heal (DESIGN §9). Pair it with `services.nmidid` on hosts that serve
-MIDI. Deployable from [`dotfiles`](https://github.com/camshaft/dotfiles) via Colmena.
+the §4.1 TOML declaratively and runs `capmeshd` as a systemd service. `automount` rules mount any
+matching discovered capability with no manual step (§6.1, the headline path); `permanentMounts` are
+reconciled every boot for self-heal (§9). Pair it with `services.nmidid` on hosts that serve MIDI —
+wire both §8 trust gates to the shared group (`socketGroup` + `allowedGroups`). Deployable from
+[`dotfiles`](https://github.com/camshaft/dotfiles) via Colmena. See the
+[M0 demo runbook](docs/M0-DEMO.md) for the full co-deploy config.
 
 ```nix
 services.capmesh = {
@@ -107,6 +118,13 @@ services.capmesh = {
     enable = true;
     socket = "/run/nmidid.sock";                          # the nmidid control socket
   };
+  # Auto-mount any discovered remote MIDI source as a local virtual source — the headline
+  # path, no manual mount; torn down when the source stops advertising (§6.1).
+  automount = [{
+    match = { kind = "midi"; dir = "source"; };
+    action = "mirror-local";
+    lifetime = "while-advertised";
+  }];
   # Desired mounts, reconciled on every boot — connect by IP, never a .local name (§5).
   permanentMounts = [{
     localName = "studio keyboard";
