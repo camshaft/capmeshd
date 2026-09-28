@@ -602,11 +602,15 @@ async fn try_auto_mount(
         pending,
     } = ctx;
 
-    // Coarse match on the advert (kind/dir) before paying for a descriptor fetch.
+    // Coarse pre-fetch filter on KIND only — the host-level advert's `dir` is always the coarse
+    // `duplex` and its port-ids are unknown until the descriptor is fetched, so a `dir`/`port`
+    // selector is applied later against the real ports by `plan_mount` in `evaluate`. Filtering
+    // on `dir`/`port` here would reject a rule (e.g. `dir = "source"`) before the fetch that
+    // could satisfy it.
     let matched: Vec<&Automount> = auto
         .rules
         .iter()
-        .filter(|r| r.selector.matches(&advert.cap, &advert.dir, None))
+        .filter(|r| r.selector.coarse_matches(&advert.cap))
         .collect();
     if matched.is_empty() {
         return;
