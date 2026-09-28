@@ -41,6 +41,12 @@ struct Args {
     #[arg(long, default_value = "500")]
     note_interval_ms: u64,
 
+    /// Accept the session and answer clock-sync, but emit no MIDI. Lets a
+    /// rehearsal assert that a live-but-silent source keeps the mount `active`
+    /// via clock-sync alone (rather than being torn down as unresponsive).
+    #[arg(long)]
+    no_notes: bool,
+
     /// Session name advertised in the invitation reply and the mDNS service.
     #[arg(long, default_value = "nmidi-fake-source")]
     name: String,
@@ -156,7 +162,7 @@ async fn main() -> Result<()> {
                 }
             }
             _ = ticker.tick() => {
-                if let Some(dest) = peer_data {
+                if let Some(dest) = peer_data.filter(|_| !args.no_notes) {
                     let note = NOTES[(step / 2) % NOTES.len()];
                     let on = step.is_multiple_of(2);
                     let midi = if on {
