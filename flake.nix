@@ -83,56 +83,100 @@
           # NixOS VM test requires the `kvm` system feature, so it runs on a KVM-capable CI host
           # (`nix build .#packages.<system>.rehearsal-m0`), not in a plain `nix flake check`.
           # Locally verifiable up to the boot step: `nix build .#packages.<system>.rehearsal-m0.driver`
-          # builds the guest system + test driver and type-checks/lints the testScript without KVM.
+          # builds both guest systems + the test driver and type-checks/lints the testScript
+          # without KVM.
           #
-          # This first slice is the SuperCollider-host co-deploy smoke (docs/M0-DEMO.md): the
-          # capmesh + nmidid co-deploy boots, both services come up, and the auto-mount rule is
-          # rendered into the daemon config. The cross-host discovery→auto-mount→active e2e (with a
-          # fake MIDI source node) is the next slice, pending the source-node topology with v-nmidid.
-          packages.rehearsal-m0 = pkgs.testers.runNixOSTest {
-            name = "capmesh-m0-rehearsal";
-            nodes.sc = { config, ... }: {
-              imports = [ self.nixosModules.capmesh self.nixosModules.nmidid ];
-              # mDNS substrate (the capmesh module's advertise/browse relies on Avahi) and virtual
-              # MIDI so nmidid has ports to serve.
-              services.avahi.enable = true;
-              services.avahi.publish.enable = true;
-              services.avahi.publish.userServices = true;
-              boot.kernelModules = [ "snd-virmidi" ];
+          # The cross-host M0 headline path (docs/M0-DEMO.md): a `source` host advertises a MIDI
+          # source; the `sc` (SuperCollider) host discovers it and auto-mounts it — unasked — onto
+          # its local nmidid. Asserting capmeshd's "auto-mount issued" log on `sc` proves the whole
+          # SC-side path end-to-end: mDNS discovery → descriptor fetch → AppleMIDI control-port
+          # correlation (by IP) → plan → issue-and-accept. (The RTP data-plane "active + bytes-in"
+          # assertion is a v-nmidid-owned follow-up.)
+          packages.rehearsal-m0 =
+            let
+              # Shared per-host bits: the mDNS substrate (capmesh advertise/browse relies on Avahi)
+              # and virtual MIDI so nmidid has real ports to project into a descriptor.
+              midiHost = { config, ... }: {
+                imports = [ self.nixosModules.capmesh self.nixosModules.nmidid ];
+                services.avahi.enable = true;
+                services.avahi.publish.enable = true;
+                services.avahi.publish.userServices = true;
+                boot.kernelModules = [ "snd-virmidi" ];
+                services.nmidid = {
+                  enable = true;
+                  socket = "/run/nmidid/nmidid.sock";
+                  socketGroup = config.services.capmesh.group;
+                  allowedGroups = [ config.services.capmesh.group ];
+                };
+                services.capmesh = {
+                  enable = true;
+                  advertise.midi.enable = true;
+                  advertise.midi.socket = config.services.nmidid.socket;
+                };
+              };
+            in
+            pkgs.testers.runNixOSTest {
+              name = "capmesh-m0-rehearsal";
+              nodes = {
+                # The source host: a self-contained fake RTP-MIDI source (advertises
+                # `_apple-midi._udp` itself) plus a capmeshd advertising the `_capmesh._tcp`
+                # midi/source capability (descriptor projected from the local nmidid). The two
+                # records are correlated by IP on the SC side. No automount here — it only serves.
+                source = { config, ... }: {
+                  imports = [ midiHost ];
+                  services.capmesh.hostId = "source-host";
+                  # The RTP-MIDI session the SC host pulls from: control port 5008, data 5009,
+                  # streaming notes so bytes-in grows. Advertises `_apple-midi._udp` on the LAN.
+                  systemd.services.fake-source = {
+                    wantedBy = [ "multi-user.target" ];
+                    after = [ "network-online.target" "avahi-daemon.service" ];
+                    wants = [ "network-online.target" ];
+                    serviceConfig = {
+                      ExecStart = "${config.services.nmidid.package}/bin/nmidi-fake-source"
+                        + " --bind 0.0.0.0 --port 5008 --note-interval-ms 100";
+                      Restart = "on-failure";
+                      RestartSec = 2;
+                    };
+                  };
+                };
+                # The SuperCollider host: the co-deploy that auto-mounts a discovered MIDI source.
+                sc = { ... }: {
+                  imports = [ midiHost ];
+                  services.capmesh.hostId = "sc-host";
+                  services.capmesh.automount = [{
+                    match = { kind = "midi"; dir = "source"; };
+                    action = "mirror-local";
+                    lifetime = "while-advertised";
+                  }];
+                };
+              };
+              testScript = ''
+                start_all()
 
-              services.nmidid = {
-                enable = true;
-                socket = "/run/nmidid/nmidid.sock";
-                socketGroup = config.services.capmesh.group;
-                allowedGroups = [ config.services.capmesh.group ];
-              };
-              services.capmesh = {
-                enable = true;
-                hostId = "sc-host";
-                advertise.midi.enable = true;
-                advertise.midi.socket = config.services.nmidid.socket;
-                automount = [{
-                  match = { kind = "midi"; dir = "source"; };
-                  action = "mirror-local";
-                  lifetime = "while-advertised";
-                }];
-              };
+                # Both hosts come up (co-deploy: data-plane daemon, then control plane).
+                for m in (source, sc):
+                    m.wait_for_unit("nmidid.service")
+                    m.wait_for_unit("capmesh.service")
+                    m.wait_for_open_port(7420)  # capmesh mesh control endpoint
+                source.wait_for_unit("fake-source.service")
+
+                # The SC host renders the auto-mount headline rule (§6.1).
+                sc.succeed("grep -q '\\[\\[automount\\]\\]' /etc/capmesh/capmesh.toml")
+
+                # The SC host discovers the source peer over mDNS.
+                sc.wait_until_succeeds(
+                    "journalctl -u capmesh.service | grep -q 'resolved capmesh peer'", timeout=90
+                )
+
+                # ...and auto-issues a mirror-source mount to its local nmidid. This one line proves
+                # the whole SC-side path: only a successful descriptor fetch + AppleMIDI control-port
+                # correlation (by IP) + plan lets `evaluate` reach Mount and log "auto-mount issued";
+                # a missing apple-midi record would log "awaiting" instead.
+                sc.wait_until_succeeds(
+                    "journalctl -u capmesh.service | grep -q 'auto-mount issued'", timeout=120
+                )
+              '';
             };
-            testScript = ''
-              sc.start()
-              # The co-deploy comes up: the data-plane daemon, then the control plane.
-              sc.wait_for_unit("nmidid.service")
-              sc.wait_for_unit("capmesh.service")
-              # The rendered §4.1 config carries the auto-mount headline rule (§6.1).
-              sc.succeed("test -f /etc/capmesh/capmesh.toml")
-              sc.succeed("grep -q '\\[\\[automount\\]\\]' /etc/capmesh/capmesh.toml")
-              sc.succeed("grep -q 'action = \"mirror-local\"' /etc/capmesh/capmesh.toml")
-              # capmeshd serves its mesh control endpoint on the advertised port (7420).
-              sc.wait_for_open_port(7420)
-              # The control plane is browsing + serving (not crash-looping).
-              sc.succeed("systemctl is-active capmesh.service")
-            '';
-          };
 
           checks.clippy = capmeshd.overrideAttrs (old: {
             pname = "${old.pname}-clippy";
