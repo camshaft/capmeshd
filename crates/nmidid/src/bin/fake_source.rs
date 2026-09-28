@@ -47,6 +47,11 @@ struct Args {
     #[arg(long)]
     no_notes: bool,
 
+    /// Reject every invitation with `NO` instead of accepting. Lets a rehearsal
+    /// assert the mount fails fast with a `rejected` detail (CONTROL-PROTOCOL).
+    #[arg(long)]
+    reject: bool,
+
     /// Session name advertised in the invitation reply and the mDNS service.
     #[arg(long, default_value = "nmidi-fake-source")]
     name: String,
@@ -132,6 +137,16 @@ async fn main() -> Result<()> {
                 let (n, from) = recv.context("control recv")?;
                 let Ok(packet) = AppleMidiPacket::parse(&buf[..n]) else { continue };
                 match packet {
+                    AppleMidiPacket::Invitation { token, .. } if args.reject => {
+                        let no = AppleMidiPacket::InvitationRejected {
+                            version: APPLEMIDI_VERSION,
+                            token,
+                            ssrc,
+                            name: args.name.clone(),
+                        };
+                        control.send_to(&no.to_bytes(), from).await.context("send reject")?;
+                        info!("rejected session from {from}");
+                    }
                     AppleMidiPacket::Invitation { token, .. } => {
                         let accept = AppleMidiPacket::InvitationAccepted {
                             version: APPLEMIDI_VERSION,

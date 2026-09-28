@@ -79,6 +79,7 @@ nmidi-fake-source --bind 127.0.0.1 --port 5008 --note-interval-ms 100
 | `--port <port>` | `5008` | Control port; the **data port is `port + 1`** (AppleMIDI convention). |
 | `--note-interval-ms <ms>` | `500` | Cadence of emitted MIDI notes. |
 | `--no-notes` | *(off)* | Accept + answer clock-sync but emit no MIDI (test clock-sync keep-alive). |
+| `--reject` | *(off)* | Reject every invitation with `NO` (test the mount reject → `failed` path). |
 | `--name <str>` | `nmidi-fake-source` | Session name in the invitation reply and the mDNS service. |
 | `--no-advertise` | *(off)* | Suppress the `_apple-midi._udp` mDNS advertisement. |
 | `--log-level <lvl>` | `info` | Log verbosity. |
