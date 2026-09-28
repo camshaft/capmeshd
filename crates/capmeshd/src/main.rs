@@ -17,7 +17,7 @@ use capmesh_daemon::automount::{
 };
 use capmesh_daemon::negotiate;
 use capmesh_daemon::reconcile::{self, Reconciler};
-use capmesh_discovery::{self as discovery, AppleMidiPeers};
+use capmesh_discovery::{self as discovery, AppleMidiPeers, PendingAutoMounts, PendingPeer};
 use capmesh_mesh::server::CapabilityProvider;
 use capmesh_model::CapabilityDescriptor;
 use clap::{Parser, Subcommand};
@@ -366,6 +366,19 @@ async fn main() -> Result<()> {
     // mounted across advert removal.
     let active_mounts: ActiveMounts = Arc::new(Mutex::new(HashMap::new()));
 
+    // Peers whose auto-mount matched but await their AppleMIDI control port (§6.1). Drained +
+    // re-tried when the peer's `_apple-midi._udp` record resolves, so a capmesh advert that
+    // arrives before the apple-midi record does not wait for the next mDNS re-resolve.
+    let pending: Arc<Mutex<PendingAutoMounts>> = Arc::new(Mutex::new(PendingAutoMounts::new()));
+
+    // The shared context cloned into each spawned auto-mount task (Arc clones are cheap).
+    let ctx = MountCtx {
+        auto: Arc::clone(&auto),
+        apple_peers: Arc::clone(&apple_peers),
+        active_mounts: Arc::clone(&active_mounts),
+        pending: Arc::clone(&pending),
+    };
+
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
@@ -389,13 +402,11 @@ async fn main() -> Result<()> {
                                         // Issue any matching auto-mounts off the browse loop:
                                         // fetching the descriptor is network I/O.
                                         tokio::spawn(try_auto_mount(
-                                            Arc::clone(&auto),
+                                            ctx.clone(),
                                             advert,
                                             addr,
                                             svc.get_port(),
-                                            Arc::clone(&apple_peers),
                                             svc.get_fullname().to_string(),
-                                            Arc::clone(&active_mounts),
                                         ));
                                     }
                                     Err(e) => info!(
@@ -455,6 +466,20 @@ async fn main() -> Result<()> {
                             let control_port = svc.get_port();
                             apple_peers.lock().unwrap().observe(addr, control_port);
                             debug!(%addr, control_port, "observed AppleMIDI peer");
+                            // Re-try any auto-mounts that matched this peer but were awaiting its
+                            // control port — now known — instead of waiting for a capmesh re-resolve.
+                            let waiting = pending.lock().unwrap().take(&addr);
+                            for p in waiting {
+                                debug!(%addr, fullname = %p.fullname,
+                                    "auto-mount: control port learned, re-trying pending peer");
+                                tokio::spawn(try_auto_mount(
+                                    ctx.clone(),
+                                    p.advert,
+                                    addr,
+                                    p.ep,
+                                    p.fullname,
+                                ));
+                            }
                         }
                     }
                     // A removed record leaves a stale entry until re-observed; harmless — a mount
@@ -476,6 +501,17 @@ async fn main() -> Result<()> {
 /// spawned issuance task.
 type ActiveMounts = Arc<Mutex<HashMap<String, Vec<ActiveAutoMount>>>>;
 
+/// The shared, cheaply-cloneable context every auto-mount task needs: the rules+sockets+codecs,
+/// the AppleMIDI control-port map, the issued-mount registry (for lifetime teardown), and the
+/// awaiting-control-port parking (for the apple-midi re-trigger). Cloned into each spawned task.
+#[derive(Clone)]
+struct MountCtx {
+    auto: Arc<AutoMount>,
+    apple_peers: Arc<Mutex<AppleMidiPeers>>,
+    active_mounts: ActiveMounts,
+    pending: Arc<Mutex<PendingAutoMounts>>,
+}
+
 /// The auto-mount inputs shared into each spawned issuance task: the config's rules, the
 /// per-kind `capmesh-ctl` sockets to issue against, and the local side's preferred codecs.
 struct AutoMount {
@@ -488,15 +524,24 @@ struct AutoMount {
 /// auto-mount rule. Fetches the peer's descriptor over the mesh endpoint (MESH-PROTOCOL.md),
 /// plans + assembles the mount ([`automount::evaluate`]) using the AppleMIDI control port
 /// correlated by IP, and issues it against the local data-plane daemon's `capmesh-ctl` socket.
+///
+/// If the peer's control port is not known yet (its `_apple-midi._udp` record has not resolved),
+/// the peer is parked in `pending`; the apple-midi resolve handler re-runs this the moment the
+/// port is learned, so a capmesh advert arriving first does not wait for the next mDNS re-resolve.
 async fn try_auto_mount(
-    auto: Arc<AutoMount>,
+    ctx: MountCtx,
     advert: CapabilityAdvert,
     addr: IpAddr,
     ep: u16,
-    apple_peers: Arc<Mutex<AppleMidiPeers>>,
     fullname: String,
-    active_mounts: ActiveMounts,
 ) {
+    let MountCtx {
+        auto,
+        apple_peers,
+        active_mounts,
+        pending,
+    } = ctx;
+
     // Coarse match on the advert (kind/dir) before paying for a descriptor fetch.
     let matched: Vec<&Automount> = auto
         .rules
@@ -523,6 +568,7 @@ async fn try_auto_mount(
     // The AppleMIDI control port for this peer (by IP); may be unknown until its record resolves.
     let control_port = apple_peers.lock().unwrap().control_port(&addr);
 
+    let mut awaiting_control_port = false;
     for rule in matched {
         let remote = Remote {
             mount_id: advert.id.clone(),
@@ -559,15 +605,31 @@ async fn try_auto_mount(
                         });
                 }
             }
-            AutoMountOutcome::AwaitingControlPort => info!(
-                %addr,
-                host = %advert.host,
-                "auto-mount: matched, awaiting the peer's _apple-midi._udp record to learn its control port"
-            ),
+            AutoMountOutcome::AwaitingControlPort => {
+                awaiting_control_port = true;
+                info!(
+                    %addr,
+                    host = %advert.host,
+                    "auto-mount: matched, awaiting the peer's _apple-midi._udp record to learn its control port"
+                );
+            }
             AutoMountOutcome::Skip(e) => {
                 debug!(action = %rule.action, "auto-mount: rule does not apply: {e}")
             }
         }
+    }
+
+    // Park the peer so the `_apple-midi._udp` resolve re-triggers it the moment the control port
+    // is known, rather than waiting for the next capmesh re-resolve (§6.1).
+    if awaiting_control_port {
+        pending.lock().unwrap().record(
+            addr,
+            PendingPeer {
+                advert,
+                ep,
+                fullname,
+            },
+        );
     }
 }
 

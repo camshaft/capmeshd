@@ -247,6 +247,50 @@ impl AppleMidiPeers {
     }
 }
 
+/// A capmesh peer whose auto-mount rule matched but which is waiting on the peer's AppleMIDI
+/// **control** port — its `_apple-midi._udp` record has not resolved yet (DESIGN §6.1). Holds
+/// exactly what the daemon needs to re-run auto-mount once that record arrives.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PendingPeer {
+    /// The peer's capmesh advert (kind/dir/id/host/descr).
+    pub advert: CapabilityAdvert,
+    /// The peer's capmesh control endpoint port (its `_capmesh._tcp` SRV port), for the descriptor fetch.
+    pub ep: u16,
+    /// The peer's mDNS fullname, so a re-issued mount is tracked under the same key.
+    pub fullname: String,
+}
+
+/// Peers whose auto-mount matched but await their AppleMIDI control port, keyed by IP — the join
+/// to an incoming `_apple-midi._udp` record ([`AppleMidiPeers`]). When that record resolves the
+/// daemon [`take`](Self::take)s the peers here for that IP and re-runs auto-mount (now the control
+/// port is known), instead of waiting for the next `_capmesh._tcp` re-resolve. Deduplicated by
+/// fullname so a capmesh re-resolve arriving before the apple-midi record does not stack copies.
+#[derive(Debug, Clone, Default)]
+pub struct PendingAutoMounts {
+    by_addr: HashMap<IpAddr, Vec<PendingPeer>>,
+}
+
+impl PendingAutoMounts {
+    /// A fresh, empty registry.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record a peer awaiting its control port at `addr`. A prior entry with the same fullname at
+    /// this addr is replaced (a re-resolve refreshes rather than duplicates).
+    pub fn record(&mut self, addr: IpAddr, peer: PendingPeer) {
+        let peers = self.by_addr.entry(addr).or_default();
+        peers.retain(|p| p.fullname != peer.fullname);
+        peers.push(peer);
+    }
+
+    /// Remove and return every peer awaiting a control port at `addr` — called when that addr's
+    /// `_apple-midi._udp` record resolves. Empty if none were waiting.
+    pub fn take(&mut self, addr: &IpAddr) -> Vec<PendingPeer> {
+        self.by_addr.remove(addr).unwrap_or_default()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -323,5 +367,41 @@ mod tests {
 
         peers.forget(&a);
         assert_eq!(peers.control_port(&a), None); // peer went away
+    }
+
+    fn pending(fullname: &str) -> PendingPeer {
+        PendingPeer {
+            advert: sample(),
+            ep: 7420,
+            fullname: fullname.into(),
+        }
+    }
+
+    #[test]
+    fn pending_take_drains_the_addr() {
+        let a: IpAddr = "192.168.1.23".parse().unwrap();
+        let b: IpAddr = "192.168.1.99".parse().unwrap();
+        let mut p = PendingAutoMounts::new();
+        assert!(p.take(&a).is_empty()); // nothing waiting
+
+        p.record(a, pending("host-midi-1"));
+        p.record(b, pending("other-midi-1")); // unrelated addr untouched
+
+        let drained = p.take(&a);
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].fullname, "host-midi-1");
+        assert!(p.take(&a).is_empty()); // take removed it
+        assert_eq!(p.take(&b).len(), 1); // b still waiting
+    }
+
+    #[test]
+    fn pending_record_dedups_by_fullname() {
+        let a: IpAddr = "192.168.1.23".parse().unwrap();
+        let mut p = PendingAutoMounts::new();
+        p.record(a, pending("host-midi-1"));
+        p.record(a, pending("host-midi-1")); // same peer re-resolved → refresh, not stack
+        p.record(a, pending("host-midi-2")); // a distinct peer at the same addr is kept
+        let drained = p.take(&a);
+        assert_eq!(drained.len(), 2);
     }
 }
