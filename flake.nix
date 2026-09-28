@@ -174,9 +174,10 @@
           #
           # Scenarios (built by `rehearsalScenarios`, which fixes the topology and varies only the
           # fake source's flags + the trailing assertion):
-          #   rehearsal-m0        — source streams notes → mount active + bytes-in > 0 (headline).
-          #   rehearsal-m0-reject — source refuses the invitation → mount failed, detail "rejected".
-          # The `--no-notes` (keepalive) and dead-peer (unresponsive) scenarios are a later slice.
+          #   rehearsal-m0           — source streams notes → mount active + bytes-in > 0 (headline).
+          #   rehearsal-m0-reject    — source refuses the invitation → mount failed, detail "rejected".
+          #   rehearsal-m0-keepalive — source --no-notes → mount stays active past the timeout, bytes-in 0.
+          #   rehearsal-m0-deadpeer  — source vanishes mid-session → mount failed, detail "unresponsive".
           # Happy path: the source streams notes, the mount reaches active and bytes flow — the M0
           # headline (SuperCollider would hear the keyboard).
           packages.rehearsal-m0 = rehearsalScenarios {
@@ -209,6 +210,58 @@
               sc.wait_until_succeeds(
                   "capmeshd mount-status --socket /run/nmidid/nmidid.sock --json | grep -q rejected",
                   timeout=90,
+              )
+            '';
+          };
+
+          # Keepalive: the source accepts + clock-syncs but sends NO notes. The mount reaches active
+          # and STAYS active past the session timeout with bytes-in == 0 — the initiator keepalive
+          # holds the RTP session open, so dead-peer detection must not false-positive on a
+          # responsive-but-silent source.
+          packages.rehearsal-m0-keepalive = rehearsalScenarios {
+            name = "capmesh-m0-keepalive";
+            fakeSourceArgs = "--no-notes";
+            tail = ''
+
+              import time
+              sc.wait_until_succeeds(
+                  "capmeshd mount-status --socket /run/nmidid/nmidid.sock --json | grep -q '\"state\":\"active\"'",
+                  timeout=90,
+              )
+              # Past the ~30s session timeout the mount is STILL active (keepalive), not failed,
+              # and no notes have arrived.
+              time.sleep(40)
+              sc.succeed(
+                  "capmeshd mount-status --socket /run/nmidid/nmidid.sock --json | grep -q '\"state\":\"active\"'"
+              )
+              sc.succeed(
+                  "capmeshd mount-status --socket /run/nmidid/nmidid.sock --json | grep -q '\"bytes-in\":0'"
+              )
+            '';
+          };
+
+          # Dead peer: the source streams and the mount goes active, then the source vanishes. Its
+          # RTP session stops responding, so after the session timeout the mount fails with an
+          # "unresponsive" detail (rather than lingering active).
+          packages.rehearsal-m0-deadpeer = rehearsalScenarios {
+            name = "capmesh-m0-deadpeer";
+            fakeSourceArgs = "--note-interval-ms 100";
+            tail = ''
+
+              sc.wait_until_succeeds(
+                  "capmeshd mount-status --socket /run/nmidid/nmidid.sock --json | grep -q '\"state\":\"active\"'",
+                  timeout=90,
+              )
+              # The source disappears; nmidid's RTP session to it goes silent.
+              source.succeed("systemctl stop fake-source.service")
+              # After the ~30s session timeout the mount transitions to failed/unresponsive.
+              sc.wait_until_succeeds(
+                  "capmeshd mount-status --socket /run/nmidid/nmidid.sock --json | grep -q '\"state\":\"failed\"'",
+                  timeout=60,
+              )
+              sc.wait_until_succeeds(
+                  "capmeshd mount-status --socket /run/nmidid/nmidid.sock --json | grep -q unresponsive",
+                  timeout=60,
               )
             '';
           };
