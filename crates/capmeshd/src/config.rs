@@ -48,9 +48,10 @@ pub struct Config {
     #[serde(default)]
     pub dataplane: HashMap<String, Dataplane>,
 
-    /// Auto-mount selectors (DESIGN §6.1). Parsed now; the reconciler consumes them at M1.
+    /// Auto-mount rules (DESIGN §6.1): each is consumed by the daemon's discovery-driven
+    /// auto-mount pass, which evaluates every rule against each discovered, descriptor-fetched
+    /// peer and issues the derived mount (see `main.rs` `try_auto_mount`).
     #[serde(default)]
-    #[allow(dead_code)] // consumed by the reconciler's auto-mount pass (M1)
     pub automount: Vec<Automount>,
 
     /// Permanent desired mounts (DESIGN §9) — reconciled at startup + on drift.
@@ -322,6 +323,34 @@ port-id = "kbd-0"
         let pm = &cfg.permanent_mounts[0];
         assert_eq!(pm.remote.port_id, "kbd-0");
         assert_eq!(pm.remote.addr, "192.168.1.23".parse::<IpAddr>().unwrap());
+    }
+
+    #[test]
+    fn parses_the_module_rendered_automount_subtable_form() {
+        // The exact shape the NixOS module emits for an auto-mount rule (pkgs.formats.toml
+        // renders `match` as an [automount.match] subtable, not an inline table) — pins
+        // renderer↔parser for §6.1 the same way the permanent-mount test does for §9.
+        let cfg = Config::parse(
+            r#"
+host-id = "check-host"
+
+[[automount]]
+action = "mirror-local"
+lifetime = "while-advertised"
+
+[automount.match]
+dir = "source"
+kind = "midi"
+"#,
+        )
+        .expect("parse module-rendered automount form");
+        assert_eq!(cfg.automount.len(), 1);
+        let am = &cfg.automount[0];
+        assert_eq!(am.selector.kind.as_deref(), Some("midi"));
+        assert_eq!(am.selector.dir.as_deref(), Some("source"));
+        assert_eq!(am.selector.port, None); // unset in the rule → matches any port
+        assert_eq!(am.action, "mirror-local");
+        assert_eq!(am.lifetime.as_deref(), Some("while-advertised"));
     }
 
     #[test]

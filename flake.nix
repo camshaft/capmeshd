@@ -161,6 +161,11 @@
                         enable = true;
                         socket = "/run/nmidid.sock";
                       };
+                      automount = [{
+                        match = { kind = "midi"; dir = "source"; };
+                        action = "mirror-local";
+                        lifetime = "while-advertised";
+                      }];
                       permanentMounts = [{
                         localName = "studio keyboard";
                         remote = {
@@ -191,6 +196,11 @@
               grep -q '\[\[permanent-mount\]\]' rendered.toml
               grep -q 'port-id = "kbd-0"' rendered.toml
               grep -q 'addr = "192.168.1.23"' rendered.toml
+              # §6.1 auto-mount rule: the [[automount]] table with its match selector + action.
+              grep -q '\[\[automount\]\]' rendered.toml
+              grep -q 'action = "mirror-local"' rendered.toml
+              grep -q 'kind = "midi"' rendered.toml
+              grep -q 'lifetime = "while-advertised"' rendered.toml
               # §8 trust boundary: capmesh group joined, group declared, sandbox kept.
               printf 'SupplementaryGroups=%s DynamicUser=%s hasGroup=%s\n' "$supGroups" "$dynUser" "$hasGroup"
               [ "$supGroups" = "capmesh" ]
