@@ -140,20 +140,17 @@ pub struct MatchSelector {
 }
 
 impl MatchSelector {
-    /// Whether a discovered capability matches this selector (§6.1): each `Some` field must
-    /// equal the corresponding capability attribute; a `None` field matches anything.
+    /// Coarse pre-fetch match (§6.1): whether this selector's `kind` admits a discovered
+    /// capability, using only the field the host-level `_capmesh._tcp` advert carries reliably.
     ///
-    /// `kind` and `dir` are known from the coarse `_capmesh._tcp` advert; `port_id` is only
-    /// known once the capability's descriptor has been fetched, so it is `None` at the advert
-    /// stage. A selector that constrains `port` therefore does **not** match on advert alone —
-    /// it can only be satisfied after descriptor resolution, which is exactly the intent.
-    pub fn matches(&self, kind: &str, dir: &str, port_id: Option<&str>) -> bool {
+    /// The advert's `dir` is always coarse — a data-plane kind can expose both source and sink
+    /// ports, so the host-level advert reports `duplex` — and `port` (a port-id) is not known
+    /// until the descriptor is fetched. So `dir` and `port` are deliberately NOT matched here;
+    /// they are applied against the descriptor's real ports when the mount is planned (see
+    /// `capmesh_daemon::automount::plan_mount`). Matching them at this stage would reject a rule (e.g.
+    /// `dir = "source"`) before the fetch that could satisfy it. A `None` `kind` admits anything.
+    pub fn coarse_matches(&self, kind: &str) -> bool {
         self.kind.as_deref().is_none_or(|k| k == kind)
-            && self.dir.as_deref().is_none_or(|d| d == dir)
-            && match &self.port {
-                None => true,
-                Some(want) => port_id == Some(want.as_str()),
-            }
     }
 }
 
@@ -228,38 +225,37 @@ lifetime = "while-advertised"
     }
 
     #[test]
-    fn selector_matches_on_kind_and_dir() {
+    fn coarse_matches_filters_on_kind_only() {
         let sel = MatchSelector {
             kind: Some("midi".into()),
             dir: Some("source".into()),
             port: None,
         };
-        // kind + dir match, no port constraint → matches at the advert stage.
-        assert!(sel.matches("midi", "source", None));
-        assert!(sel.matches("midi", "source", Some("kbd-0"))); // port ignored when unconstrained
-        assert!(!sel.matches("audio", "source", None)); // wrong kind
-        assert!(!sel.matches("midi", "sink", None)); // wrong dir
+        // Coarse (pre-fetch) match is kind-only: `dir`/`port` are applied later against the
+        // fetched descriptor's real ports, so a dir-constrained rule must still pass the coarse
+        // filter (the host advert's dir is always the coarse `duplex`).
+        assert!(sel.coarse_matches("midi"));
+        assert!(!sel.coarse_matches("audio")); // wrong kind
     }
 
     #[test]
-    fn empty_selector_matches_anything() {
+    fn coarse_matches_empty_kind_admits_anything() {
         let sel = MatchSelector { kind: None, dir: None, port: None };
-        assert!(sel.matches("midi", "source", None));
-        assert!(sel.matches("audio", "sink", Some("out-3")));
+        assert!(sel.coarse_matches("midi"));
+        assert!(sel.coarse_matches("audio"));
     }
 
     #[test]
-    fn port_constrained_selector_needs_a_known_port_id() {
+    fn coarse_matches_ignores_a_port_constraint() {
+        // A port-constrained rule must pass the coarse filter (port-id is unknown pre-fetch);
+        // the port is matched against the descriptor when the mount is planned.
         let sel = MatchSelector {
             kind: Some("midi".into()),
             dir: None,
             port: Some("kbd-0".into()),
         };
-        // At the advert stage the port-id is unknown → a port-constrained selector must NOT
-        // match yet; it can only be satisfied after descriptor resolution.
-        assert!(!sel.matches("midi", "source", None));
-        assert!(sel.matches("midi", "source", Some("kbd-0")));
-        assert!(!sel.matches("midi", "source", Some("other"))); // wrong port-id
+        assert!(sel.coarse_matches("midi"));
+        assert!(!sel.coarse_matches("audio"));
     }
 
     #[test]
