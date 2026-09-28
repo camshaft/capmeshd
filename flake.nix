@@ -282,10 +282,11 @@
               supGroups = toString (sys.config.systemd.services.capmesh.serviceConfig.SupplementaryGroups or [ ]);
               dynUser = pkgs.lib.boolToString (sys.config.systemd.services.capmesh.serviceConfig.DynamicUser or false);
               hasGroup = pkgs.lib.boolToString (sys.config.users.groups ? capmesh);
+              rustLog = sys.config.systemd.services.capmesh.environment.RUST_LOG or "";
             in
             pkgs.runCommand "capmesh-module-render"
               {
-                inherit supGroups dynUser hasGroup;
+                inherit supGroups dynUser hasGroup rustLog;
               } ''
               cp ${sys.config.environment.etc."capmesh/capmesh.toml".source} rendered.toml
               cat rendered.toml
@@ -305,6 +306,9 @@
               [ "$supGroups" = "capmesh" ]
               [ "$dynUser" = "true" ]
               [ "$hasGroup" = "true" ]
+              # Log verbosity is set declaratively (defaults to info) via RUST_LOG.
+              printf 'RUST_LOG=%s\n' "$rustLog"
+              [ "$rustLog" = "info" ]
               cp rendered.toml $out
             '';
 
