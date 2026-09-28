@@ -14,8 +14,7 @@
 //! A surface is created on first touch (attach or push), so a surface is
 //! visibly real end-to-end without a prior `create-surface` call.
 
-use std::convert::Infallible;
-use std::sync::Arc;
+use std::{convert::Infallible, sync::Arc};
 
 use axum::{
     Json, Router,
@@ -30,9 +29,11 @@ use axum::{
 use serde_json::{Value, json};
 use tokio_stream::{StreamExt, wrappers::BroadcastStream};
 
-use crate::inbox::{PushRequest, SurfaceEvent, SurfaceStore, ViewRequest, broadcast_view};
-use crate::mcp;
-use crate::page::{SURFACE_CSS, SURFACE_HTML, SURFACE_JS};
+use crate::{
+    inbox::{PushRequest, SurfaceEvent, SurfaceStore, ViewRequest, broadcast_view},
+    mcp,
+    page::{SURFACE_CSS, SURFACE_HTML, SURFACE_JS},
+};
 
 /// Router state: the shared store, the page HTML pre-rendered with the
 /// `<base href>` for the configured mount prefix (so the page's relative asset
@@ -391,10 +392,8 @@ async fn events(
     // Tell a buffering reverse proxy (nginx and friends honor this) NOT to hold
     // the SSE bytes back: without it, live view/item events can be withheld until
     // the connection closes, so an attached tab appears to update only on reload.
-    resp.headers_mut().insert(
-        "x-accel-buffering",
-        header::HeaderValue::from_static("no"),
-    );
+    resp.headers_mut()
+        .insert("x-accel-buffering", header::HeaderValue::from_static("no"));
     resp
 }
 
@@ -409,8 +408,10 @@ fn to_event(ev: SurfaceEvent) -> Result<Event, Infallible> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::body::{Body, to_bytes};
-    use axum::http::Request;
+    use axum::{
+        body::{Body, to_bytes},
+        http::Request,
+    };
     use tower::ServiceExt;
 
     fn text_push(body: &str, promote: bool) -> Body {
@@ -567,7 +568,10 @@ mod tests {
             "text/css; charset=utf-8"
         );
         // Fingerprinted URL → cache long-term.
-        assert_eq!(css.headers().get(header::CACHE_CONTROL).unwrap(), ASSET_CACHE);
+        assert_eq!(
+            css.headers().get(header::CACHE_CONTROL).unwrap(),
+            ASSET_CACHE
+        );
 
         let js = app
             .oneshot(
@@ -583,7 +587,10 @@ mod tests {
             js.headers().get(header::CONTENT_TYPE).unwrap(),
             "text/javascript; charset=utf-8"
         );
-        assert_eq!(js.headers().get(header::CACHE_CONTROL).unwrap(), ASSET_CACHE);
+        assert_eq!(
+            js.headers().get(header::CACHE_CONTROL).unwrap(),
+            ASSET_CACHE
+        );
     }
 
     #[test]
@@ -755,8 +762,16 @@ mod tests {
     #[tokio::test]
     async fn delete_item_endpoint_removes_one() {
         let store = Arc::new(SurfaceStore::in_memory());
-        let a = store.push("s", crate::item::DisplayItem::Text { body: "a".into() }, true);
-        store.push("s", crate::item::DisplayItem::Text { body: "b".into() }, false);
+        let a = store.push(
+            "s",
+            crate::item::DisplayItem::Text { body: "a".into() },
+            true,
+        );
+        store.push(
+            "s",
+            crate::item::DisplayItem::Text { body: "b".into() },
+            false,
+        );
         let app = router(store.clone());
         // Remove item `a`.
         let resp = app

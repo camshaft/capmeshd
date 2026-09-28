@@ -13,8 +13,10 @@
 //! channel; a push or view change fans out to every attached tab as an
 //! [`SurfaceEvent`].
 
-use std::collections::{HashMap, VecDeque};
-use std::path::{Path, PathBuf};
+use std::{
+    collections::{HashMap, VecDeque},
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
@@ -825,7 +827,10 @@ mod tests {
         let v: serde_json::Value = serde_json::to_value(&ev).unwrap();
         assert_eq!(v["kind"], "view");
         assert_eq!(v["current-view"], "abc");
-        assert!(v.get("current_view").is_none(), "must not use snake_case key");
+        assert!(
+            v.get("current_view").is_none(),
+            "must not use snake_case key"
+        );
     }
 
     #[test]
@@ -869,9 +874,15 @@ mod tests {
             // Reopen the surface: the token sidecar should be gone.
             assert!(store.set_token("s", None));
         }
-        assert!(!path.join("s.token").exists(), "token sidecar should be removed");
+        assert!(
+            !path.join("s.token").exists(),
+            "token sidecar should be removed"
+        );
         let reborn = SurfaceStore::with_state_dir(&path).unwrap();
-        assert!(reborn.authorize_attach("s", None), "should be open after clear");
+        assert!(
+            reborn.authorize_attach("s", None),
+            "should be open after clear"
+        );
     }
 
     #[test]
@@ -975,7 +986,10 @@ mod tests {
         let snap = store.snapshot("s");
         assert_eq!(snap.items.len(), 1);
         assert_eq!(snap.items[0].item, text("b"));
-        assert_eq!(snap.current_view, None, "removing the viewed item clears the view");
+        assert_eq!(
+            snap.current_view, None,
+            "removing the viewed item clears the view"
+        );
         assert_eq!(read_log(dir.path(), "s").unwrap().len(), 1);
 
         // Removing a nonexistent item, or from an unknown surface, is false.
