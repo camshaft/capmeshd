@@ -10,7 +10,7 @@
 //!    then `active`.
 //! 2. **Forwarding.** Each received RTP-MIDI message is forwarded into the local
 //!    virtual sink, accumulating `bytes-in`. Packets are gated by RTP sequence
-//!    number ([`SeqGate`]) so a reordered or duplicated datagram never replays
+//!    number (`SeqGate`) so a reordered or duplicated datagram never replays
 //!    already-played MIDI. (MIDI running status is expanded during parsing in
 //!    `nmidi-core`.)
 //! 3. **Clock-sync.** As the session initiator we *drive* clock-sync: we send our

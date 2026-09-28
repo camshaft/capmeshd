@@ -73,7 +73,7 @@ impl PeerPolicy {
     /// supplementary groups), because the shared-group trust model keys on a
     /// group a client typically holds as a *supplementary* group — e.g. a
     /// systemd `DynamicUser` whose primary gid is transient but which joins the
-    /// shared `capmesh` group via `SupplementaryGroups`. See [`peer_gids`].
+    /// shared `capmesh` group via `SupplementaryGroups`. See `peer_gids`.
     pub fn allows(&self, uid: u32, gids: &[u32]) -> bool {
         if !self.enforcing() {
             return true;
