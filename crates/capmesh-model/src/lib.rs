@@ -130,7 +130,7 @@ pub enum MountState {
 }
 
 /// Throughput/liveness counters for a live mount (§3.2).
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MountStats {
     #[serde(rename = "bytes-in", default)]
     pub bytes_in: u64,
@@ -141,7 +141,7 @@ pub struct MountStats {
 }
 
 /// The status of one mount (§3.2).
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MountStatus {
     #[serde(rename = "mount-id")]
     pub mount_id: String,
@@ -163,7 +163,7 @@ pub struct MountResult {
 }
 
 /// `mount-status` result (§3): one or all live mounts.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MountStatusResult {
     pub mounts: Vec<MountStatus>,
 }
@@ -292,6 +292,28 @@ mod tests {
             Some(&serde_json::json!(0))
         );
         assert_eq!(pd.formats[1].codec, "midi1");
+    }
+
+    #[test]
+    fn mount_status_result_serializes_with_wire_names() {
+        // capmeshd re-emits this as machine-readable JSON (`mount-status --json`); the wire form
+        // must carry the kebab-case field/enum names, not the Rust identifiers.
+        let res = MountStatusResult {
+            mounts: vec![MountStatus {
+                mount_id: "laptop-kbd-0".into(),
+                state: MountState::Active,
+                since: None,
+                stats: Some(MountStats { bytes_in: 42, bytes_out: 0, last_event: None }),
+                detail: None,
+            }],
+        };
+        let json = serde_json::to_string(&res).unwrap();
+        assert!(json.contains("\"mount-id\":\"laptop-kbd-0\""));
+        assert!(json.contains("\"state\":\"active\"")); // kebab-case enum, not "Active"
+        assert!(json.contains("\"bytes-in\":42")); // hyphen, not bytes_in
+        // And it round-trips back.
+        let back: MountStatusResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, res);
     }
 
     #[test]

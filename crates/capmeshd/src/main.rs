@@ -160,6 +160,10 @@ enum Cmd {
         /// Restrict to one mount id.
         #[arg(long)]
         mount_id: Option<String>,
+        /// Emit the result as machine-readable JSON on stdout (stable wire field/enum names)
+        /// instead of human log lines — for scripts, agents, and the rehearsal harness.
+        #[arg(long)]
+        json: bool,
     },
     /// Reconcile a desired mount against a daemon (DESIGN §6): issue it if absent/failed,
     /// leave it if live. With --interval-secs > 0, run the reconcile loop.
@@ -321,8 +325,8 @@ async fn main() -> Result<()> {
         }
         Some(Cmd::Mount(m)) => return cmd_mount(m).await,
         Some(Cmd::Unmount { socket, mount_id }) => return cmd_unmount(socket, mount_id).await,
-        Some(Cmd::MountStatus { socket, mount_id }) => {
-            return cmd_mount_status(socket, mount_id.as_deref()).await;
+        Some(Cmd::MountStatus { socket, mount_id, json }) => {
+            return cmd_mount_status(socket, mount_id.as_deref(), *json).await;
         }
         Some(Cmd::Reconcile {
             mount,
@@ -1282,13 +1286,19 @@ async fn cmd_unmount(socket: &Path, mount_id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Connect + hello, then print live mounts (§3).
-async fn cmd_mount_status(socket: &Path, mount_id: Option<&str>) -> Result<()> {
+/// Connect + hello, then print live mounts (§3). With `json`, emit the result as machine-readable
+/// JSON on stdout (stable kebab-case wire names) for scripts/agents/the rehearsal harness;
+/// otherwise emit human log lines.
+async fn cmd_mount_status(socket: &Path, mount_id: Option<&str>, json: bool) -> Result<()> {
     let mut client = connect_and_hello(socket).await?;
     let res = client
         .mount_status(mount_id)
         .await
         .context("mount-status")?;
+    if json {
+        println!("{}", serde_json::to_string(&res).context("serialize mount-status")?);
+        return Ok(());
+    }
     if res.mounts.is_empty() {
         info!("no live mounts");
     }

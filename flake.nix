@@ -181,17 +181,17 @@
                 )
 
                 # The RTP data plane flows: the SC-host nmidid completes the AppleMIDI handshake to
-                # the fake source and the mount reaches Active. Query nmidid via `capmeshd
-                # mount-status` (root is admitted by nmidid's peer policy). The CLI logs the state
-                # enum via Debug, so the on-the-wire "active" prints as `state=Active`.
+                # the fake source and the mount reaches active. Query nmidid via `capmeshd
+                # mount-status --json` (root is admitted by nmidid's peer policy) — stable
+                # kebab-case wire names on stdout, not the human log format.
                 sc.wait_until_succeeds(
-                    "capmeshd mount-status --socket /run/nmidid/nmidid.sock 2>&1 | grep -q 'state=Active'",
+                    "capmeshd mount-status --socket /run/nmidid/nmidid.sock --json | grep -q '\"state\":\"active\"'",
                     timeout=90,
                 )
                 # ...and notes actually arrive: fake-source streams every 100ms, so bytes-in climbs
-                # off zero (the CLI logs the `bytes-in` stat as the field `bytes_in=<n>`).
+                # off zero.
                 sc.wait_until_succeeds(
-                    "capmeshd mount-status --socket /run/nmidid/nmidid.sock 2>&1 | grep -Eq 'bytes_in=[1-9]'",
+                    "capmeshd mount-status --socket /run/nmidid/nmidid.sock --json | grep -Eq '\"bytes-in\":[1-9]'",
                     timeout=90,
                 )
               '';
