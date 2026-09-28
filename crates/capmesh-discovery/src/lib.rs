@@ -247,6 +247,52 @@ impl AppleMidiPeers {
     }
 }
 
+/// Why selecting a single capability from a discovery result failed (§7). A mount targets one
+/// capability, so neither "none" nor "several" can be resolved by guessing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SelectError {
+    /// No discovered advert matched the selector.
+    NoMatch,
+    /// More than one advert matched; the selector must be narrowed. Carries the match count.
+    Ambiguous(usize),
+}
+
+impl std::fmt::Display for SelectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SelectError::NoMatch => write!(f, "no discovered capability matches the selector"),
+            SelectError::Ambiguous(n) => write!(
+                f,
+                "{n} discovered capabilities match the selector; narrow it with --kind/--host/--id"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SelectError {}
+
+/// Select exactly one capability from discovered adverts by an optional `(kind, dir, host, id)`
+/// selector (§7): each `Some` field must match; `id` pins the exact capability. Errors if none
+/// match ([`SelectError::NoMatch`]) or more than one does ([`SelectError::Ambiguous`]) — a mount
+/// targets a single capability, so ambiguity is surfaced to the caller rather than guessed.
+pub fn select_one<'a>(
+    adverts: &'a [CapabilityAdvert],
+    kind: Option<&str>,
+    dir: Option<&str>,
+    host: Option<&str>,
+    id: Option<&str>,
+) -> Result<&'a CapabilityAdvert, SelectError> {
+    let mut matching = adverts
+        .iter()
+        .filter(|a| a.matches(kind, dir, host) && id.is_none_or(|i| a.id == i));
+    let first = matching.next().ok_or(SelectError::NoMatch)?;
+    let extra = matching.count();
+    if extra > 0 {
+        return Err(SelectError::Ambiguous(extra + 1));
+    }
+    Ok(first)
+}
+
 /// A capmesh peer whose auto-mount rule matched but which is waiting on the peer's AppleMIDI
 /// **control** port — its `_apple-midi._udp` record has not resolved yet (DESIGN §6.1). Holds
 /// exactly what the daemon needs to re-run auto-mount once that record arrives.
@@ -375,6 +421,56 @@ mod tests {
             ep: 7420,
             fullname: fullname.into(),
         }
+    }
+
+    fn advert(cap: &str, dir: &str, host: &str, id: &str) -> CapabilityAdvert {
+        CapabilityAdvert {
+            cap: cap.into(),
+            dir: dir.into(),
+            id: id.into(),
+            host: host.into(),
+            ep: 7420,
+            descr: format!("/caps/{id}"),
+        }
+    }
+
+    #[test]
+    fn select_one_no_match_is_an_error() {
+        let adverts = vec![advert("midi", "source", "a", "1")];
+        assert_eq!(
+            select_one(&adverts, Some("audio"), None, None, None),
+            Err(SelectError::NoMatch)
+        );
+    }
+
+    #[test]
+    fn select_one_unique_match_is_returned() {
+        let adverts = vec![
+            advert("midi", "source", "green", "1"),
+            advert("audio", "sink", "blue", "2"),
+        ];
+        // A kind that only one advert has selects it.
+        let got = select_one(&adverts, Some("audio"), None, None, None).unwrap();
+        assert_eq!(got.id, "2");
+        // An id pins the exact capability even when kind alone is ambiguous.
+        let got = select_one(&adverts, None, None, None, Some("1")).unwrap();
+        assert_eq!(got.host, "green");
+    }
+
+    #[test]
+    fn select_one_ambiguous_reports_the_count() {
+        let adverts = vec![
+            advert("midi", "source", "green", "1"),
+            advert("midi", "source", "blue", "2"),
+            advert("midi", "source", "red", "3"),
+        ];
+        // kind=midi matches all three → ambiguous; host narrows it to one.
+        assert_eq!(
+            select_one(&adverts, Some("midi"), None, None, None),
+            Err(SelectError::Ambiguous(3))
+        );
+        let got = select_one(&adverts, Some("midi"), None, Some("blue"), None).unwrap();
+        assert_eq!(got.id, "2");
     }
 
     #[test]
