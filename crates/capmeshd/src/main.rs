@@ -508,6 +508,9 @@ async fn main() -> Result<()> {
                                     "auto-mount teardown: no local socket for this kind; skipping");
                             }
                         }
+                        // Drop any auto-mounts of this peer still awaiting a control port: its
+                        // advert is gone, so they can no longer be issued (§6.1).
+                        pending.lock().unwrap().forget_fullname(&fullname);
                     }
                     Ok(_) => {}
                     Err(e) => {

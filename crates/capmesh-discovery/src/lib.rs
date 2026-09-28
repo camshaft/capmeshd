@@ -335,6 +335,16 @@ impl PendingAutoMounts {
     pub fn take(&mut self, addr: &IpAddr) -> Vec<PendingPeer> {
         self.by_addr.remove(addr).unwrap_or_default()
     }
+
+    /// Drop every parked peer with this mDNS fullname, across all addresses — called when a
+    /// peer's `_capmesh._tcp` advert is removed before its control port ever arrived, so its
+    /// auto-mount can no longer be issued (§6.1). Keeps the registry from retaining dead peers.
+    pub fn forget_fullname(&mut self, fullname: &str) {
+        self.by_addr.retain(|_addr, peers| {
+            peers.retain(|p| p.fullname != fullname);
+            !peers.is_empty()
+        });
+    }
 }
 
 #[cfg(test)]
@@ -488,6 +498,22 @@ mod tests {
         assert_eq!(drained[0].fullname, "host-midi-1");
         assert!(p.take(&a).is_empty()); // take removed it
         assert_eq!(p.take(&b).len(), 1); // b still waiting
+    }
+
+    #[test]
+    fn pending_forget_fullname_removes_across_addrs() {
+        let a: IpAddr = "192.168.1.23".parse().unwrap();
+        let b: IpAddr = "192.168.1.99".parse().unwrap();
+        let mut p = PendingAutoMounts::new();
+        p.record(a, pending("host-midi-1"));
+        p.record(b, pending("host-midi-1")); // the same peer parked at two addrs
+        p.record(b, pending("other-midi-2"));
+
+        p.forget_fullname("host-midi-1");
+        assert!(p.take(&a).is_empty()); // a held only host-midi-1 → the addr entry is dropped
+        let rest = p.take(&b);
+        assert_eq!(rest.len(), 1);
+        assert_eq!(rest[0].fullname, "other-midi-2"); // an unrelated peer at b is retained
     }
 
     #[test]
