@@ -226,6 +226,17 @@ in
       '';
     };
 
+    logLevel = lib.mkOption {
+      type = lib.types.str;
+      default = "info";
+      example = "capmeshd=debug,info";
+      description = ''
+        Log verbosity for capmeshd, passed as the `RUST_LOG` env filter (capmeshd reads it via
+        the standard env filter; there is no `--log-level` flag). Accepts a bare level (`info`,
+        `debug`, …) or a full `RUST_LOG` directive string.
+      '';
+    };
+
     advertise = lib.mkOption {
       type = lib.types.attrsOf advertiseModule;
       default = { };
@@ -269,6 +280,8 @@ in
       wantedBy = [ "multi-user.target" ];
       after = [ "network-online.target" "avahi-daemon.service" ];
       wants = [ "network-online.target" ];
+      # capmeshd reads its log verbosity from RUST_LOG (no --log-level flag), so set it here.
+      environment.RUST_LOG = cfg.logLevel;
       serviceConfig = {
         ExecStart = "${cfg.package}/bin/capmeshd --config /etc/capmesh/capmesh.toml";
         Restart = "on-failure";
