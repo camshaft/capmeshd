@@ -6,5 +6,6 @@
 //! and discovery wiring around them.
 
 pub mod automount;
+pub mod mcp_routes;
 pub mod negotiate;
 pub mod reconcile;
