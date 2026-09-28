@@ -441,7 +441,7 @@ async fn main() -> Result<()> {
     // Auto-mounts issued so far, keyed by the source peer's mDNS fullname, so a `ServiceRemoved`
     // can tear down its `while-advertised` mounts (§6.1). `permanent` mounts stay tracked and
     // mounted across advert removal.
-    let active_mounts: ActiveMounts = Arc::new(Mutex::new(MountRegistry::default()));
+    let active_mounts: ActiveMounts = Arc::new(Mutex::new(AutoMountRegistry::default()));
 
     // Peers whose auto-mount matched but await their AppleMIDI control port (§6.1). Drained +
     // re-tried when the peer's `_apple-midi._udp` record resolves, so a capmesh advert that
@@ -581,13 +581,16 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// The auto-mount registry (§6.1): which source adverts are currently live on the mesh, and the
-/// mounts issued so far per source peer's mDNS fullname. Both live behind one lock so a
-/// `ServiceRemoved` and a still-in-flight `try_auto_mount` for the same peer serialize — closing
-/// the race where a mount issued *after* its advert was removed would otherwise be tracked but
-/// never torn down (the removal's teardown already ran against an empty entry).
+/// This control plane's auto-mount registry (§6.1): which source adverts are currently live on
+/// the mesh, and the mounts issued so far per source peer's mDNS fullname. Both live behind one
+/// lock so a `ServiceRemoved` and a still-in-flight `try_auto_mount` for the same peer serialize
+/// — closing the race where a mount issued *after* its advert was removed would otherwise be
+/// tracked but never torn down (the removal's teardown already ran against an empty entry).
+///
+/// Distinct from the data-plane daemon's `nmidid::mounts::MountRegistry`: this tracks *auto-mount
+/// decisions* the control plane made, not the live data-plane mounts themselves.
 #[derive(Default)]
-struct MountRegistry {
+struct AutoMountRegistry {
     /// Fullnames of adverts currently present on the mesh (inserted on `ServiceResolved`, removed
     /// on `ServiceRemoved`). Consulted at issuance to detect an advert that vanished mid-mount.
     live: std::collections::HashSet<String>,
@@ -596,7 +599,7 @@ struct MountRegistry {
     active: HashMap<String, Vec<ActiveAutoMount>>,
 }
 /// Shared across the browse loop and every spawned issuance task (cheap `Arc` clone).
-type ActiveMounts = Arc<Mutex<MountRegistry>>;
+type ActiveMounts = Arc<Mutex<AutoMountRegistry>>;
 
 /// The shared, cheaply-cloneable context every auto-mount task needs: the rules+sockets+codecs,
 /// the AppleMIDI control-port map, the issued-mount registry (for lifetime teardown), and the
