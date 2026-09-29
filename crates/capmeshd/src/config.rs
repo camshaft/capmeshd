@@ -35,6 +35,12 @@ pub struct Config {
     #[serde(rename = "host-id", default)]
     pub host_id: Option<String>,
 
+    /// Log verbosity as a `tracing` env-filter directive (e.g. `info` or `capmeshd=debug,info`).
+    /// Configured here in the TOML — NOT via `RUST_LOG` or any env var (fleet mandate seq-1377:
+    /// daemons take their config from `--config`, not the environment). Defaults to `info`.
+    #[serde(default = "default_log")]
+    pub log: String,
+
     /// Path to the cluster credential (DESIGN §8, trust boundary). Parsed now; the
     /// credential is enforced on actionable RPC in a later slice.
     #[serde(rename = "cluster-key-file", default)]
@@ -98,6 +104,10 @@ impl McpRouteConfig {
             protocol_rev: self.protocol_rev.clone(),
         }
     }
+}
+
+fn default_log() -> String {
+    "info".to_string()
 }
 
 fn default_role() -> String {
@@ -243,6 +253,15 @@ socket   = "/run/nmidid.sock"
         let midi = cfg.dataplane.get("midi").expect("midi dataplane");
         assert_eq!(midi.protocol, "nmidi-ctl");
         assert_eq!(midi.socket.as_deref(), Some(Path::new("/run/nmidid.sock")));
+        // Log verbosity is TOML config (seq-1377): absent → the `info` default.
+        assert_eq!(cfg.log, "info");
+    }
+
+    #[test]
+    fn log_defaults_to_info_and_parses_a_directive() {
+        assert_eq!(Config::parse("").expect("empty parses").log, "info");
+        let cfg = Config::parse(r#"log = "capmeshd=debug,info""#).expect("parse");
+        assert_eq!(cfg.log, "capmeshd=debug,info");
     }
 
     #[test]

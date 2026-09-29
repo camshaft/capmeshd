@@ -52,6 +52,7 @@ let
   settings = {
     "host-id" = cfg.hostId;
     "advertise-port" = cfg.advertisePort;
+    log = cfg.logLevel;
   }
   // lib.optionalAttrs (cfg.clusterKeyFile != null) { "cluster-key-file" = cfg.clusterKeyFile; }
   // lib.optionalAttrs (enabledDataplanes != { }) { dataplane = enabledDataplanes; }
@@ -231,9 +232,10 @@ in
       default = "info";
       example = "capmeshd=debug,info";
       description = ''
-        Log verbosity for capmeshd, passed as the `RUST_LOG` env filter (capmeshd reads it via
-        the standard env filter; there is no `--log-level` flag). Accepts a bare level (`info`,
-        `debug`, …) or a full `RUST_LOG` directive string.
+        Log verbosity for capmeshd, rendered into the TOML config's `log` key (capmeshd reads it
+        from `--config`, not from `RUST_LOG` or any env var; fleet mandate seq-1377). Accepts a
+        bare level (`info`, `debug`, …) or a full `tracing` env-filter directive string
+        (e.g. `capmeshd=debug,info`).
       '';
     };
 
@@ -280,8 +282,8 @@ in
       wantedBy = [ "multi-user.target" ];
       after = [ "network-online.target" "avahi-daemon.service" ];
       wants = [ "network-online.target" ];
-      # capmeshd reads its log verbosity from RUST_LOG (no --log-level flag), so set it here.
-      environment.RUST_LOG = cfg.logLevel;
+      # Log verbosity is rendered into the TOML `log` key (fleet mandate seq-1377: config comes
+      # from `--config`, never an env var), so no `environment.RUST_LOG` here.
       serviceConfig = {
         ExecStart = "${cfg.package}/bin/capmeshd --config /etc/capmesh/capmesh.toml";
         Restart = "on-failure";
