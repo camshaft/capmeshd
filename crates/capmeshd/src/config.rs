@@ -9,6 +9,7 @@
 //! `[dataplane.printer.<instance>]` form (control-API kinds) is a later milestone (M5).
 
 use anyhow::{Context, Result};
+use capmesh_ctl::{McpRoute, McpTransport};
 use serde::Deserialize;
 use std::{
     collections::HashMap,
@@ -57,6 +58,39 @@ pub struct Config {
     /// Permanent desired mounts (DESIGN §9) — reconciled at startup + on drift.
     #[serde(rename = "permanent-mount", default)]
     pub permanent_mounts: Vec<PermanentMount>,
+
+    /// Statically-declared MCP routes (DESIGN §7.2) seeded into the route registry at startup —
+    /// the "explicit floor" for known upstreams (kb / board / surfaced), complementing the runtime
+    /// register endpoint and `cap=mcp` auto-discovery.
+    #[serde(rename = "mcp-route", default)]
+    pub mcp_routes: Vec<McpRouteConfig>,
+}
+
+/// A statically-declared MCP route (DESIGN §7.2), the config form of an [`McpRoute`].
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpRouteConfig {
+    /// Stable upstream id — also the gateway's `tools/list` namespace prefix.
+    pub id: String,
+    /// Where the gateway reaches it (endpoint URL for `streamable-http`, command for `stdio`).
+    pub url: String,
+    /// The transport the gateway speaks to this upstream.
+    pub transport: McpTransport,
+    /// The MCP protocol revision the upstream negotiates, if known (e.g. `2026-07-28`).
+    #[serde(rename = "protocol-rev", default)]
+    pub protocol_rev: Option<String>,
+}
+
+impl McpRouteConfig {
+    /// The registry [`McpRoute`] this config entry declares.
+    pub fn to_route(&self) -> McpRoute {
+        McpRoute {
+            id: self.id.clone(),
+            url: self.url.clone(),
+            transport: self.transport,
+            protocol_rev: self.protocol_rev.clone(),
+        }
+    }
 }
 
 fn default_role() -> String {
@@ -268,6 +302,37 @@ lifetime = "while-advertised"
     #[test]
     fn unknown_field_is_rejected() {
         assert!(Config::parse("bogus-key = 1").is_err());
+    }
+
+    #[test]
+    fn parses_mcp_routes() {
+        let cfg = Config::parse(
+            r#"
+host-id = "green-machine"
+
+[[mcp-route]]
+id = "board"
+url = "http://green-machine.lan:8880/board/mcp"
+transport = "streamable-http"
+protocol-rev = "2026-07-28"
+
+[[mcp-route]]
+id = "local-tool"
+url = "run-local-mcp"
+transport = "stdio"
+"#,
+        )
+        .expect("parse");
+        assert_eq!(cfg.mcp_routes.len(), 2);
+        let board = &cfg.mcp_routes[0];
+        assert_eq!(board.id, "board");
+        assert_eq!(board.transport, McpTransport::StreamableHttp);
+        assert_eq!(board.protocol_rev.as_deref(), Some("2026-07-28"));
+        // to_route() carries the fields into the registry type.
+        assert_eq!(board.to_route().url, "http://green-machine.lan:8880/board/mcp");
+        // stdio + omitted protocol-rev.
+        assert_eq!(cfg.mcp_routes[1].transport, McpTransport::Stdio);
+        assert_eq!(cfg.mcp_routes[1].protocol_rev, None);
     }
 
     #[test]

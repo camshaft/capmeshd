@@ -18,6 +18,7 @@ use capmesh_ctl::{CtlClient, CtlError, Format, LocalEndpoint, MountRole, MountSp
 use capmesh_daemon::automount::{
     self, ActiveAutoMount, AutoMountOutcome, Lifetime, Remote, teardown_on_unadvertise,
 };
+use capmesh_daemon::mcp_routes::McpRouteRegistry;
 use capmesh_daemon::negotiate;
 use capmesh_daemon::reconcile::{self, Reconciler};
 use capmesh_discovery::{self as discovery, AppleMidiPeers, PendingAutoMounts, PendingPeer};
@@ -391,6 +392,12 @@ async fn main() -> Result<()> {
     // startup. Best-effort: if the daemon socket is down (e.g. nmidid not up yet), log and
     // carry on — a later tick's reconcile / the daemon coming up converges it.
     reconcile_permanent_mounts(&cfg).await;
+
+    // Seed the MCP route registry (DESIGN §7.2) from the statically-declared `[[mcp-route]]`
+    // entries — the "explicit floor" for known upstreams. The runtime register endpoint and
+    // `cap=mcp` auto-discovery mutate the same registry; the gateway is driven off it.
+    let mcp_routes = build_mcp_route_registry(&cfg);
+    info!(routes = mcp_routes.len(), "mcp route registry seeded from config");
 
     // Serve the mesh control endpoint (docs/MESH-PROTOCOL.md) on the advertised port so peers
     // can resolve this host's `descr` pointers into full capability descriptors. The provider
@@ -1110,6 +1117,21 @@ fn permanent_to_spec(pm: &config::PermanentMount) -> Result<MountSpec> {
     })
 }
 
+/// Build the MCP route registry (DESIGN §7.2) from the config's statically-declared `[[mcp-route]]`
+/// entries. Each is validated through [`McpRouteRegistry::register`]; an invalid entry (e.g. a bad
+/// id) is logged and skipped rather than failing daemon startup. The runtime register endpoint and
+/// `cap=mcp` auto-discovery mutate this same registry, and the gateway is driven off it.
+fn build_mcp_route_registry(cfg: &Config) -> McpRouteRegistry {
+    let mut registry = McpRouteRegistry::new();
+    for rc in &cfg.mcp_routes {
+        match registry.register(rc.to_route()) {
+            Ok(_) => info!(id = %rc.id, url = %rc.url, ?rc.transport, "configured mcp route"),
+            Err(e) => warn!(id = %rc.id, "skipping invalid configured mcp route: {e}"),
+        }
+    }
+    registry
+}
+
 /// Reconcile the config's permanent mounts (DESIGN §9) against the local MIDI data-plane
 /// daemon named by `[dataplane.midi].socket`. Best-effort at startup: an unreachable daemon
 /// or an invalid mount is logged, not fatal — the daemon keeps advertising/browsing.
@@ -1482,6 +1504,38 @@ mod tests {
 
         // A direction the descriptor doesn't expose yields nothing (→ discover drops it).
         assert!(matching_ports(&cap, Some("duplex")).is_empty());
+    }
+
+    #[test]
+    fn build_mcp_route_registry_seeds_valid_and_skips_invalid() {
+        // Two well-formed routes and one with an invalid id (underscore → would break the gateway's
+        // `<id>__<tool>` namespacing); the invalid one is skipped, not fatal.
+        let cfg = config::Config::parse(
+            r#"
+host-id = "h"
+
+[[mcp-route]]
+id = "board"
+url = "http://h/board/mcp"
+transport = "streamable-http"
+
+[[mcp-route]]
+id = "bad_id"
+url = "http://h/bad/mcp"
+transport = "streamable-http"
+
+[[mcp-route]]
+id = "kb"
+url = "http://h/kb/mcp"
+transport = "streamable-http"
+"#,
+        )
+        .expect("parse");
+        let reg = build_mcp_route_registry(&cfg);
+        // Only the two valid ids landed, in stable order.
+        let ids: Vec<&str> = reg.routes().iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, ["board", "kb"]);
+        assert!(reg.get("bad_id").is_none());
     }
 
     #[test]
