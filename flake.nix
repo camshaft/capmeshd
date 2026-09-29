@@ -135,7 +135,7 @@
                 };
               };
               # The SuperCollider host: the co-deploy that auto-mounts a discovered MIDI source.
-              scNode = { ... }: {
+              automountScNode = { ... }: {
                 imports = [ midiHost ];
                 services.capmesh.hostId = "sc-host";
                 services.capmesh.automount = [{
@@ -144,13 +144,22 @@
                   lifetime = "while-advertised";
                 }];
               };
+              # The `link`-scenario SC host: NO automount — the testScript issues a manual `link`
+              # mount that binds one of this host's own REAL snd-virmidi SINK ports to the discovered
+              # remote source (§3.1 link role). `jq` is on PATH to resolve the real sink's port-id
+              # from `capmeshd list-ports --json`.
+              linkScNode = { ... }: {
+                imports = [ midiHost ];
+                services.capmesh.hostId = "sc-host";
+                environment.systemPackages = [ pkgs.jq ];
+              };
               # Shared prologue: both hosts boot, the source advertises, and the SC host discovers
               # the peer and auto-issues the mount to its nmidid. "auto-mount issued" only logs when
               # discovery + descriptor fetch + AppleMIDI control-port correlation + plan all succeed
               # (a missing apple-midi record logs "awaiting" instead) — so it proves the SC-side path
               # regardless of what the RTP data plane then does. Each scenario's `tail` asserts the
               # data-plane outcome via `capmeshd mount-status --json` (stable kebab-case wire names).
-              prologue = ''
+              automountPrologue = ''
                 start_all()
                 for m in (source, sc):
                     m.wait_for_unit("nmidid.service")
@@ -165,8 +174,24 @@
                     "journalctl -u capmesh.service | grep -q 'auto-mount issued'", timeout=120
                 )
               '';
+              # The `link`-scenario prologue: both hosts up + the source advertising. No automount
+              # assertion — the SC host has no rule; its `tail` issues the manual link mount and then
+              # asserts the data-plane outcome (connect-discover does its own browse/correlation).
+              linkPrologue = ''
+                start_all()
+                for m in (source, sc):
+                    m.wait_for_unit("nmidid.service")
+                    m.wait_for_unit("capmesh.service")
+                    m.wait_for_open_port(7420)
+                source.wait_for_unit("fake-source.service")
+              '';
             in
-            { name, fakeSourceArgs, tail }: pkgs.testers.runNixOSTest {
+            { name, fakeSourceArgs, tail, link ? false }:
+            let
+              scNode = if link then linkScNode else automountScNode;
+              prologue = if link then linkPrologue else automountPrologue;
+            in
+            pkgs.testers.runNixOSTest {
               inherit name;
               nodes = { source = sourceNode fakeSourceArgs; sc = scNode; };
               testScript = prologue + tail;
@@ -189,12 +214,14 @@
           # `nix build .#packages.<system>.rehearsal-m0.driver` builds both guests + the test driver
           # and type-checks/lints the testScript without KVM.
           #
-          # Scenarios (built by `rehearsalScenarios`, which fixes the topology and varies only the
-          # fake source's flags + the trailing assertion):
+          # Scenarios (built by `rehearsalScenarios`, which fixes the topology and varies the fake
+          # source's flags, the SC-host mount mode (`link`), and the trailing assertion):
           #   rehearsal-m0           — source streams notes → mount active + bytes-in > 0 (headline).
           #   rehearsal-m0-reject    — source refuses the invitation → mount failed, detail "rejected".
           #   rehearsal-m0-keepalive — source --no-notes → mount stays active past the timeout, bytes-in 0.
           #   rehearsal-m0-deadpeer  — source vanishes mid-session → mount failed, detail "unresponsive".
+          #   rehearsal-link         — SC binds a REAL local snd-virmidi sink (link role) to the remote
+          #                            source → mount active + bytes-in > 0 (link headline, `link=true`).
           # Happy path: the source streams notes, the mount reaches active and bytes flow — the M0
           # headline (SuperCollider would hear the keyboard).
           packages.rehearsal-m0 = rehearsalScenarios {
@@ -279,6 +306,48 @@
               sc.wait_until_succeeds(
                   "capmeshd mount-status --socket /run/nmidid/nmidid.sock --json | grep -q unresponsive",
                   timeout=60,
+              )
+            '';
+          };
+
+          # Link path: the SC host binds one of its OWN real snd-virmidi SINK ports to the discovered
+          # remote MIDI source (the `link` role, §3.1 — no virtual endpoint) and the remote's notes
+          # flow INTO that real sink. Exercises the full link stack end-to-end: capmesh sources the
+          # local real-port id (`--local-port-id`, #184/#185), nmidid's link pump resolves it against
+          # its list-ports and forwards inbound RTP into it (#182). Mirrors rehearsal-m0's active +
+          # bytes-in>0 headline, but binding a REAL local port instead of a virtual mirror.
+          packages.rehearsal-link = rehearsalScenarios {
+            name = "capmesh-link-rehearsal";
+            fakeSourceArgs = "--note-interval-ms 100";
+            link = true;
+            tail = ''
+
+              # Resolve this host's own real snd-virmidi SINK port-id from nmidid's list-ports
+              # (name-derived + not statically known, so discover it rather than hardcode).
+              sink = sc.wait_until_succeeds(
+                  "capmeshd list-ports --socket /run/nmidid/nmidid.sock --json "
+                  "| jq -re '.ports[] | select(.dir == \"sink\") | .[\"port-id\"]' | head -n1",
+                  timeout=60,
+              ).strip()
+
+              # Link that real local sink to the discovered remote source: connect-discover browses
+              # the mesh, learns the remote coords + AppleMIDI control port, and issues a `link` mount
+              # naming the local sink. `--dir source` picks the remote's source port for the role.
+              sc.succeed(
+                  "capmeshd connect-discover --socket /run/nmidid/nmidid.sock "
+                  "--kind midi --dir source --role link --local-port-id '" + sink + "' "
+                  "--timeout-secs 30"
+              )
+
+              # The remote source streams notes → the link mount reaches active and bytes flow INTO
+              # the real sink (the M0 link headline: a real local port hears the remote).
+              sc.wait_until_succeeds(
+                  "capmeshd mount-status --socket /run/nmidid/nmidid.sock --json | grep -q '\"state\":\"active\"'",
+                  timeout=90,
+              )
+              sc.wait_until_succeeds(
+                  "capmeshd mount-status --socket /run/nmidid/nmidid.sock --json | grep -Eq '\"bytes-in\":[1-9]'",
+                  timeout=90,
               )
             '';
           };
