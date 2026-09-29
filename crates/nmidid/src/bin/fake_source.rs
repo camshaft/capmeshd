@@ -1,14 +1,20 @@
-//! `nmidi-fake-source` — a synthetic RTP-MIDI *source* for headless rehearsal.
+//! `nmidi-fake-source` — a synthetic RTP-MIDI peer for headless rehearsal.
 //!
-//! It plays the AppleMIDI *invitee* (server) role a real MIDI source device would:
-//! it binds a control + data UDP socket pair, accepts an incoming invitation,
-//! answers clock-sync probes, and streams periodic RTP-MIDI notes to the peer.
+//! It plays the AppleMIDI *invitee* (server) role a real MIDI device would: it
+//! binds a control + data UDP socket pair, accepts an incoming invitation, and
+//! answers clock-sync probes. In the default (source) mode it then streams
+//! periodic RTP-MIDI notes to the peer; in `--sink` mode it instead *receives*
+//! and counts inbound RTP-MIDI, standing in for a remote sink.
 //!
-//! This lets the full `nmidid` mount data path (`connecting → active → bytes-in`)
-//! be exercised in CI without any physical MIDI hardware: point an `nmidid`
-//! mount at this source and the note stream drives the mount to `active`. The
-//! companion capmeshd nixosTest loads `snd-virmidi` in the guest so `nmidid` can
-//! create its local virtual mirror.
+//! This lets the full `nmidid` mount data path be exercised in CI without any
+//! physical MIDI hardware, in either direction:
+//! - **source** (default): point a `mirror-source` mount at it and the note
+//!   stream drives the mount to `active` with `bytes-in`;
+//! - **`--sink`**: point a `mirror-sink` mount at it and it counts the outbound
+//!   notes `nmidid` forwards (`bytes-out`), logging a greppable running total.
+//!
+//! The companion capmeshd nixosTest loads `snd-virmidi` in the guest so `nmidid`
+//! can create its local virtual endpoint.
 //!
 //! Single-peer: the most recent inviter is the active peer.
 
@@ -51,6 +57,13 @@ struct Args {
     /// assert the mount fails fast with a `rejected` detail (CONTROL-PROTOCOL).
     #[arg(long)]
     reject: bool,
+
+    /// Act as a remote **sink**: accept the session and answer clock-sync (as
+    /// always), but instead of emitting notes, receive inbound RTP-MIDI on the
+    /// data socket and log a running message/byte count. Lets a `mirror-sink`
+    /// rehearsal assert `nmidid` actually forwarded local MIDI out over the wire.
+    #[arg(long)]
+    sink: bool,
 
     /// Session name advertised in the invitation reply and the mDNS service.
     #[arg(long, default_value = "nmidi-fake-source")]
@@ -106,6 +119,14 @@ fn control_reply(
         }),
         _ => None,
     }
+}
+
+/// Count the non-empty MIDI messages and their total bytes in an RTP-MIDI packet
+/// (`--sink` mode accounting). Pure (no I/O), so it is unit-tested.
+fn count_rtp_midi(packet: &RtpPacket) -> (usize, usize) {
+    let msgs = packet.commands.iter().filter(|c| !c.data.is_empty()).count();
+    let bytes: usize = packet.commands.iter().map(|c| c.data.len()).sum();
+    (msgs, bytes)
 }
 
 #[tokio::main]
@@ -166,9 +187,15 @@ async fn main() -> Result<()> {
     let started = Instant::now();
     let mut ticker = tokio::time::interval(Duration::from_millis(args.note_interval_ms));
     let mut buf = [0u8; 2048];
+    // A separate buffer for the data socket so the two recv branches of the
+    // select do not alias the same borrow.
+    let mut data_buf = [0u8; 2048];
     // The peer's DATA address (its control port + 1), set once a session is accepted.
     let mut peer_data: Option<SocketAddr> = None;
     let mut seq: u16 = 0;
+    // `--sink` mode running totals of inbound RTP-MIDI.
+    let mut sink_msgs: usize = 0;
+    let mut sink_bytes: usize = 0;
     // A short major-scale phrase, alternating note-on / note-off.
     const NOTES: [u8; 4] = [60, 64, 67, 72];
     let mut step: usize = 0;
@@ -198,8 +225,23 @@ async fn main() -> Result<()> {
                     _ => {}
                 }
             }
+            // `--sink` mode: receive and count inbound RTP-MIDI on the data socket.
+            recv = data.recv_from(&mut data_buf), if args.sink => {
+                let (n, from) = recv.context("data recv")?;
+                if let Ok(packet) = RtpPacket::parse(&data_buf[..n]) {
+                    let (m, b) = count_rtp_midi(&packet);
+                    if m > 0 {
+                        sink_msgs += m;
+                        sink_bytes += b;
+                        info!(
+                            "fake-sink: received {sink_msgs} MIDI message(s), {sink_bytes} bytes (last from {from})"
+                        );
+                    }
+                }
+            }
             _ = ticker.tick() => {
-                if let Some(dest) = peer_data.filter(|_| !args.no_notes) {
+                // Source mode only: `--sink` and `--no-notes` both suppress emission.
+                if let Some(dest) = peer_data.filter(|_| !args.no_notes && !args.sink) {
                     let note = NOTES[(step / 2) % NOTES.len()];
                     let on = step.is_multiple_of(2);
                     let midi = if on {
@@ -312,5 +354,24 @@ mod tests {
             ssrc: 0x0102_0304,
         };
         assert!(control_reply(&end, false, SSRC, NAME, TS).is_none());
+    }
+
+    #[test]
+    fn count_rtp_midi_sums_messages_and_bytes() {
+        let mut pkt = RtpPacket::new(SSRC, 1, 0);
+        pkt.add_command(0, vec![0x90, 0x3C, 0x64]); // note on (3 bytes)
+        pkt.add_command(5, vec![0x80, 0x3C, 0x00]); // note off (3 bytes)
+        assert_eq!(count_rtp_midi(&pkt), (2, 6));
+    }
+
+    #[test]
+    fn count_rtp_midi_ignores_empty_commands_and_empty_packets() {
+        // An empty packet counts as nothing.
+        assert_eq!(count_rtp_midi(&RtpPacket::new(SSRC, 1, 0)), (0, 0));
+        // An empty command payload is not a message.
+        let mut pkt = RtpPacket::new(SSRC, 1, 0);
+        pkt.add_command(0, vec![]);
+        pkt.add_command(0, vec![0xB0, 0x07, 0x7F]); // control change (3 bytes)
+        assert_eq!(count_rtp_midi(&pkt), (1, 3));
     }
 }
