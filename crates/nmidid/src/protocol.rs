@@ -168,11 +168,12 @@ pub fn error_response(id: Value, err: &DaemonError) -> Value {
 #[serde(rename_all = "kebab-case")]
 pub enum MountRole {
     /// Create a local virtual **source** fed by the remote source (the
-    /// keyboard-shows-up case). The only role implemented in M0a.
+    /// keyboard-shows-up case).
     MirrorSource,
     /// Create a local virtual **sink** that forwards to the remote sink.
     MirrorSink,
-    /// Connect an existing local **real** port to the remote (no virtual endpoint).
+    /// Connect an existing local **real** port to the remote (no virtual
+    /// endpoint), named by [`LocalEndpoint::port_id`].
     Link,
 }
 
@@ -186,6 +187,13 @@ pub struct LocalEndpoint {
     /// Display name for the virtual device.
     #[serde(default)]
     pub name: Option<String>,
+    /// For a `link` mount (`virtual: false`): which existing *real* local port to
+    /// bind, named by the id this daemon's `list-ports` exposes. Absent for mirror
+    /// roles (which create a virtual endpoint). Additive/optional on the frozen
+    /// wire — serialized only when present. The direction (source vs sink) is
+    /// resolved from the daemon's own descriptor for this id, not carried here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port_id: Option<String>,
 }
 
 /// The remote peer this host connects to — DIRECT, p2p (§3.1).

@@ -77,8 +77,12 @@ graceful teardown:
   apps write into it out to the remote sink (a local app plays a remote
   instrument).
 
-The `link` role (bind an *existing real* local port, no virtual endpoint) is not
-yet implemented and is declined with `role-unsupported`.
+- `link` — bind an *existing real* local port (named by `local.port-id`, an id
+  from this daemon's `list-ports`) instead of creating a virtual one. The
+  direction is resolved from the daemon's own descriptor for that id: a real
+  source (MIDI input) forwards its events out to the remote; a real sink (MIDI
+  output) receives from the remote. An unknown id is refused with `no-such-port`;
+  a missing `local.port-id` is `invalid-params`.
 
 ### Notifications (daemon → capmeshd, unsolicited, §5)
 
