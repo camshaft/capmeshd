@@ -10,6 +10,7 @@ pub mod control_exec;
 pub mod control_http;
 pub mod control_mcp;
 pub mod control_result;
+pub mod gateway_driver;
 pub mod mcp_routes;
 pub mod negotiate;
 pub mod reconcile;
