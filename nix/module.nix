@@ -288,7 +288,17 @@ in
         RestartSec = 2;
         # Keep the DynamicUser sandbox; join the shared capmesh group so the data-plane
         # daemon's SO_PEERCRED gid check (DESIGN §8) admits this client once enforcement is on.
+        #
+        # `User` MUST differ from both the unit name and `cfg.group`: DynamicUser allocates a
+        # transient user AND a same-named group, deriving the name from `User` (falling back to
+        # the unit name, `capmesh`, when unset). With the default `cfg.group = "capmesh"` that
+        # derived group collides with the static trust group declared above, and newer systemd
+        # rejects the clash with 217/USER ("User or group with specified name already exists").
+        # Pinning `Group=` does NOT fix it — the dynamic user (and its group) is allocated first.
+        # Naming the transient user `capmeshd` sidesteps the collision while keeping both the
+        # sandbox and the documented, authorize-by-name trust group `capmesh` intact.
         DynamicUser = true;
+        User = "capmeshd";
         SupplementaryGroups = [ cfg.group ];
       };
     };
