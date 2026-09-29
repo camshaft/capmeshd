@@ -30,6 +30,7 @@
 //! [`mounts::Connector`] (the pump). Production impls wrap `midir` and real
 //! sockets; tests substitute in-memory fakes.
 
+pub mod config;
 pub mod hotplug;
 pub mod mounts;
 pub mod ports;
