@@ -51,9 +51,18 @@ so only root (or a same-user client) can connect.
 ### Control methods (capmeshd → daemon)
 
 `hello` · `list-ports` · `describe-port` · `mount` · `unmount` · `mount-status`
-(CONTROL-PROTOCOL.md §1–§3). `mount` currently implements the `mirror-source`
-role: it creates a local virtual MIDI source and pumps RTP-MIDI from the remote
-into it, driving the mount `connecting → active`.
+(CONTROL-PROTOCOL.md §1–§3). `mount` implements both **mirror** roles, each
+driving the mount `connecting → active` with clock-sync, dead-peer detection and
+graceful teardown:
+
+- `mirror-source` — create a local virtual MIDI *source* and pump RTP-MIDI from
+  the remote source into it (a remote keyboard plays a local app);
+- `mirror-sink` — create a local virtual MIDI *sink* and forward the MIDI local
+  apps write into it out to the remote sink (a local app plays a remote
+  instrument).
+
+The `link` role (bind an *existing real* local port, no virtual endpoint) is not
+yet implemented and is declined with `role-unsupported`.
 
 ### Notifications (daemon → capmeshd, unsolicited, §5)
 
@@ -62,12 +71,14 @@ MIDI hot-plug, gated behind the `hotplug-events` capability). Port ids are
 name-derived (`<dir>-<slug(name)>`, e.g. `source-keystation-49e`) and stable
 across sibling reindex (§2).
 
-## `nmidi-fake-source` — synthetic RTP-MIDI source (headless rehearsal / CI)
+## `nmidi-fake-source` — synthetic RTP-MIDI peer (headless rehearsal / CI)
 
-A second binary in this crate that plays the AppleMIDI *invitee* (source) role a
-real MIDI device would: it accepts an invitation, answers clock-sync, and streams
-periodic RTP-MIDI notes. It lets the full mount data path
-(`connecting → active → bytes-in`) run **without physical MIDI hardware**.
+A second binary in this crate that plays the AppleMIDI *invitee* role a real MIDI
+device would: it accepts an invitation and answers clock-sync. In the default
+(source) mode it then streams periodic RTP-MIDI notes; with `--sink` it instead
+*receives* and counts inbound RTP-MIDI, standing in for a remote sink. It lets the
+full mount data path run **without physical MIDI hardware** in either direction
+(`mirror-source` → `bytes-in`; `mirror-sink` → `bytes-out`).
 
 ```sh
 nmidi-fake-source --bind 127.0.0.1 --port 5008 --note-interval-ms 100
@@ -80,6 +91,7 @@ nmidi-fake-source --bind 127.0.0.1 --port 5008 --note-interval-ms 100
 | `--note-interval-ms <ms>` | `500` | Cadence of emitted MIDI notes. |
 | `--no-notes` | *(off)* | Accept + answer clock-sync but emit no MIDI (test clock-sync keep-alive). |
 | `--reject` | *(off)* | Reject every invitation with `NO` (test the mount reject → `failed` path). |
+| `--sink` | *(off)* | Act as a remote **sink**: receive + count inbound RTP-MIDI instead of emitting notes (test the `mirror-sink` path). |
 | `--name <str>` | `nmidi-fake-source` | Session name in the invitation reply and the mDNS service. |
 | `--no-advertise` | *(off)* | Suppress the `_apple-midi._udp` mDNS advertisement. |
 | `--log-level <lvl>` | `info` | Log verbosity. |
@@ -98,11 +110,19 @@ guest (hardware-independent, CI-gatable). Inside the guest:
 1. Start `nmidid` and `nmidi-fake-source --port 5008`.
 2. Point a mount at the fake source:
    `mount { role: "mirror-source", local: { virtual: true },
-   remote: { addr: "127.0.0.1", port: 5008, port-id: <a source id from
-   nmidid list-ports> }, format: { codec: "midi1" } }`.
-   > The mount's `remote.port-id` is validated against `nmidid`'s **local**
-   > `list-ports`, so pass a real id — `snd-virmidi` provides several.
+   remote: { addr: "127.0.0.1", port: 5008, port-id: "source-fake" },
+   format: { codec: "midi1" } }`.
+   > `remote.port-id` names a port on the *remote* peer, so `nmidid` treats it as
+   > an opaque label and does **not** check it against local ports (capmeshd
+   > validates it against the fetched remote descriptor). Any label works for a
+   > direct rehearsal like this.
 3. Watch `mount-state` reach `active` with `stats.bytes-in > 0`.
+
+For the reverse direction (`mirror-sink`), run `nmidi-fake-source --sink --port
+5008` and issue a `mount { role: "mirror-sink", local: { virtual: true }, remote:
+{ … port: 5008 … } }`; write MIDI into the local virtual sink and watch
+`mount-state` reach `active` with `stats.bytes-out > 0` (the fake sink also logs
+`fake-sink: received N MIDI message(s)`).
 
 The `nmidi-fake-source` binary ships in the `nmidid` package's output
 (`bin/nmidi-fake-source`), so a nixosTest can pull it into the guest closure.
