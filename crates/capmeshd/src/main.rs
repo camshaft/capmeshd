@@ -120,6 +120,10 @@ enum Cmd {
         role: String,
         #[arg(long)]
         local_name: Option<String>,
+        /// The local **real** port to bind for a `link` mount — the id from the data-plane daemon's
+        /// own `list-ports` (§3.1 `local.port-id`). Required for `link`; ignored for the mirror roles.
+        #[arg(long)]
+        local_port_id: Option<String>,
         /// Local codecs in preference order (the consuming side); defaults to [midi1].
         #[arg(long = "local-codec")]
         local_codecs: Vec<String>,
@@ -323,6 +327,7 @@ async fn main() -> Result<()> {
             remote_port_id,
             role,
             local_name,
+            local_port_id,
             local_codecs,
             remote_codecs,
             mount_id,
@@ -335,6 +340,7 @@ async fn main() -> Result<()> {
                 remote_port_id,
                 role,
                 local_name.clone(),
+                local_port_id.clone(),
                 local_codecs,
                 remote_codecs,
                 mount_id.clone(),
@@ -1540,6 +1546,7 @@ async fn cmd_connect(
     remote_port_id: &str,
     role: &str,
     local_name: Option<String>,
+    local_port_id: Option<String>,
     local_codecs: &[String],
     remote_codecs: &[String],
     mount_id: Option<String>,
@@ -1564,8 +1571,12 @@ async fn cmd_connect(
         local: LocalEndpoint {
             is_virtual: !matches!(role, MountRole::Link),
             name: local_name,
-            // Discovery-driven connect does not yet name a local real port for `link` (follow-on).
-            port_id: None,
+            // A `link` binds the named local real port (§3.1 `local.port-id`); mirror roles create a
+            // virtual endpoint and ignore it.
+            port_id: match role {
+                MountRole::Link => local_port_id,
+                MountRole::MirrorSource | MountRole::MirrorSink => None,
+            },
         },
         remote: RemoteEndpoint {
             host: remote_host.to_string(),
