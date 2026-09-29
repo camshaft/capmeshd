@@ -137,17 +137,38 @@ impl MountRegistry {
         self.notifier.clone()
     }
 
-    /// Establish a mount (§3.1). Idempotent on `mount-id`: a repeat returns the
-    /// existing mount's state rather than creating a second endpoint.
+    /// Establish a mount (§3.1). Idempotent on `mount-id`: a repeat against a
+    /// still-live mount returns the existing state rather than creating a second
+    /// endpoint. A repeat against a *terminal* mount (`failed`/`torn-down`, whose
+    /// pump task has exited) starts a fresh attempt — this is how capmeshd's
+    /// reconciler retries a `failed` mount (§3.2 "on failed it retries").
     pub fn mount(&self, spec: MountSpec) -> Result<serde_json::Value, DaemonError> {
         {
-            let mounts = self.mounts.lock().unwrap();
-            if let Some(entry) = mounts.get(&spec.mount_id) {
-                let status = entry.status.lock().unwrap();
-                return Ok(serde_json::json!({
-                    "mount-id": status.mount_id,
-                    "state": status.state,
-                }));
+            let mut mounts = self.mounts.lock().unwrap();
+            let existing = mounts.get(&spec.mount_id).map(|e| {
+                let s = e.status.lock().unwrap();
+                (s.mount_id.clone(), s.state)
+            });
+            if let Some((mount_id, state)) = existing {
+                // A mount in a terminal (dead) state — its pump task has exited
+                // and its virtual port has been dropped — is stale. capmeshd's
+                // reconciler retries a `failed` mount by re-issuing `mount` on the
+                // same id (the idempotency key; CONTROL-PROTOCOL §3.2 "on failed it
+                // retries"), so a re-issue here must start a *fresh* attempt rather
+                // than echo the dead state forever. A still-live mount
+                // (pending/connecting/active/degraded) stays idempotent.
+                if matches!(state, MountState::Failed | MountState::TornDown) {
+                    if let Some(dead) = mounts.remove(&spec.mount_id) {
+                        // The task has already exited terminally; this is only a
+                        // guard in case it is mid-teardown.
+                        dead.cancel.notify_one();
+                    }
+                } else {
+                    return Ok(serde_json::json!({
+                        "mount-id": mount_id,
+                        "state": state,
+                    }));
+                }
             }
         }
 
@@ -507,6 +528,47 @@ mod tests {
         s.role = MountRole::Link;
         let err = reg.mount(s).unwrap_err();
         assert_eq!(err.code, "role-unsupported");
+    }
+
+    #[test]
+    fn remount_after_terminal_state_reattempts_fresh() {
+        // CONTROL-PROTOCOL §3.2: capmeshd's reconciler retries a `failed` mount by
+        // re-issuing `mount` on the same id. A stale terminal entry (whose pump
+        // task has exited and virtual port dropped) must NOT wedge that id — the
+        // re-issue starts a fresh attempt.
+        for terminal in [MountState::Failed, MountState::TornDown] {
+            let reg = registry(true);
+            reg.mount(spec("m1", "source-0", "midi1")).unwrap();
+            // Simulate the pump reaching a terminal state and its task exiting.
+            {
+                let mounts = reg.mounts.lock().unwrap();
+                mounts.get("m1").unwrap().status.lock().unwrap().state = terminal;
+            }
+            // Re-issue: must re-attempt (fresh `connecting`), not echo the dead state.
+            let r = reg.mount(spec("m1", "source-0", "midi1")).unwrap();
+            assert_eq!(r["state"], "connecting", "re-mount after {terminal:?} must re-attempt");
+            let mounts = reg.status(None)["mounts"].as_array().unwrap().clone();
+            assert_eq!(mounts.len(), 1, "still exactly one mount for the id");
+            assert_eq!(mounts[0]["state"], "connecting");
+        }
+    }
+
+    #[test]
+    fn remount_while_live_stays_idempotent() {
+        // A still-live mount (connecting/active/degraded) is NOT re-attempted: the
+        // re-issue echoes the current state and does not create a second endpoint.
+        for live in [MountState::Connecting, MountState::Active, MountState::Degraded] {
+            let reg = registry(true);
+            reg.mount(spec("m1", "source-0", "midi1")).unwrap();
+            {
+                let mounts = reg.mounts.lock().unwrap();
+                mounts.get("m1").unwrap().status.lock().unwrap().state = live;
+            }
+            let r = reg.mount(spec("m1", "source-0", "midi1")).unwrap();
+            let want = serde_json::to_value(live).unwrap();
+            assert_eq!(r["state"], want, "re-mount while {live:?} echoes the live state");
+            assert_eq!(reg.status(None)["mounts"].as_array().unwrap().len(), 1);
+        }
     }
 
     #[test]
