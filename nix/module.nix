@@ -32,7 +32,8 @@ let
       } // lib.optionalAttrs (m.remote.host != null) { host = m.remote.host; };
     }
     // lib.optionalAttrs (m.mountId != null) { "mount-id" = m.mountId; }
-    // lib.optionalAttrs (m.localName != null) { "local-name" = m.localName; };
+    // lib.optionalAttrs (m.localName != null) { "local-name" = m.localName; }
+    // lib.optionalAttrs (m.localPortId != null) { "local-port-id" = m.localPortId; };
 
   # An automount entry → a `[[automount]]` table (§6.1). The `match` selector fields are all
   # optional (a `None` field matches anything, §6.1), so an unset field is OMITTED — the parser's
@@ -150,6 +151,14 @@ let
         type = lib.types.nullOr lib.types.str;
         default = null;
         description = "Display name for the local virtual device (mirror roles).";
+      };
+      localPortId = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        description = ''
+          The local real port to bind for a `link` mount — the port-id from the data-plane daemon's
+          own list-ports (§3.1 `local.port-id`). Required for `link`; ignored for the mirror roles.
+        '';
       };
       codec = lib.mkOption {
         type = lib.types.str;

@@ -1250,9 +1250,12 @@ fn permanent_to_spec(pm: &config::PermanentMount) -> Result<MountSpec> {
         local: LocalEndpoint {
             is_virtual: !matches!(role, MountRole::Link),
             name: pm.local_name.clone(),
-            // Permanent-mount config does not yet carry a local real-port selector for `link`
-            // (follow-on); a permanent link mount has no named local port until then.
-            port_id: None,
+            // A `link` binds the configured local real port (§3.1 `local.port-id`); mirror roles
+            // create a virtual endpoint and ignore it.
+            port_id: match role {
+                MountRole::Link => pm.local_port_id.clone(),
+                MountRole::MirrorSource | MountRole::MirrorSink => None,
+            },
         },
         remote: RemoteEndpoint {
             host,
@@ -1867,6 +1870,46 @@ mod tests {
         assert_eq!(s, 200);
         let (s, _) = call(&router, "DELETE", "/mcp/routes/board", None).await;
         assert_eq!(s, 404);
+    }
+
+    #[test]
+    fn permanent_to_spec_link_carries_the_local_port_id() {
+        // A `link` permanent mount → a non-virtual MountSpec whose local end names the configured
+        // local real port (§3.1 `local.port-id`); the daemon resolves direction from its own port.
+        let cfg = config::Config::parse(
+            r#"
+host-id = "studio-host"
+
+[[permanent-mount]]
+role = "link"
+local-port-id = "sink-supercollider"
+remote = { addr = "192.168.1.23", port = 5004, port-id = "kbd-0" }
+"#,
+        )
+        .expect("parse");
+        let spec = permanent_to_spec(&cfg.permanent_mounts[0]).expect("spec");
+        assert_eq!(spec.role, MountRole::Link);
+        assert!(!spec.local.is_virtual);
+        assert_eq!(spec.local.port_id.as_deref(), Some("sink-supercollider"));
+    }
+
+    #[test]
+    fn permanent_to_spec_mirror_omits_the_local_port_id() {
+        // A mirror mount never binds a local real port, even if `local-port-id` is (wrongly) set.
+        let cfg = config::Config::parse(
+            r#"
+host-id = "music-host"
+
+[[permanent-mount]]
+role = "mirror-source"
+local-port-id = "ignored"
+remote = { addr = "192.168.1.23", port = 5004, port-id = "kbd-0" }
+"#,
+        )
+        .expect("parse");
+        let spec = permanent_to_spec(&cfg.permanent_mounts[0]).expect("spec");
+        assert!(spec.local.is_virtual);
+        assert_eq!(spec.local.port_id, None);
     }
 
     #[test]
