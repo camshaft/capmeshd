@@ -7,3 +7,8 @@ description = "capmesh MCP gateway: federates mesh-discovered MCP servers behind
 
 [dependencies]
 serde_json.workspace = true
+
+[dev-dependencies]
+# The serve seam is async (it awaits an injected forwarder); tests drive it with a runtime.
+# Runtime deps stay pure — the daemon supplies the actual async transport.
+tokio.workspace = true
