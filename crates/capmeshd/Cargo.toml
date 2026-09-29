@@ -16,6 +16,7 @@ capmesh-daemon = { path = "../capmesh-daemon" }
 capmesh-mesh = { path = "../capmesh-mesh" }
 capmesh-model = { path = "../capmesh-model" }
 tokio.workspace = true
+axum = "0.8"
 mdns-sd.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -25,3 +26,7 @@ anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 hostname.workspace = true
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"

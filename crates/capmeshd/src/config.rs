@@ -64,6 +64,13 @@ pub struct Config {
     /// register endpoint and `cap=mcp` auto-discovery.
     #[serde(rename = "mcp-route", default)]
     pub mcp_routes: Vec<McpRouteConfig>,
+
+    /// Local bind address for the MCP route control endpoint (DESIGN §7.2 `register`). When set,
+    /// capmeshd serves `GET/POST/DELETE /mcp/routes` here so an operator (or `cap=mcp` discovery)
+    /// can add/remove routes at runtime. Bind loopback — this mutates control-plane state and is
+    /// not the peer-facing mesh endpoint. Absent → the endpoint is off (config routes only).
+    #[serde(rename = "mcp-control-addr", default)]
+    pub mcp_control_addr: Option<String>,
 }
 
 /// A statically-declared MCP route (DESIGN §7.2), the config form of an [`McpRoute`].
