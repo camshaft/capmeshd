@@ -72,6 +72,22 @@
               mainProgram = "surfaced";
             };
           };
+          # The MCP gateway data-plane daemon (DESIGN §7.2): the single agent-facing /mcp that
+          # federates the mesh's MCP servers. Pure Rust (axum/hyper) — no system libraries.
+          # doCheck runs the federation/transport unit tests (in-process, loopback) in the sandbox.
+          mcp-gateway = pkgs.rustPlatform.buildRustPackage {
+            pname = "mcp-gateway";
+            version = "0.1.0";
+            src = self;
+            cargoLock.lockFile = ./Cargo.lock;
+            cargoBuildFlags = [ "-p" "mcp-gateway" ];
+            cargoTestFlags = [ "-p" "mcp-gateway" ];
+            meta = {
+              description = "capmesh MCP gateway — one namespaced /mcp federating the mesh's MCP servers";
+              license = pkgs.lib.licenses.mit;
+              mainProgram = "mcp-gateway";
+            };
+          };
           # A scenario builder shared by every rehearsal package: the two-host cross-mesh topology
           # is fixed; only the fake source's flags and the trailing assertions vary per scenario.
           rehearsalScenarios =
@@ -162,6 +178,7 @@
           packages.capmeshd = capmeshd;
           packages.nmidid = nmidid;
           packages.surfaced = surfaced;
+          packages.mcp-gateway = mcp-gateway;
 
           # M0 rehearsal harness (nixosTest), cross-host (docs/M0-DEMO.md): a `source` host
           # advertises a MIDI source; the `sc` (SuperCollider) host discovers it and auto-mounts it
@@ -394,6 +411,53 @@
               cp rendered.toml $out
             '';
 
+          # mcp-gateway module render (seq-1377 + DESIGN §7.2): the unit launches mcp-gateway from a
+          # rendered `--config` TOML — bind / log / [[upstream]] — no argv/env config. The crate's
+          # GatewayConfig has deny_unknown_fields, so a render/key drift is a hard startup error.
+          checks.mcp-gateway-module-eval =
+            let
+              sys = nixpkgs.lib.nixosSystem {
+                inherit system;
+                modules = [
+                  self.nixosModules.mcp-gateway
+                  ({ ... }: {
+                    boot.loader.grub.enable = false;
+                    fileSystems."/" = { device = "none"; fsType = "tmpfs"; };
+                    system.stateVersion = "24.11";
+                    services.mcp-gateway = {
+                      enable = true;
+                      address = "0.0.0.0";
+                      port = 8091;
+                      upstreams = [
+                        { id = "board"; url = "http://127.0.0.1:7001/mcp"; }
+                        { id = "kb"; url = "http://127.0.0.1:7002/mcp"; protocolRev = "2026-07-28"; }
+                      ];
+                    };
+                  })
+                ];
+              };
+              execStart = toString sys.config.systemd.services.mcp-gateway.serviceConfig.ExecStart;
+              renderedToml = sys.config.environment.etc."mcp-gateway/mcp-gateway.toml".source;
+              svcEnv = sys.config.systemd.services.mcp-gateway.environment or { };
+              rustLogUnset = pkgs.lib.boolToString (!(svcEnv ? RUST_LOG));
+            in
+            pkgs.runCommand "mcp-gateway-module-eval" { inherit execStart rustLogUnset; } ''
+              printf '%s\n' "$execStart" | tee exec
+              # The unit launches the gateway from the rendered --config TOML — no argv config.
+              grep -q 'bin/mcp-gateway --config /etc/mcp-gateway/mcp-gateway.toml' exec
+              cp ${renderedToml} rendered.toml
+              cat rendered.toml
+              # GatewayConfig's schema (exact kebab-case keys; deny_unknown_fields).
+              grep -q 'bind = "0.0.0.0:8091"' rendered.toml
+              grep -q 'log = "info"' rendered.toml
+              grep -q 'id = "board"' rendered.toml
+              grep -q 'url = "http://127.0.0.1:7002/mcp"' rendered.toml
+              grep -q 'protocol-rev = "2026-07-28"' rendered.toml
+              printf 'no RUST_LOG env-var config=%s\n' "$rustLogUnset"
+              [ "$rustLogUnset" = "true" ]
+              cp rendered.toml $out
+            '';
+
           # Prove the NixOS module's enabled path evaluates and renders a §4.1 TOML that
           # the parser's `deny_unknown_fields` accepts (built by cargo test above).
           checks.nixos-module-render =
@@ -550,5 +614,6 @@
       nixosModules.capmesh = self.nixosModules.default;
       nixosModules.nmidid = import ./nix/nmidid-module.nix { inherit self; };
       nixosModules.surfaced = import ./nix/surfaced-module.nix { inherit self; };
+      nixosModules.mcp-gateway = import ./nix/mcp-gateway-module.nix { inherit self; };
     };
 }
