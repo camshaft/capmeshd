@@ -147,6 +147,12 @@ pub struct PermanentMount {
     /// Display name for the local virtual device (mirror roles).
     #[serde(rename = "local-name", default)]
     pub local_name: Option<String>,
+    /// The local **real** port to bind for a `link` mount (§3.1 `local.port-id`) — the id from the
+    /// data-plane daemon's own `list-ports` (e.g. `sink-supercollider`). Required in practice for a
+    /// `link` mount (there is no other way to name which local port to bind); ignored for the mirror
+    /// roles, which create a virtual endpoint rather than bind an existing one.
+    #[serde(rename = "local-port-id", default)]
+    pub local_port_id: Option<String>,
     /// Chosen wire-format codec.
     #[serde(default = "default_codec")]
     pub codec: String,
@@ -399,6 +405,27 @@ remote = { host = "studio", addr = "192.168.1.23", port = 5004, port-id = "kbd-0
         assert_eq!(pm.remote.addr, "192.168.1.23".parse::<IpAddr>().unwrap());
         assert_eq!(pm.remote.port, 5004);
         assert_eq!(pm.remote.port_id, "kbd-0");
+        // A mirror mount omits the local real-port selector.
+        assert_eq!(pm.local_port_id, None);
+    }
+
+    #[test]
+    fn parses_a_link_permanent_mount_with_a_local_port_id() {
+        // A `link` permanent mount names the local real port to bind via `local-port-id` (§3.1).
+        let cfg = Config::parse(
+            r#"
+host-id = "studio-host"
+
+[[permanent-mount]]
+role = "link"
+local-port-id = "sink-supercollider"
+remote = { addr = "192.168.1.23", port = 5004, port-id = "kbd-0" }
+"#,
+        )
+        .expect("parse");
+        let pm = &cfg.permanent_mounts[0];
+        assert_eq!(pm.role, "link");
+        assert_eq!(pm.local_port_id.as_deref(), Some("sink-supercollider"));
     }
 
     #[test]
