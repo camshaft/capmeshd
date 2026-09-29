@@ -46,11 +46,12 @@ impl UpstreamEndpoint {
     }
 }
 
-/// The HTTP [`UpstreamForwarder`]: routes each `tools/call` to its owning upstream's endpoint.
+/// The HTTP [`UpstreamForwarder`]: routes each `tools/call` to its owning upstream's endpoint. The
+/// endpoint table is mutable so capmeshd can (de)federate upstreams on the running gateway.
 #[derive(Clone)]
 pub struct HttpForwarder {
     client: HttpClient,
-    endpoints: Arc<HashMap<String, UpstreamEndpoint>>,
+    endpoints: Arc<std::sync::RwLock<HashMap<String, UpstreamEndpoint>>>,
     next_id: Arc<AtomicI64>,
 }
 
@@ -60,15 +61,39 @@ impl HttpForwarder {
     pub fn new(endpoints: HashMap<String, UpstreamEndpoint>) -> Self {
         Self {
             client: http_client(),
-            endpoints: Arc::new(endpoints),
+            endpoints: Arc::new(std::sync::RwLock::new(endpoints)),
             next_id: Arc::new(AtomicI64::new(1)),
         }
+    }
+
+    /// Add or replace an upstream's endpoint (a live federate).
+    pub fn set_endpoint(&self, upstream_id: impl Into<String>, endpoint: UpstreamEndpoint) {
+        self.endpoints
+            .write()
+            .expect("endpoints lock poisoned")
+            .insert(upstream_id.into(), endpoint);
+    }
+
+    /// Drop an upstream's endpoint (a live defederate). Returns whether it had been present.
+    pub fn remove_endpoint(&self, upstream_id: &str) -> bool {
+        self.endpoints
+            .write()
+            .expect("endpoints lock poisoned")
+            .remove(upstream_id)
+            .is_some()
     }
 }
 
 impl UpstreamForwarder for HttpForwarder {
     fn forward(&self, upstream_id: String, tool: String, arguments: Value) -> ForwardFuture {
-        let Some(endpoint) = self.endpoints.get(&upstream_id).cloned() else {
+        // Clone the endpoint out from under the lock before awaiting the round-trip.
+        let endpoint = self
+            .endpoints
+            .read()
+            .expect("endpoints lock poisoned")
+            .get(&upstream_id)
+            .cloned();
+        let Some(endpoint) = endpoint else {
             let msg = format!("no endpoint for upstream '{upstream_id}'");
             return Box::pin(async move { Err(msg) });
         };

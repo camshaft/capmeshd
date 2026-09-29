@@ -14,10 +14,11 @@ use crate::client::{
     tools_list_request, DEFAULT_PROTOCOL_VERSION,
 };
 use crate::config::UpstreamConfig;
-use crate::forward::{post_and_session, post_jsonrpc, HttpClient, UpstreamEndpoint};
+use crate::forward::{post_and_session, post_jsonrpc, HttpClient, HttpForwarder, UpstreamEndpoint};
 use crate::{Federation, NS_SEP};
 use serde_json::Value;
 use std::collections::HashMap;
+use tokio::sync::RwLock;
 use tracing::{info, warn};
 
 /// The client name the gateway presents to upstreams on `initialize`.
@@ -84,6 +85,48 @@ async fn connect_one(
     Ok((tools_from_list_result(&result), session_id))
 }
 
+/// Federate (or re-federate) one upstream on the *running* gateway: connect it, point the forwarder
+/// at its endpoint, and merge its tools into the live [`Federation`]. Returns whether the federated
+/// surface changed (a new upstream, or different tools) — the caller emits `tools/list_changed`
+/// when it did. This is the op capmeshd drives over the gateway control socket on a `register`.
+pub async fn federate(
+    client: &HttpClient,
+    federation: &RwLock<Federation>,
+    forwarder: &HttpForwarder,
+    id: &str,
+    url: &str,
+    protocol: &str,
+) -> Result<bool, String> {
+    if id.contains(NS_SEP) {
+        return Err(format!("upstream id '{id}' must not contain '{NS_SEP}'"));
+    }
+    let (tools, session_id) = connect_one(client, url, protocol).await?;
+    // Point the forwarder first, so a concurrent tools/call can route the moment the tools appear.
+    forwarder.set_endpoint(
+        id,
+        UpstreamEndpoint {
+            url: url.to_string(),
+            session_id,
+        },
+    );
+    let changed = federation.write().await.set_upstream_tools(id, tools);
+    info!(%id, %url, changed, "federated upstream (live)");
+    Ok(changed)
+}
+
+/// Defederate one upstream from the running gateway: drop it from the forwarder and the live
+/// [`Federation`]. Returns whether it had been federated (→ emit `tools/list_changed`).
+pub async fn defederate(
+    federation: &RwLock<Federation>,
+    forwarder: &HttpForwarder,
+    id: &str,
+) -> bool {
+    forwarder.remove_endpoint(id);
+    let changed = federation.write().await.remove_upstream(id);
+    info!(%id, changed, "defederated upstream (live)");
+    changed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -109,6 +152,9 @@ mod tests {
                         .into_response(),
                     "tools/list" => Json(json!({ "jsonrpc": "2.0", "id": id,
                         "result": { "tools": [{ "name": tool, "inputSchema": {"type":"object"} }] } }))
+                    .into_response(),
+                    "tools/call" => Json(json!({ "jsonrpc": "2.0", "id": id,
+                        "result": { "content": [{ "type": "text", "text": "created" }] } }))
                     .into_response(),
                     // notifications/initialized — no id, no body.
                     _ => axum::http::StatusCode::ACCEPTED.into_response(),
@@ -181,5 +227,62 @@ mod tests {
         let client = http_client();
         let (federation, _) = connect_upstreams(&client, &[upstream("bad__id", url)]).await;
         assert!(federation.upstream_ids().is_empty());
+    }
+
+    #[tokio::test]
+    async fn federate_then_defederate_updates_the_live_federation_and_forwarder() {
+        use crate::forward::HttpForwarder;
+        use crate::http::UpstreamForwarder;
+        use std::collections::HashMap;
+
+        let url = spawn_upstream("create_task").await;
+        let client = http_client();
+        let federation = RwLock::new(Federation::new());
+        let forwarder = HttpForwarder::new(HashMap::new());
+
+        // Federate on the running gateway: new upstream → surface changed.
+        let changed = federate(&client, &federation, &forwarder, "board", &url, "2026-07-28")
+            .await
+            .unwrap();
+        assert!(changed);
+        assert_eq!(
+            federation.read().await.merged_tools()[0]["name"],
+            "board__create_task"
+        );
+        // The forwarder now routes to the freshly-federated upstream.
+        let msg = forwarder
+            .forward("board".into(), "create_task".into(), json!({}))
+            .await
+            .unwrap();
+        assert_eq!(msg["result"]["content"][0]["text"], "created");
+
+        // Re-federate with identical tools → no surface change (idempotent).
+        let changed = federate(&client, &federation, &forwarder, "board", &url, "2026-07-28")
+            .await
+            .unwrap();
+        assert!(!changed);
+
+        // Defederate → removed from both; the forwarder no longer routes it.
+        assert!(defederate(&federation, &forwarder, "board").await);
+        assert!(federation.read().await.upstream_ids().is_empty());
+        let err = forwarder
+            .forward("board".into(), "create_task".into(), json!({}))
+            .await
+            .unwrap_err();
+        assert!(err.contains("no endpoint for upstream 'board'"));
+        // Defederating an absent upstream reports no change.
+        assert!(!defederate(&federation, &forwarder, "board").await);
+    }
+
+    #[tokio::test]
+    async fn federate_rejects_a_namespaced_id() {
+        let url = spawn_upstream("t").await;
+        let client = http_client();
+        let federation = RwLock::new(Federation::new());
+        let forwarder = crate::forward::HttpForwarder::new(std::collections::HashMap::new());
+        let err = federate(&client, &federation, &forwarder, "bad__id", &url, "2026-07-28")
+            .await
+            .unwrap_err();
+        assert!(err.contains("must not contain"));
     }
 }
