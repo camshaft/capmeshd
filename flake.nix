@@ -372,11 +372,12 @@
               dynUser = pkgs.lib.boolToString (sys.config.systemd.services.capmesh.serviceConfig.DynamicUser or false);
               svcUser = sys.config.systemd.services.capmesh.serviceConfig.User or "";
               hasGroup = pkgs.lib.boolToString (sys.config.users.groups ? capmesh);
-              rustLog = sys.config.systemd.services.capmesh.environment.RUST_LOG or "";
+              # seq-1377: log verbosity is TOML config, not an env var — assert no RUST_LOG is set.
+              rustLogUnset = pkgs.lib.boolToString (!(sys.config.systemd.services.capmesh.environment ? RUST_LOG));
             in
             pkgs.runCommand "capmesh-module-render"
               {
-                inherit supGroups dynUser svcUser hasGroup rustLog;
+                inherit supGroups dynUser svcUser hasGroup rustLogUnset;
               } ''
               cp ${sys.config.environment.etc."capmesh/capmesh.toml".source} rendered.toml
               cat rendered.toml
@@ -400,9 +401,10 @@
               # group, or systemd 217/USER-crashes on the colliding same-named transient group (#79).
               [ "$svcUser" = "capmeshd" ]
               [ "$svcUser" != "$supGroups" ]
-              # Log verbosity is set declaratively (defaults to info) via RUST_LOG.
-              printf 'RUST_LOG=%s\n' "$rustLog"
-              [ "$rustLog" = "info" ]
+              # seq-1377: log verbosity is TOML config (defaults to info), NOT an env var.
+              grep -q 'log = "info"' rendered.toml
+              printf 'RUST_LOG unset=%s\n' "$rustLogUnset"
+              [ "$rustLogUnset" = "true" ]
               cp rendered.toml $out
             '';
 

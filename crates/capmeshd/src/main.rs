@@ -257,14 +257,17 @@ impl MountArgs {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
-
     let args = Args::parse();
+
+    // Log verbosity is TOML config, not an env var (fleet mandate seq-1377: no `RUST_LOG`). Read
+    // it from `--config` before anything logs; a missing/unparseable config falls back to `info`
+    // (the daemon path below re-loads and warns), so logging always comes up.
+    let log_directive = Config::load(&args.config)
+        .map(|c| c.log)
+        .unwrap_or_else(|_| "info".to_string());
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::new(log_directive))
+        .init();
 
     match &args.cmd {
         Some(Cmd::ProbeCtl { socket, watch }) => return probe_ctl(socket, *watch).await,
