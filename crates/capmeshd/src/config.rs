@@ -78,6 +78,13 @@ pub struct Config {
     #[serde(rename = "mcp-control-addr", default)]
     pub mcp_control_addr: Option<String>,
 
+    /// Base URL of the MCP gateway's control channel (DESIGN §7.2), e.g. `http://127.0.0.1:8092`.
+    /// When set, capmeshd drives the running gateway on every route registry change (register →
+    /// federate, unregister → defederate) so a `cap=mcp` (de)registration takes effect live. Absent
+    /// → the registry is maintained but the gateway is not driven (it uses its own static config).
+    #[serde(rename = "gateway-admin-url", default)]
+    pub gateway_admin_url: Option<String>,
+
     /// Local bind address for capmesh's own embedded control-tools MCP server (DESIGN §7.1). When
     /// set, capmeshd serves `POST /mcp` here exposing its control tools (discover/describe/connect/
     /// disconnect/status), so the gateway can federate capmesh as a `cap=mcp` upstream. Bind

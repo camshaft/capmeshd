@@ -28,7 +28,8 @@ use capmesh_ctl::{
 use capmesh_daemon::automount::{
     self, ActiveAutoMount, AutoMountOutcome, Lifetime, Remote, teardown_on_unadvertise,
 };
-use capmesh_daemon::mcp_routes::{McpRouteRegistry, RouteRequest, RouteResponse};
+use capmesh_daemon::gateway_driver::{self, GatewayCommand, GatewayClient};
+use capmesh_daemon::mcp_routes::{McpRouteRegistry, RegisterOutcome, RouteRequest, RouteResponse};
 use capmesh_daemon::negotiate;
 use capmesh_daemon::reconcile::{self, Reconciler};
 use capmesh_discovery::{self as discovery, AppleMidiPeers, PendingAutoMounts, PendingPeer};
@@ -432,10 +433,22 @@ async fn main() -> Result<()> {
     // registry. Best-effort: a bind failure is logged, not fatal.
     if let Some(addr) = cfg.mcp_control_addr.clone() {
         let shared: SharedMcpRoutes = Arc::new(Mutex::new(registry));
+        // When a gateway admin URL is configured, drive it live on every route change (§7.2).
+        let gateway = cfg.gateway_admin_url.clone().map(|base_url| {
+            info!(%base_url, "driving mcp gateway on route changes");
+            GatewayDriver {
+                client: gateway_driver::gateway_client(),
+                base_url,
+            }
+        });
+        let state = McpControlState {
+            routes: shared,
+            gateway,
+        };
         match tokio::net::TcpListener::bind(&addr).await {
             Ok(listener) => {
                 info!(%addr, "mcp route control endpoint listening");
-                let router = mcp_control_router(shared);
+                let router = mcp_control_router(state);
                 tokio::spawn(async move {
                     if let Err(e) = axum::serve(listener, router).await {
                         warn!("mcp route control endpoint server error: {e}");
@@ -1227,15 +1240,31 @@ fn build_mcp_route_registry(cfg: &Config) -> McpRouteRegistry {
 /// The MCP route registry shared between the control endpoint and (later) the gateway-driving loop.
 type SharedMcpRoutes = Arc<Mutex<McpRouteRegistry>>;
 
+/// A driver that pushes route changes to the running MCP gateway's control channel.
+#[derive(Clone)]
+struct GatewayDriver {
+    client: GatewayClient,
+    base_url: String,
+}
+
+/// The MCP route control-endpoint state: the shared registry + an optional gateway driver (present
+/// when `gateway-admin-url` is configured). On a route change, capmeshd drives the running gateway
+/// to (de)federate — so a `register`/`unregister` (manual, or `cap=mcp` auto-discovery) takes effect
+/// live.
+#[derive(Clone)]
+struct McpControlState {
+    routes: SharedMcpRoutes,
+    gateway: Option<GatewayDriver>,
+}
+
 /// The axum router for the MCP route control endpoint (DESIGN §7.2 `register`): `GET /mcp/routes`
 /// lists the registry, `POST /mcp/routes` registers (upserts) a route from an [`McpRoute`] body,
-/// `DELETE /mcp/routes/{id}` unregisters one. Each maps to a [`RouteRequest`] the shared
-/// [`McpRouteRegistry`] handles; the response carries the registry's status + JSON body.
-fn mcp_control_router(routes: SharedMcpRoutes) -> Router {
+/// `DELETE /mcp/routes/{id}` unregisters one. A change also drives the gateway (when configured).
+fn mcp_control_router(state: McpControlState) -> Router {
     Router::new()
         .route("/mcp/routes", get(list_mcp_routes).post(register_mcp_route))
         .route("/mcp/routes/{id}", delete(unregister_mcp_route))
-        .with_state(routes)
+        .with_state(state)
 }
 
 /// Render a registry [`RouteResponse`] as an HTTP response.
@@ -1244,24 +1273,56 @@ fn render_route_response(resp: RouteResponse) -> impl IntoResponse {
     (status, Json(resp.body))
 }
 
-async fn list_mcp_routes(State(routes): State<SharedMcpRoutes>) -> impl IntoResponse {
-    let resp = routes.lock().unwrap().handle(RouteRequest::List);
+/// Drive the gateway with `cmd` (fire-and-forget): a down/unreachable gateway is logged, not fatal —
+/// the registry stays authoritative and capmeshd re-drives on the next change. No-op when no gateway
+/// is configured or the command is a [`GatewayCommand::Noop`].
+fn drive_gateway(gateway: &Option<GatewayDriver>, cmd: GatewayCommand) {
+    let Some(gw) = gateway else { return };
+    if matches!(cmd, GatewayCommand::Noop) {
+        return;
+    }
+    let client = gw.client.clone();
+    let base_url = gw.base_url.clone();
+    tokio::spawn(async move {
+        if let Err(e) = gateway_driver::send_command(&client, &base_url, &cmd).await {
+            warn!("driving gateway on route change failed: {e}");
+        }
+    });
+}
+
+async fn list_mcp_routes(State(state): State<McpControlState>) -> impl IntoResponse {
+    let resp = state.routes.lock().unwrap().handle(RouteRequest::List);
     render_route_response(resp)
 }
 
 async fn register_mcp_route(
-    State(routes): State<SharedMcpRoutes>,
+    State(state): State<McpControlState>,
     Json(route): Json<McpRoute>,
 ) -> impl IntoResponse {
-    let resp = routes.lock().unwrap().handle(RouteRequest::Register(route));
+    let route_for_gw = route.clone();
+    let resp = state.routes.lock().unwrap().handle(RouteRequest::Register(route));
+    // A registry change (Added/Updated — never Unchanged) federates the upstream on the gateway.
+    if resp.status == 200 && resp.changed {
+        drive_gateway(
+            &state.gateway,
+            gateway_driver::on_register(&route_for_gw, RegisterOutcome::Added),
+        );
+    }
     render_route_response(resp)
 }
 
 async fn unregister_mcp_route(
-    State(routes): State<SharedMcpRoutes>,
+    State(state): State<McpControlState>,
     AxumPath(id): AxumPath<String>,
 ) -> impl IntoResponse {
-    let resp = routes.lock().unwrap().handle(RouteRequest::Unregister(id));
+    let resp = state
+        .routes
+        .lock()
+        .unwrap()
+        .handle(RouteRequest::Unregister(id.clone()));
+    if resp.status == 200 && resp.changed {
+        drive_gateway(&state.gateway, gateway_driver::on_unregister(&id));
+    }
     render_route_response(resp)
 }
 
@@ -1663,7 +1724,8 @@ mod tests {
         use tower::ServiceExt; // for `oneshot`
 
         let routes: SharedMcpRoutes = Arc::new(Mutex::new(McpRouteRegistry::new()));
-        let router = mcp_control_router(routes);
+        // No gateway configured in this test — the registry behavior is what's under test.
+        let router = mcp_control_router(McpControlState { routes, gateway: None });
 
         // Run one request against a fresh clone of the (shared-state) router.
         async fn call(
