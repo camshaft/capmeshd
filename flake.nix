@@ -348,6 +348,52 @@
               cp rendered.toml $out
             '';
 
+          # nmidid module render (fleet mandate seq-1377): the unit launches nmidid from a rendered
+          # `--config` TOML — no argv/env config. Asserts the shipped schema keys (nmidid's config.rs
+          # has `deny_unknown_fields`, so a render/key drift is a hard startup error) and no RUST_LOG.
+          checks.nmidid-module-eval =
+            let
+              sys = nixpkgs.lib.nixosSystem {
+                inherit system;
+                modules = [
+                  self.nixosModules.nmidid
+                  ({ ... }: {
+                    boot.loader.grub.enable = false;
+                    fileSystems."/" = { device = "none"; fsType = "tmpfs"; };
+                    system.stateVersion = "24.11";
+                    services.nmidid = {
+                      enable = true;
+                      socket = "/run/nmidid/nmidid.sock";
+                      monitorInterval = 5;
+                      allowedGroups = [ "capmesh" ];
+                    };
+                  })
+                ];
+              };
+              execStart = toString sys.config.systemd.services.nmidid.serviceConfig.ExecStart;
+              renderedToml = sys.config.environment.etc."nmidid/nmidid.toml".source;
+              svcEnv = sys.config.systemd.services.nmidid.environment or { };
+              # seq-1377: config is the TOML, never env vars — assert the unit sets no RUST_LOG.
+              rustLogUnset = pkgs.lib.boolToString (!(svcEnv ? RUST_LOG));
+            in
+            pkgs.runCommand "nmidid-module-eval" { inherit execStart rustLogUnset; } ''
+              printf '%s\n' "$execStart" | tee exec
+              # The unit launches nmidid from the rendered --config TOML — no argv config.
+              grep -q 'bin/nmidid --config /etc/nmidid/nmidid.toml' exec
+              # ... and none of the old argv config flags survive.
+              ! grep -qE -- '--socket|--log-level|--allow-uid|--allow-gid|--allow-group' exec
+              cp ${renderedToml} rendered.toml
+              cat rendered.toml
+              # nmidid's shipped schema (exact kebab-case keys; deny_unknown_fields).
+              grep -q 'socket = "/run/nmidid/nmidid.sock"' rendered.toml
+              grep -q 'monitor-interval-secs = 5' rendered.toml
+              grep -q 'log = "info"' rendered.toml
+              grep -q 'allow-groups = \["capmesh"\]' rendered.toml
+              printf 'no RUST_LOG env-var config=%s\n' "$rustLogUnset"
+              [ "$rustLogUnset" = "true" ]
+              cp rendered.toml $out
+            '';
+
           # Prove the NixOS module's enabled path evaluates and renders a §4.1 TOML that
           # the parser's `deny_unknown_fields` accepts (built by cargo test above).
           checks.nixos-module-render =
@@ -468,6 +514,7 @@
               nmididExec = toString (demo.config.systemd.services.nmidid.serviceConfig.ExecStart or "");
               nmididGroup = toString (demo.config.systemd.services.nmidid.serviceConfig.Group or "");
               capmeshSup = toString (demo.config.systemd.services.capmesh.serviceConfig.SupplementaryGroups or [ ]);
+              nmididToml = demo.config.environment.etc."nmidid/nmidid.toml".source;
             in
             pkgs.runCommand "capmesh-m0-demo-codeploy"
               {
@@ -484,7 +531,12 @@
                 "$nmididGroup" "$capmeshSup" "$nmididExec"
               [ "$nmididGroup" = "capmesh" ]
               [ "$capmeshSup" = "capmesh" ]
-              echo "$nmididExec" | grep -q -- '--allow-group capmesh'
+              # nmidid launches from its --config TOML (seq-1377), which authorizes the shared group
+              # for the peer-cred check — the config-file form of the old `--allow-group capmesh`.
+              echo "$nmididExec" | grep -q -- '--config /etc/nmidid/nmidid.toml'
+              cp ${nmididToml} nmidid.toml
+              cat nmidid.toml
+              grep -q 'allow-groups = \["capmesh"\]' nmidid.toml
               cp rendered.toml $out
             '';
 
