@@ -59,8 +59,9 @@ pub struct HelloResult {
     pub capabilities: Vec<String>,
 }
 
-/// `list-ports` result (§3).
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+/// `list-ports` result (§3). `Serialize` too so the CLI can emit it as machine-readable JSON
+/// (`capmeshd list-ports --json`), mirroring the wire keys (`port-id`, `type`, …).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ListPortsResult {
     pub ports: Vec<PortDescriptor>,
 }
@@ -378,6 +379,30 @@ mod tests {
         assert!(!src.matches_dir(Some("sink"))); // wrong direction
         assert!(undirected.matches_dir(None)); // a dir-less port matches only the None selector
         assert!(!undirected.matches_dir(Some("source")));
+    }
+
+    #[test]
+    fn list_ports_result_serializes_with_wire_keys() {
+        // `capmeshd list-ports --json` emits this; the link CI guard resolves a sink id from it via
+        // `jq -r '.ports[] | select(.dir=="sink") | .["port-id"]'`, so pin the wire keys/values.
+        let result = ListPortsResult {
+            ports: vec![PortDescriptor {
+                port_id: "sink-supercollider".into(),
+                kind: "stream".into(),
+                dir: Some("sink".into()),
+                type_: "midi".into(),
+                name: "SuperCollider".into(),
+                virtualizable: false,
+                formats: vec![],
+            }],
+        };
+        let v = serde_json::to_value(&result).unwrap();
+        assert_eq!(v["ports"][0]["port-id"], "sink-supercollider");
+        assert_eq!(v["ports"][0]["dir"], "sink");
+        assert_eq!(v["ports"][0]["type"], "midi");
+        // Round-trips back through the receiving (client) deserialize path.
+        let back: ListPortsResult = serde_json::from_value(v).unwrap();
+        assert_eq!(back, result);
     }
 
     #[test]
