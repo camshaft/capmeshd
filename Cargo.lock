@@ -241,6 +241,7 @@ name = "capmeshd"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "capmesh-ctl",
  "capmesh-daemon",
  "capmesh-discovery",
@@ -248,11 +249,13 @@ dependencies = [
  "capmesh-model",
  "clap",
  "hostname",
+ "http-body-util",
  "mdns-sd",
  "serde",
  "serde_json",
  "tokio",
  "toml",
+ "tower",
  "tracing",
  "tracing-subscriber",
 ]

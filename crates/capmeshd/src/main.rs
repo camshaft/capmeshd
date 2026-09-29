@@ -14,11 +14,20 @@
 mod config;
 
 use anyhow::{Context, Result};
-use capmesh_ctl::{CtlClient, CtlError, Format, LocalEndpoint, MountRole, MountSpec, RemoteEndpoint};
+use axum::{
+    Json, Router,
+    extract::{Path as AxumPath, State},
+    http::StatusCode,
+    response::IntoResponse,
+    routing::{delete, get},
+};
+use capmesh_ctl::{
+    CtlClient, CtlError, Format, LocalEndpoint, McpRoute, MountRole, MountSpec, RemoteEndpoint,
+};
 use capmesh_daemon::automount::{
     self, ActiveAutoMount, AutoMountOutcome, Lifetime, Remote, teardown_on_unadvertise,
 };
-use capmesh_daemon::mcp_routes::McpRouteRegistry;
+use capmesh_daemon::mcp_routes::{McpRouteRegistry, RouteRequest, RouteResponse};
 use capmesh_daemon::negotiate;
 use capmesh_daemon::reconcile::{self, Reconciler};
 use capmesh_discovery::{self as discovery, AppleMidiPeers, PendingAutoMounts, PendingPeer};
@@ -396,8 +405,27 @@ async fn main() -> Result<()> {
     // Seed the MCP route registry (DESIGN §7.2) from the statically-declared `[[mcp-route]]`
     // entries — the "explicit floor" for known upstreams. The runtime register endpoint and
     // `cap=mcp` auto-discovery mutate the same registry; the gateway is driven off it.
-    let mcp_routes = build_mcp_route_registry(&cfg);
-    info!(routes = mcp_routes.len(), "mcp route registry seeded from config");
+    let registry = build_mcp_route_registry(&cfg);
+    info!(routes = registry.len(), "mcp route registry seeded from config");
+
+    // Serve the runtime MCP route control endpoint (DESIGN §7.2 `register`) when configured, so an
+    // operator (or, later, `cap=mcp` discovery) can add/remove routes live. It shares the seeded
+    // registry. Best-effort: a bind failure is logged, not fatal.
+    if let Some(addr) = cfg.mcp_control_addr.clone() {
+        let shared: SharedMcpRoutes = Arc::new(Mutex::new(registry));
+        match tokio::net::TcpListener::bind(&addr).await {
+            Ok(listener) => {
+                info!(%addr, "mcp route control endpoint listening");
+                let router = mcp_control_router(shared);
+                tokio::spawn(async move {
+                    if let Err(e) = axum::serve(listener, router).await {
+                        warn!("mcp route control endpoint server error: {e}");
+                    }
+                });
+            }
+            Err(e) => warn!(%addr, "mcp route control endpoint: bind failed: {e}"),
+        }
+    }
 
     // Serve the mesh control endpoint (docs/MESH-PROTOCOL.md) on the advertised port so peers
     // can resolve this host's `descr` pointers into full capability descriptors. The provider
@@ -1132,6 +1160,47 @@ fn build_mcp_route_registry(cfg: &Config) -> McpRouteRegistry {
     registry
 }
 
+/// The MCP route registry shared between the control endpoint and (later) the gateway-driving loop.
+type SharedMcpRoutes = Arc<Mutex<McpRouteRegistry>>;
+
+/// The axum router for the MCP route control endpoint (DESIGN §7.2 `register`): `GET /mcp/routes`
+/// lists the registry, `POST /mcp/routes` registers (upserts) a route from an [`McpRoute`] body,
+/// `DELETE /mcp/routes/{id}` unregisters one. Each maps to a [`RouteRequest`] the shared
+/// [`McpRouteRegistry`] handles; the response carries the registry's status + JSON body.
+fn mcp_control_router(routes: SharedMcpRoutes) -> Router {
+    Router::new()
+        .route("/mcp/routes", get(list_mcp_routes).post(register_mcp_route))
+        .route("/mcp/routes/{id}", delete(unregister_mcp_route))
+        .with_state(routes)
+}
+
+/// Render a registry [`RouteResponse`] as an HTTP response.
+fn render_route_response(resp: RouteResponse) -> impl IntoResponse {
+    let status = StatusCode::from_u16(resp.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    (status, Json(resp.body))
+}
+
+async fn list_mcp_routes(State(routes): State<SharedMcpRoutes>) -> impl IntoResponse {
+    let resp = routes.lock().unwrap().handle(RouteRequest::List);
+    render_route_response(resp)
+}
+
+async fn register_mcp_route(
+    State(routes): State<SharedMcpRoutes>,
+    Json(route): Json<McpRoute>,
+) -> impl IntoResponse {
+    let resp = routes.lock().unwrap().handle(RouteRequest::Register(route));
+    render_route_response(resp)
+}
+
+async fn unregister_mcp_route(
+    State(routes): State<SharedMcpRoutes>,
+    AxumPath(id): AxumPath<String>,
+) -> impl IntoResponse {
+    let resp = routes.lock().unwrap().handle(RouteRequest::Unregister(id));
+    render_route_response(resp)
+}
+
 /// Reconcile the config's permanent mounts (DESIGN §9) against the local MIDI data-plane
 /// daemon named by `[dataplane.midi].socket`. Best-effort at startup: an unreachable daemon
 /// or an invalid mount is logged, not fatal — the daemon keeps advertising/browsing.
@@ -1504,6 +1573,68 @@ mod tests {
 
         // A direction the descriptor doesn't expose yields nothing (→ discover drops it).
         assert!(matching_ports(&cap, Some("duplex")).is_empty());
+    }
+
+    #[tokio::test]
+    async fn mcp_control_endpoint_register_list_unregister() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use http_body_util::BodyExt;
+        use tower::ServiceExt; // for `oneshot`
+
+        let routes: SharedMcpRoutes = Arc::new(Mutex::new(McpRouteRegistry::new()));
+        let router = mcp_control_router(routes);
+
+        // Run one request against a fresh clone of the (shared-state) router.
+        async fn call(
+            router: &Router,
+            method: &str,
+            path: &str,
+            body: Option<serde_json::Value>,
+        ) -> (u16, serde_json::Value) {
+            let builder = Request::builder().method(method).uri(path);
+            let req = match body {
+                Some(b) => builder
+                    .header("content-type", "application/json")
+                    .body(Body::from(b.to_string()))
+                    .unwrap(),
+                None => builder.body(Body::empty()).unwrap(),
+            };
+            let resp = router.clone().oneshot(req).await.unwrap();
+            let status = resp.status().as_u16();
+            let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+            let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+            (status, json)
+        }
+
+        let board = serde_json::json!({
+            "id": "board", "url": "http://h/board/mcp", "transport": "streamable-http"
+        });
+
+        // POST registers → 200 added.
+        let (s, b) = call(&router, "POST", "/mcp/routes", Some(board.clone())).await;
+        assert_eq!(s, 200);
+        assert_eq!(b["outcome"], "added");
+
+        // GET lists it.
+        let (s, b) = call(&router, "GET", "/mcp/routes", None).await;
+        assert_eq!(s, 200);
+        assert_eq!(b["routes"][0]["id"], "board");
+
+        // Idempotent re-POST → 200 unchanged.
+        let (_, b) = call(&router, "POST", "/mcp/routes", Some(board)).await;
+        assert_eq!(b["outcome"], "unchanged");
+
+        // Invalid id → 400.
+        let bad = serde_json::json!({"id":"bad_id","url":"http://h/mcp","transport":"stdio"});
+        let (s, _) = call(&router, "POST", "/mcp/routes", Some(bad)).await;
+        assert_eq!(s, 400);
+
+        // DELETE existing → 200; DELETE again → 404.
+        let (s, _) = call(&router, "DELETE", "/mcp/routes/board", None).await;
+        assert_eq!(s, 200);
+        let (s, _) = call(&router, "DELETE", "/mcp/routes/board", None).await;
+        assert_eq!(s, 404);
     }
 
     #[test]
