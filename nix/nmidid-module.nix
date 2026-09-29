@@ -7,6 +7,21 @@
 { config, lib, pkgs, ... }:
 let
   cfg = config.services.nmidid;
+  tomlFormat = pkgs.formats.toml { };
+
+  # The §1/§1.1 config rendered from options into nmidid's --config TOML (fleet mandate seq-1377:
+  # daemons take config from a file, never env vars). Keys are nmidid's shipped schema (kebab-case,
+  # serde deny_unknown_fields — an unknown/typo'd key is a hard parse error). socketGroup is a
+  # systemd concern (the unit's Group=), not a crate config key, so it is NOT in the TOML.
+  settings = {
+    socket = toString cfg.socket;
+    "monitor-interval-secs" = cfg.monitorInterval;
+    log = cfg.logLevel;
+    "allow-uids" = cfg.allowedUids;
+    "allow-gids" = cfg.allowedGids;
+    "allow-groups" = cfg.allowedGroups;
+  };
+  configFile = tomlFormat.generate "nmidid.toml" settings;
 in
 {
   options.services.nmidid = {
@@ -28,7 +43,19 @@ in
     logLevel = lib.mkOption {
       type = lib.types.enum [ "trace" "debug" "info" "warn" "error" ];
       default = "info";
-      description = "Log verbosity.";
+      description = ''
+        Log verbosity, rendered into the TOML `log` key (nmidid reads it from `--config`, not from
+        `RUST_LOG` or any env var; fleet mandate seq-1377).
+      '';
+    };
+
+    monitorInterval = lib.mkOption {
+      type = lib.types.int;
+      default = 5;
+      description = ''
+        Hot-plug poll interval in seconds (CONTROL-PROTOCOL §5), rendered into the TOML
+        `monitor-interval-secs` key.
+      '';
     };
 
     socketGroup = lib.mkOption {
@@ -91,17 +118,16 @@ in
   };
 
   config = lib.mkIf cfg.enable {
+    # Render nmidid's config to /etc so the unit launches from `--config` (seq-1377: no argv/env
+    # config). deny_unknown_fields on the crate side means a render/key drift is a hard startup error.
+    environment.etc."nmidid/nmidid.toml".source = configFile;
+
     systemd.services.nmidid = {
       description = "nmidid MIDI data-plane daemon";
       wantedBy = [ "multi-user.target" ];
       after = [ "sound.target" ];
       serviceConfig = {
-        ExecStart = lib.concatStringsSep " " (
-          [ "${cfg.package}/bin/nmidid" "--socket" "${cfg.socket}" "--log-level" cfg.logLevel ]
-          ++ lib.concatMap (uid: [ "--allow-uid" (toString uid) ]) cfg.allowedUids
-          ++ lib.concatMap (gid: [ "--allow-gid" (toString gid) ]) cfg.allowedGids
-          ++ lib.concatMap (grp: [ "--allow-group" grp ]) cfg.allowedGroups
-        );
+        ExecStart = "${cfg.package}/bin/nmidid --config /etc/nmidid/nmidid.toml";
         RuntimeDirectory = "nmidid";
         # Owner + group only: with `socketGroup` set, only root and that group can
         # traverse to the socket; others cannot even see it (the socket itself is
