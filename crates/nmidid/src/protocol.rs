@@ -2,10 +2,12 @@
 //! `capmeshd/docs/CONTROL-PROTOCOL.md`). Transport is newline-delimited JSON
 //! (NDJSON) carrying JSON-RPC 2.0 messages over a local Unix domain socket.
 //!
-//! This slice (M0a increment 1) implements the framing plus the `hello`,
-//! `list-ports` and `describe-port` methods. The remaining methods (`mount`,
-//! `unmount`, `mount-status`) and the daemon→client notifications land in later
-//! increments; their wire shapes are already fixed by the frozen spec.
+//! This module defines the framing plus the wire types for every control
+//! method the daemon serves — `hello`, `list-ports`, `describe-port`, `mount`,
+//! `unmount`, `mount-status` — and the unsolicited daemon→client notifications
+//! (`mount-state`, `port-added`/`port-removed`). All are implemented (dispatch
+//! in [`crate::server`], mounts in [`crate::mounts`], hot-plug in
+//! [`crate::hotplug`]); the wire shapes follow the frozen spec.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -19,8 +21,9 @@ pub const DAEMON_ID: &str = concat!("nmidid/", env!("CARGO_PKG_VERSION"));
 /// Optional features advertised in the `hello` result (§5, §7).
 ///
 /// `midi1` is the always-supported codec; `ump` is intentionally absent until
-/// the converter lands. `virtual-endpoints`/`hotplug-events` name capabilities
-/// later increments implement.
+/// the converter lands. `virtual-endpoints` (the daemon materializes local
+/// virtual MIDI ports, see [`crate::mounts`]) and `hotplug-events` (unsolicited
+/// `port-added`/`port-removed`, see [`crate::hotplug`]) are both implemented.
 pub const CAPABILITIES: &[&str] = &["virtual-endpoints", "hotplug-events", "midi1"];
 
 /// A single incoming JSON-RPC 2.0 request line.
