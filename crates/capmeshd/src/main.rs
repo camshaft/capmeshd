@@ -243,6 +243,8 @@ impl MountArgs {
                 // Mirror roles materialize a local virtual endpoint; `link` uses a real port.
                 is_virtual: !matches!(role, MountRole::Link),
                 name: self.local_name.clone(),
+                // CLI connect does not yet name a local real port for `link` (follow-on).
+                port_id: None,
             },
             remote: RemoteEndpoint {
                 host: self.remote_host.clone(),
@@ -1248,6 +1250,9 @@ fn permanent_to_spec(pm: &config::PermanentMount) -> Result<MountSpec> {
         local: LocalEndpoint {
             is_virtual: !matches!(role, MountRole::Link),
             name: pm.local_name.clone(),
+            // Permanent-mount config does not yet carry a local real-port selector for `link`
+            // (follow-on); a permanent link mount has no named local port until then.
+            port_id: None,
         },
         remote: RemoteEndpoint {
             host,
@@ -1505,6 +1510,8 @@ async fn cmd_connect(
         local: LocalEndpoint {
             is_virtual: !matches!(role, MountRole::Link),
             name: local_name,
+            // Discovery-driven connect does not yet name a local real port for `link` (follow-on).
+            port_id: None,
         },
         remote: RemoteEndpoint {
             host: remote_host.to_string(),
@@ -1620,6 +1627,8 @@ async fn cmd_connect_discover(
         *addr,
         control_port,
         local_name,
+        // connect-discover does not yet name a local real port for `link` (follow-on).
+        None,
     );
 
     let mut client = connect_and_hello(socket).await?;

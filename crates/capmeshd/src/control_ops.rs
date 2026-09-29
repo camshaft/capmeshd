@@ -159,6 +159,9 @@ fn connect_args_to_spec(args: &ConnectArgs) -> Result<MountSpec, String> {
             // Mirror roles materialize a local virtual endpoint; `link` binds a real port.
             is_virtual: !matches!(role, MountRole::Link),
             name: args.local_name.clone(),
+            // The connect tool does not yet carry a local real-port selector for `link` (follow-on);
+            // a link mount established here has no named local port until then.
+            port_id: None,
         },
         remote: RemoteEndpoint {
             host: args.remote_host.clone(),

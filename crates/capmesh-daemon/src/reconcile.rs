@@ -124,6 +124,7 @@ mod tests {
             local: LocalEndpoint {
                 is_virtual: true,
                 name: None,
+                port_id: None,
             },
             remote: RemoteEndpoint {
                 host: "peer".into(),

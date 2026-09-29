@@ -100,7 +100,8 @@ Audio/video (forward-looking, other daemons) use the *same* `Format` shape, e.g.
   "role": "mirror-source",       // §3.2
   "local":  {                     // the local endpoint the daemon owns/creates
      "virtual": true,             // create a virtual endpoint (requires port.virtualizable)
-     "name": "laptop: Keystation 49e"   // display name for the virtual device
+     "name": "laptop: Keystation 49e",  // display name for the virtual device (virtual roles)
+     "port-id": "sink-supercollider"    // link only: which local REAL port to bind (see below)
   },
   "remote": {                     // the peer this host connects to (DIRECT, p2p)
      "host": "laptop",
@@ -119,6 +120,16 @@ Audio/video (forward-looking, other daemons) use the *same* `Format` shape, e.g.
 | `mirror-source` | create a local **virtual source** fed by the remote source (the keyboard-shows-up case) |
 | `mirror-sink`   | create a local **virtual sink** that forwards to the remote sink |
 | `link`          | connect an existing local **real** port to the remote (no virtual endpoint) |
+
+**`local.port-id`** (link only): the id — from this daemon's own `list-ports` — of the local **real**
+port a `link` mount binds. Present only for `link` (`virtual:false`); absent for the mirror roles,
+which create a virtual endpoint rather than bind an existing one. The daemon resolves it against its
+`list-ports` (an unknown id → `no-such-port`, §5) and derives the mount **direction** from its own
+descriptor for that id — a real **source** forwards its MIDI out to the remote, a real **sink**
+receives inbound MIDI from the remote. Direction is therefore NOT carried on the wire: `local.port-id`
+alone names *which* local port to bind, and the daemon's descriptor is the single source of truth for
+its direction. (Contrast `remote.port-id`, which stays an opaque id the mounting side never resolves.)
+Additive/optional on the frozen wire — omitted for every mirror mount.
 
 ### 3.2 `MountStatus`
 
