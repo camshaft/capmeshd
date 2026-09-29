@@ -80,24 +80,36 @@ in
     logLevel = lib.mkOption {
       type = lib.types.enum [ "trace" "debug" "info" "warn" "error" ];
       default = "info";
-      description = "Log verbosity.";
+      description = "Log verbosity. Rendered into the `--config` TOML `log` key (seq-1377: NOT RUST_LOG / not an env var).";
     };
   };
 
   config = lib.mkIf cfg.enable {
     networking.firewall.allowedTCPPorts = lib.mkIf cfg.openFirewall [ cfg.port ];
 
+    # seq-1377: the daemon is configured from a `--config` TOML file, never env
+    # vars. Render /etc/surfaced/surfaced.toml from the module options and pass
+    # `--config`; the file is the single inspectable source of surfaced's settings.
+    # Keys are kebab-case and match crates/surfaced/src/config.rs (deny_unknown_fields,
+    # so a typo'd key is a hard parse error — a good render-gate signal).
+    environment.etc."surfaced/surfaced.toml".text = ''
+      http-addr = "${cfg.address}:${toString cfg.port}"
+      state-dir = "${cfg.stateDir}"
+      log = "${cfg.logLevel}"
+    ''
+    + lib.optionalString (cfg.basePath != "") ''
+      base-path = "${cfg.basePath}"
+    ''
+    + lib.optionalString (cfg.socket != null) ''
+      socket = "${cfg.socket}"
+    '';
+
     systemd.services.surfaced = {
       description = "surfaced browser-surface data-plane daemon";
       wantedBy = [ "multi-user.target" ];
       after = [ "network.target" ];
       serviceConfig = {
-        ExecStart = "${cfg.package}/bin/surfaced"
-          + " --http-addr ${cfg.address}:${toString cfg.port}"
-          + " --state-dir ${cfg.stateDir}"
-          + " --log-level ${cfg.logLevel}"
-          + lib.optionalString (cfg.basePath != "") " --base-path ${cfg.basePath}"
-          + lib.optionalString (cfg.socket != null) " --socket ${cfg.socket}";
+        ExecStart = "${cfg.package}/bin/surfaced --config /etc/surfaced/surfaced.toml";
         StateDirectory = "surfaced";
         # /run/surfaced for the control socket (harmless when socket is unset).
         RuntimeDirectory = "surfaced";

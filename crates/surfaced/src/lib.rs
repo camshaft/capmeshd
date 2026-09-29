@@ -19,6 +19,7 @@
 //! tokens (in [`inbox`]/[`http`]), and an embedded MCP server ([`mcp`]) so an
 //! agent can post items to surfaces and list them.
 
+pub mod config;
 pub mod ctl;
 pub mod http;
 pub mod inbox;

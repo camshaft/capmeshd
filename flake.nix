@@ -295,7 +295,9 @@
           });
 
           # Prove the services.surfaced module's enabled path evaluates and renders
-          # a systemd unit that runs surfaced with a durable state dir.
+          # the `--config` TOML that crates/surfaced/src/config.rs (deny_unknown_fields)
+          # accepts, and that surfaced is launched with `--config` and no env-var
+          # config (seq-1377: TOML files, never env vars — no RUST_LOG / SURFACED_*).
           checks.surfaced-module-eval =
             let
               sys = nixpkgs.lib.nixosSystem {
@@ -318,15 +320,32 @@
                 ];
               };
               execStart = toString sys.config.systemd.services.surfaced.serviceConfig.ExecStart;
+              renderedToml = sys.config.environment.etc."surfaced/surfaced.toml".source;
+              svcEnv = sys.config.systemd.services.surfaced.environment or { };
+              # seq-1377: config comes from the TOML, never env vars — assert the unit
+              # sets no RUST_LOG and no SURFACED_* config var (NixOS' own service
+              # defaults like LOCALE_ARCHIVE are unrelated and expected).
+              envUnset = pkgs.lib.boolToString
+                (!(svcEnv ? RUST_LOG)
+                  && !(svcEnv ? SURFACED_BASE_PATH)
+                  && !(svcEnv ? SURFACED_SOCKET)
+                  && !(svcEnv ? SURFACED_MCP_TOKEN));
             in
-            pkgs.runCommand "surfaced-module-eval" { inherit execStart; } ''
+            pkgs.runCommand "surfaced-module-eval" { inherit execStart envUnset; } ''
               printf '%s\n' "$execStart" | tee exec
-              grep -q 'bin/surfaced' exec
-              grep -q -- '--http-addr 0.0.0.0:8787' exec
-              grep -q -- '--state-dir /var/lib/surfaced' exec
-              grep -q -- '--base-path /surfaced' exec
-              grep -q -- '--socket /run/surfaced/surfaced.sock' exec
-              cp exec $out
+              # The unit launches surfaced from the rendered --config TOML — no argv config.
+              grep -q 'bin/surfaced --config /etc/surfaced/surfaced.toml' exec
+              cp ${renderedToml} rendered.toml
+              cat rendered.toml
+              grep -q 'http-addr = "0.0.0.0:8787"' rendered.toml
+              grep -q 'state-dir = "/var/lib/surfaced"' rendered.toml
+              grep -q 'base-path = "/surfaced"' rendered.toml
+              grep -q 'socket = "/run/surfaced/surfaced.sock"' rendered.toml
+              # seq-1377: log verbosity is the TOML `log` key (defaults to info), NOT an env var.
+              grep -q 'log = "info"' rendered.toml
+              printf 'no RUST_LOG / SURFACED_* env-var config=%s\n' "$envUnset"
+              [ "$envUnset" = "true" ]
+              cp rendered.toml $out
             '';
 
           # Prove the NixOS module's enabled path evaluates and renders a §4.1 TOML that
