@@ -88,7 +88,7 @@ fn resolve_config(args: &Args) -> (Config, String) {
 fn config_from_flags(args: &Args) -> Config {
     Config {
         socket: args.socket.clone(),
-        monitor_interval: args.monitor_interval,
+        monitor_interval_secs: args.monitor_interval,
         log: args.log_level.clone(),
         allow_uids: args.allow_uid.clone(),
         allow_gids: args.allow_gid.clone(),
@@ -116,7 +116,7 @@ async fn main() -> Result<()> {
     // Hot-plug notifications (§5, `hotplug-events`): watch local ports and emit
     // port-added/port-removed on the daemon's notification bus.
     let port_rx =
-        nmidi_core::midi::start_port_monitor(Duration::from_secs(config.monitor_interval)).await;
+        nmidi_core::midi::start_port_monitor(Duration::from_secs(config.monitor_interval_secs)).await;
     hotplug::spawn(port_rx, mounts.notifier());
 
     // Resolve any allow-group names to gids and merge them into the gid
