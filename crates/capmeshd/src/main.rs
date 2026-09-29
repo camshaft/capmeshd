@@ -23,7 +23,8 @@ use axum::{
     routing::{delete, get},
 };
 use capmesh_ctl::{
-    CtlClient, CtlError, Format, LocalEndpoint, McpRoute, MountRole, MountSpec, RemoteEndpoint,
+    CtlClient, CtlError, Format, LocalEndpoint, McpRoute, McpTransport, MountRole, MountSpec,
+    RemoteEndpoint,
 };
 use capmesh_daemon::automount::{
     self, ActiveAutoMount, AutoMountOutcome, Lifetime, Remote, teardown_on_unadvertise,
@@ -427,23 +428,26 @@ async fn main() -> Result<()> {
     // `cap=mcp` auto-discovery mutate the same registry; the gateway is driven off it.
     let registry = build_mcp_route_registry(&cfg);
     info!(routes = registry.len(), "mcp route registry seeded from config");
+    // The registry is shared unconditionally: the runtime control endpoint (below), the manual
+    // `register` API, AND the discovery browse loop's `cap=mcp` auto-registration all mutate it.
+    let shared: SharedMcpRoutes = Arc::new(Mutex::new(registry));
+    // When a gateway admin URL is configured, drive it live on every route change (§7.2) — from the
+    // control endpoint and from `cap=mcp` auto-discovery alike.
+    let gateway = cfg.gateway_admin_url.clone().map(|base_url| {
+        info!(%base_url, "driving mcp gateway on route changes");
+        GatewayDriver {
+            client: gateway_driver::gateway_client(),
+            base_url,
+        }
+    });
 
     // Serve the runtime MCP route control endpoint (DESIGN §7.2 `register`) when configured, so an
-    // operator (or, later, `cap=mcp` discovery) can add/remove routes live. It shares the seeded
-    // registry. Best-effort: a bind failure is logged, not fatal.
+    // operator can add/remove routes live. It shares the seeded registry + gateway driver.
+    // Best-effort: a bind failure is logged, not fatal.
     if let Some(addr) = cfg.mcp_control_addr.clone() {
-        let shared: SharedMcpRoutes = Arc::new(Mutex::new(registry));
-        // When a gateway admin URL is configured, drive it live on every route change (§7.2).
-        let gateway = cfg.gateway_admin_url.clone().map(|base_url| {
-            info!(%base_url, "driving mcp gateway on route changes");
-            GatewayDriver {
-                client: gateway_driver::gateway_client(),
-                base_url,
-            }
-        });
         let state = McpControlState {
-            routes: shared,
-            gateway,
+            routes: shared.clone(),
+            gateway: gateway.clone(),
         };
         match tokio::net::TcpListener::bind(&addr).await {
             Ok(listener) => {
@@ -570,19 +574,27 @@ async fn main() -> Result<()> {
                                             cap = %format!("{}/{}", advert.cap, advert.dir),
                                             "resolved capmesh peer"
                                         );
-                                        // Mark the advert live *before* spawning, so an issuance
-                                        // that outraces a `ServiceRemoved` sees the removal (§6.1).
-                                        let fullname = svc.get_fullname().to_string();
-                                        active_mounts.lock().unwrap().live.insert(fullname.clone());
-                                        // Issue any matching auto-mounts off the browse loop:
-                                        // fetching the descriptor is network I/O.
-                                        tokio::spawn(try_auto_mount(
-                                            ctx.clone(),
-                                            advert,
-                                            addr,
-                                            svc.get_port(),
-                                            fullname,
-                                        ));
+                                        if advert.cap == "mcp" {
+                                            // A `cap=mcp` peer is an MCP server, not a data-plane
+                                            // capability to mount: auto-register it into the route
+                                            // registry + federate it on the gateway (§7.2). No
+                                            // descriptor fetch / mount planning applies.
+                                            auto_register_mcp(&shared, &gateway, &advert, addr);
+                                        } else {
+                                            // Mark the advert live *before* spawning, so an issuance
+                                            // that outraces a `ServiceRemoved` sees the removal (§6.1).
+                                            let fullname = svc.get_fullname().to_string();
+                                            active_mounts.lock().unwrap().live.insert(fullname.clone());
+                                            // Issue any matching auto-mounts off the browse loop:
+                                            // fetching the descriptor is network I/O.
+                                            tokio::spawn(try_auto_mount(
+                                                ctx.clone(),
+                                                advert,
+                                                addr,
+                                                svc.get_port(),
+                                                fullname,
+                                            ));
+                                        }
                                     }
                                     Err(e) => info!(
                                         fullname = %svc.get_fullname(),
@@ -1181,6 +1193,21 @@ fn mcp_capability_advert(host_id: &str, serve_addr: &str) -> Result<CapabilityAd
     })
 }
 
+/// Build the registry [`McpRoute`] for a discovered `cap=mcp` peer (DESIGN §7.2 auto-registration).
+/// The gateway reaches it over `streamable-http` at `http://<addr>:<ep><descr>` — the advert's
+/// resolved IP + control-endpoint port + descriptor pointer (which for a `cap=mcp` advert is the
+/// server's `/mcp` path; see [`mcp_capability_advert`]). The route id is the advert's stable
+/// capability id, so its tools land under a stable `<id>__` namespace on the gateway. The protocol
+/// revision is unknown from the coarse advert (negotiated when the gateway connects) → `None`.
+fn mcp_route_from_advert(advert: &CapabilityAdvert, addr: IpAddr) -> McpRoute {
+    McpRoute {
+        id: advert.id.clone(),
+        url: format!("http://{addr}:{}{}", advert.ep, advert.descr),
+        transport: McpTransport::StreamableHttp,
+        protocol_rev: None,
+    }
+}
+
 fn parse_role(s: &str) -> Result<MountRole> {
     match s {
         "mirror-source" => Ok(MountRole::MirrorSource),
@@ -1288,6 +1315,33 @@ fn drive_gateway(gateway: &Option<GatewayDriver>, cmd: GatewayCommand) {
             warn!("driving gateway on route change failed: {e}");
         }
     });
+}
+
+/// Auto-register a discovered `cap=mcp` peer (DESIGN §7.2) into the shared route registry and drive
+/// the running gateway to federate it — the discovery-driven analogue of the manual `register`
+/// endpoint. Idempotent via the registry: a re-resolve of an already-registered peer with identical
+/// coordinates is an `Unchanged` no-op (no gateway churn). An invalid advert id is logged, not fatal.
+/// Unlike MIDI auto-mount, this does *not* skip our own advert: federating capmesh's own control
+/// server through the gateway is exactly what §7.2 wants (agents reach capmesh's tools via the
+/// gateway namespace).
+fn auto_register_mcp(
+    routes: &SharedMcpRoutes,
+    gateway: &Option<GatewayDriver>,
+    advert: &CapabilityAdvert,
+    addr: IpAddr,
+) {
+    let route = mcp_route_from_advert(advert, addr);
+    let outcome = routes.lock().unwrap().register(route.clone());
+    match outcome {
+        Ok(RegisterOutcome::Unchanged) => {
+            debug!(id = %route.id, "cap=mcp re-resolved; route unchanged");
+        }
+        Ok(oc) => {
+            info!(id = %route.id, url = %route.url, "cap=mcp discovered → registered; federating on gateway");
+            drive_gateway(gateway, gateway_driver::on_register(&route, oc));
+        }
+        Err(e) => warn!(id = %route.id, "cap=mcp discovered but route rejected: {e}"),
+    }
 }
 
 async fn list_mcp_routes(State(state): State<McpControlState>) -> impl IntoResponse {
@@ -1809,6 +1863,26 @@ transport = "streamable-http"
         let ids: Vec<&str> = reg.routes().iter().map(|r| r.id.as_str()).collect();
         assert_eq!(ids, ["board", "kb"]);
         assert!(reg.get("bad_id").is_none());
+    }
+
+    #[test]
+    fn mcp_route_from_advert_builds_a_streamable_http_url() {
+        // A discovered `cap=mcp` advert → a streamable-http route the gateway reaches at
+        // http://<resolved-ip>:<ep><descr>, keyed by the advert's stable capability id.
+        let advert = CapabilityAdvert {
+            cap: "mcp".to_string(),
+            dir: "control".to_string(),
+            id: "green-machine-mcp".to_string(),
+            host: "green-machine".to_string(),
+            ep: 8081,
+            descr: "/mcp".to_string(),
+        };
+        let route = mcp_route_from_advert(&advert, "192.168.1.42".parse().unwrap());
+        assert_eq!(route.id, "green-machine-mcp");
+        assert_eq!(route.url, "http://192.168.1.42:8081/mcp");
+        assert_eq!(route.transport, McpTransport::StreamableHttp);
+        // The protocol rev is unknown from the coarse advert — negotiated when the gateway connects.
+        assert_eq!(route.protocol_rev, None);
     }
 
     #[test]
