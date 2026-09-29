@@ -98,6 +98,28 @@ pub fn descriptors_for(ports: &MidiPorts) -> Vec<PortDescriptor> {
         .collect()
 }
 
+/// Find the enumerated `midir` port whose control-protocol id is `port_id`,
+/// using the exact id scheme [`descriptors_for`] exposes (so a `link` mount's
+/// `local.port-id` resolves to the same port `list-ports` advertised). Returns
+/// the port's [`MidiPortInfo`] (its `midir` enumeration index + direction), or
+/// `None` if no local port has that id.
+pub fn resolve_port(ports: &MidiPorts, port_id: &str) -> Option<MidiPortInfo> {
+    let all = ports.all_ports();
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for info in &all {
+        *counts.entry(base_port_id(info)).or_default() += 1;
+    }
+    all.into_iter().find(|info| {
+        let base = base_port_id(info);
+        let id = if counts[&base] > 1 {
+            format!("{base}-{}", info.index)
+        } else {
+            base
+        };
+        id == port_id
+    })
+}
+
 /// Production provider: scans local ports via `midir` on each call.
 pub struct MidirPortProvider;
 
@@ -169,6 +191,39 @@ mod tests {
         let id_after = descriptors_for(&after)[0].port_id.clone();
         assert_eq!(id_before, "source-pad");
         assert_eq!(id_after, "source-pad"); // stable despite the index change
+    }
+
+    #[test]
+    fn resolve_port_round_trips_the_advertised_id() {
+        // A `link` mount names a local real port by the id `list-ports` gave it;
+        // resolve_port must map that id back to the right MidiPortInfo (direction
+        // + enumeration index), and return None for an unknown id.
+        let ports = MidiPorts {
+            inputs: vec![port("Keystation 49e", 0, MidiPortType::Input)],
+            outputs: vec![port("SuperCollider", 2, MidiPortType::Output)],
+        };
+        let src = resolve_port(&ports, "source-keystation-49e").expect("source resolves");
+        assert_eq!(src.port_type, MidiPortType::Input);
+        assert_eq!(src.index, 0);
+        let sink = resolve_port(&ports, "sink-supercollider").expect("sink resolves");
+        assert_eq!(sink.port_type, MidiPortType::Output);
+        assert_eq!(sink.index, 2);
+        assert!(resolve_port(&ports, "sink-nope").is_none());
+    }
+
+    #[test]
+    fn resolve_port_matches_the_disambiguated_sibling_id() {
+        let ports = MidiPorts {
+            inputs: vec![
+                port("USB MIDI", 0, MidiPortType::Input),
+                port("USB MIDI", 3, MidiPortType::Input),
+            ],
+            outputs: vec![],
+        };
+        assert_eq!(resolve_port(&ports, "source-usb-midi-3").unwrap().index, 3);
+        assert_eq!(resolve_port(&ports, "source-usb-midi-0").unwrap().index, 0);
+        // The bare (non-disambiguated) id doesn't match when siblings collide.
+        assert!(resolve_port(&ports, "source-usb-midi").is_none());
     }
 
     #[test]

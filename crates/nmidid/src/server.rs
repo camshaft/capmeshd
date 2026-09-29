@@ -750,6 +750,7 @@ mod tests {
             local: LocalEndpoint {
                 r#virtual: true,
                 name: None,
+                port_id: None,
             },
             remote: RemoteEndpoint {
                 host: None,

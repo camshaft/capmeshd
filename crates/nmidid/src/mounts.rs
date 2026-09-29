@@ -19,7 +19,8 @@ use serde_json::Value;
 use tokio::sync::{Notify, broadcast, mpsc};
 
 use crate::protocol::{
-    DaemonError, MountRole, MountSpec, MountState, MountStats, MountStatus, RemoteEndpoint,
+    DaemonError, INVALID_PARAMS, MountRole, MountSpec, MountState, MountStats, MountStatus,
+    RemoteEndpoint,
 };
 
 /// Depth of the per-daemon notification broadcast buffer. A slow control
@@ -86,12 +87,27 @@ pub trait MidiSource: Send {
 /// Which local endpoint a mount materializes, handed to the [`Connector`] so the
 /// one pump implementation can drive either data direction: `mirror-source` pushes
 /// remote MIDI into a local [`MidiSink`]; `mirror-sink` pumps local MIDI out from a
-/// [`MidiSource`] to the remote.
+/// [`MidiSource`] to the remote. A `link` mount reuses the same variants — it just
+/// binds an *existing real* port instead of creating a virtual one (a real source
+/// → [`LocalEnd::Sink`] forwarding out; a real sink → [`LocalEnd::Source`]
+/// forwarding in).
 pub enum LocalEnd {
-    /// `mirror-source`: a local virtual source fed by the remote source.
+    /// A local source (virtual or real) fed by the remote source: push remote
+    /// MIDI into it via the [`MidiSink`].
     Source(Box<dyn MidiSink>),
-    /// `mirror-sink`: a local virtual sink whose MIDI is forwarded to the remote.
+    /// A local sink (virtual or real) whose MIDI is forwarded to the remote: read
+    /// it via the [`MidiSource`].
     Sink(Box<dyn MidiSource>),
+}
+
+/// The outcome of binding a `link` mount to an existing real local port.
+pub enum RealPort {
+    /// The named real port was found and connected, bound to the data direction
+    /// implied by the port itself (real source → forward out; real sink →
+    /// forward in).
+    Connected(LocalEnd),
+    /// No local real port has the requested id (→ `no-such-port`).
+    NotFound,
 }
 
 /// Materializes the local OS endpoint of a mount.
@@ -108,6 +124,15 @@ pub trait Mounter: Send + Sync {
     /// `display_name`, returning the source that yields the MIDI they send — the
     /// pump forwards it out to the remote sink.
     fn create_virtual_sink(&self, display_name: &str) -> anyhow::Result<Box<dyn MidiSource>>;
+
+    /// Bind an **existing real** local port named by `port_id` (a `link` mount,
+    /// §3.1) and return the [`LocalEnd`] wired to the direction the port implies:
+    /// a real *source* (MIDI input, e.g. a hardware keyboard) → [`LocalEnd::Sink`]
+    /// (read it, forward out); a real *sink* (MIDI output, e.g. a hardware synth)
+    /// → [`LocalEnd::Source`] (receive from the remote, forward in). Returns
+    /// [`RealPort::NotFound`] if no local port has that id; `Err` if the port is
+    /// found but the OS connection fails.
+    fn connect_real(&self, port_id: &str) -> anyhow::Result<RealPort>;
 }
 
 /// Drives a mount's data path: connects to the remote and pumps events between it
@@ -199,19 +224,6 @@ impl MountRegistry {
             }
         }
 
-        // The two mirror roles are implemented; `link` (bind an existing real
-        // local port, no virtual endpoint) is declined honestly rather than
-        // silently faked.
-        if spec.role == MountRole::Link {
-            return Err(DaemonError::domain(
-                "role-unsupported",
-                format!(
-                    "role {:?} is not implemented yet (mirror-source / mirror-sink only)",
-                    spec.role
-                ),
-            ));
-        }
-
         if spec.local.r#virtual && !self.mounter.supports_virtual() {
             return Err(DaemonError::domain(
                 "virtual-unsupported",
@@ -242,7 +254,8 @@ impl MountRegistry {
 
         // Materialize the local endpoint matching the role's data direction:
         // mirror-source → a virtual source we push into; mirror-sink → a virtual
-        // sink we read from and forward out. (`link` was declined above.)
+        // sink we read from and forward out; link → bind an existing real local
+        // port (direction resolved from the daemon's own list-ports for that id).
         let local = match spec.role {
             MountRole::MirrorSource => LocalEnd::Source(
                 self.mounter
@@ -251,9 +264,34 @@ impl MountRegistry {
                         DaemonError::domain("busy", format!("could not create virtual port: {e}"))
                     })?,
             ),
-            _ => LocalEnd::Sink(self.mounter.create_virtual_sink(&display_name).map_err(
-                |e| DaemonError::domain("busy", format!("could not create virtual port: {e}")),
-            )?),
+            MountRole::MirrorSink => {
+                LocalEnd::Sink(self.mounter.create_virtual_sink(&display_name).map_err(|e| {
+                    DaemonError::domain("busy", format!("could not create virtual port: {e}"))
+                })?)
+            }
+            MountRole::Link => {
+                // A `link` binds an existing real local port named by
+                // `local.port-id` (§3.1) — required for this role, and it must be
+                // a port this daemon's list-ports advertises.
+                let port_id = spec.local.port_id.as_deref().ok_or_else(|| {
+                    DaemonError::protocol(
+                        INVALID_PARAMS,
+                        "invalid-params",
+                        "a link mount requires local.port-id (the local real port to bind)",
+                    )
+                })?;
+                match self.mounter.connect_real(port_id).map_err(|e| {
+                    DaemonError::domain("busy", format!("could not bind local port: {e}"))
+                })? {
+                    RealPort::Connected(end) => end,
+                    RealPort::NotFound => {
+                        return Err(DaemonError::domain(
+                            "no-such-port",
+                            format!("no local port '{port_id}'"),
+                        ));
+                    }
+                }
+            }
         };
 
         let status = Arc::new(Mutex::new(MountStatus {
@@ -427,6 +465,68 @@ impl Mounter for MidirMounter {
             anyhow::bail!("virtual MIDI ports are not supported on this platform")
         }
     }
+
+    fn connect_real(&self, port_id: &str) -> anyhow::Result<RealPort> {
+        #[cfg(unix)]
+        {
+            use midir::{MidiInput, MidiOutput};
+            use nmidi_core::midi::MidiPortType;
+
+            // Resolve `port_id` against the same enumeration list-ports exposes, so
+            // it names the port the caller saw. Unknown id → NotFound (no-such-port).
+            let ports = nmidi_core::midi::detect_ports()?;
+            let Some(info) = crate::ports::resolve_port(&ports, port_id) else {
+                return Ok(RealPort::NotFound);
+            };
+
+            match info.port_type {
+                // A real MIDI *input* (a source, e.g. a keyboard): read from it and
+                // forward its events OUT to the remote sink — same as mirror-sink.
+                MidiPortType::Input => {
+                    let inp = MidiInput::new("nmidid")?;
+                    let midir_ports = inp.ports();
+                    let port = midir_ports.get(info.index).ok_or_else(|| {
+                        anyhow::anyhow!("real MIDI input '{}' vanished before connect", info.name)
+                    })?;
+                    let (tx, rx) = mpsc::channel::<Vec<u8>>(SINK_CHANNEL_DEPTH);
+                    let conn = inp
+                        .connect(
+                            port,
+                            "nmidid-link",
+                            move |_timestamp, message, _| {
+                                let _ = tx.try_send(message.to_vec());
+                            },
+                            (),
+                        )
+                        .map_err(|e| anyhow::anyhow!("connect real input failed: {e}"))?;
+                    Ok(RealPort::Connected(LocalEnd::Sink(Box::new(MidirSource {
+                        _conn: conn,
+                        rx,
+                    }))))
+                }
+                // A real MIDI *output* (a sink, e.g. a synth): receive from the
+                // remote and forward INTO it — same as mirror-source.
+                MidiPortType::Output => {
+                    let out = MidiOutput::new("nmidid")?;
+                    let midir_ports = out.ports();
+                    let port = midir_ports.get(info.index).ok_or_else(|| {
+                        anyhow::anyhow!("real MIDI output '{}' vanished before connect", info.name)
+                    })?;
+                    let conn = out
+                        .connect(port, "nmidid-link")
+                        .map_err(|e| anyhow::anyhow!("connect real output failed: {e}"))?;
+                    Ok(RealPort::Connected(LocalEnd::Source(Box::new(MidirSink(
+                        Mutex::new(conn),
+                    )))))
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = port_id;
+            anyhow::bail!("real MIDI ports are not supported on this platform")
+        }
+    }
 }
 
 /// A dependency-free RFC 3339 (UTC) timestamp for `MountStatus.since`.
@@ -505,6 +605,9 @@ impl Mounter for NullMounter {
     fn create_virtual_sink(&self, _display_name: &str) -> anyhow::Result<Box<dyn MidiSource>> {
         Ok(Box::new(NullSource::new()))
     }
+    fn connect_real(&self, _port_id: &str) -> anyhow::Result<RealPort> {
+        Ok(RealPort::Connected(LocalEnd::Sink(Box::new(NullSource::new()))))
+    }
 }
 
 /// A no-op connector for tests: never spawns a task, leaves the mount `connecting`.
@@ -542,6 +645,18 @@ mod tests {
         fn create_virtual_sink(&self, _display_name: &str) -> anyhow::Result<Box<dyn MidiSource>> {
             Ok(Box::new(NullSource::new()))
         }
+        fn connect_real(&self, port_id: &str) -> anyhow::Result<RealPort> {
+            // Simulate list-ports resolution: a real source id → forward-out
+            // (LocalEnd::Sink), a real sink id → forward-in (LocalEnd::Source),
+            // anything else → NotFound.
+            match port_id {
+                "source-real" => {
+                    Ok(RealPort::Connected(LocalEnd::Sink(Box::new(NullSource::new()))))
+                }
+                "sink-real" => Ok(RealPort::Connected(LocalEnd::Source(Box::new(NullSink)))),
+                _ => Ok(RealPort::NotFound),
+            }
+        }
     }
 
     fn registry(supports_virtual: bool) -> MountRegistry {
@@ -558,6 +673,7 @@ mod tests {
             local: LocalEndpoint {
                 r#virtual: true,
                 name: Some("laptop: Keystation".to_string()),
+                port_id: None,
             },
             remote: RemoteEndpoint {
                 host: Some("laptop".to_string()),
@@ -641,15 +757,6 @@ mod tests {
     }
 
     #[test]
-    fn link_role_is_declined() {
-        let reg = registry(true);
-        let mut s = spec("m1", "source-0", "midi1");
-        s.role = MountRole::Link;
-        let err = reg.mount(s).unwrap_err();
-        assert_eq!(err.code, "role-unsupported");
-    }
-
-    #[test]
     fn mount_mirror_sink_is_connecting_and_listed() {
         // mirror-sink creates a local virtual sink and drives the outbound pump;
         // it must be accepted (not declined) and reach `connecting`.
@@ -671,6 +778,61 @@ mod tests {
         s.role = MountRole::MirrorSink;
         let err = reg.mount(s).unwrap_err();
         assert_eq!(err.code, "virtual-unsupported");
+    }
+
+    /// Build a `link` mount spec binding local real port `local_port_id`
+    /// (`virtual: false`, no virtual endpoint).
+    fn link_spec(mount_id: &str, local_port_id: Option<&str>) -> MountSpec {
+        let mut s = spec(mount_id, "remote-port", "midi1");
+        s.role = MountRole::Link;
+        s.local.r#virtual = false;
+        s.local.name = None;
+        s.local.port_id = local_port_id.map(str::to_string);
+        s
+    }
+
+    #[test]
+    fn link_to_a_real_source_port_is_connecting() {
+        // A real source (MIDI input) link binds and reaches connecting (forwards
+        // its MIDI out to the remote).
+        let reg = registry(true);
+        let r = reg.mount(link_spec("m1", Some("source-real"))).unwrap();
+        assert_eq!(r["state"], "connecting");
+        assert_eq!(r["mount-id"], "m1");
+        assert_eq!(reg.status(None)["mounts"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn link_to_a_real_sink_port_is_connecting() {
+        // A real sink (MIDI output) link binds and reaches connecting (receives
+        // from the remote, forwards into it).
+        let reg = registry(true);
+        let r = reg.mount(link_spec("m1", Some("sink-real"))).unwrap();
+        assert_eq!(r["state"], "connecting");
+    }
+
+    #[test]
+    fn link_without_a_port_id_is_invalid_params() {
+        let reg = registry(true);
+        let err = reg.mount(link_spec("m1", None)).unwrap_err();
+        assert_eq!(err.code, "invalid-params");
+    }
+
+    #[test]
+    fn link_to_an_unknown_local_port_is_no_such_port() {
+        let reg = registry(true);
+        let err = reg.mount(link_spec("m1", Some("source-ghost"))).unwrap_err();
+        assert_eq!(err.code, "no-such-port");
+    }
+
+    #[test]
+    fn link_is_not_gated_by_virtual_support() {
+        // A `link` binds an existing real port and creates no virtual endpoint, so
+        // it must NOT be refused as virtual-unsupported even on a platform that
+        // cannot create virtual ports.
+        let reg = registry(false);
+        let r = reg.mount(link_spec("m1", Some("source-real"))).unwrap();
+        assert_eq!(r["state"], "connecting");
     }
 
     #[test]
