@@ -14,12 +14,28 @@ nmidid --socket /run/nmidid.sock --log-level info
 
 | flag | default | meaning |
 |---|---|---|
-| `--socket <path>` | `/run/nmidid.sock` | Unix control socket to bind (§1). |
-| `--monitor-interval <secs>` | `5` | How often to poll local MIDI ports for hot-plug (§5). |
-| `--allow-uid <uid>` | *(none)* | Permit connections from this uid (repeatable); own uid always allowed (§1.1). |
-| `--allow-gid <gid>` | *(none)* | Permit connections from this gid (repeatable) (§1.1). |
-| `--allow-group <name>` | *(none)* | Permit connections from this group name (repeatable), resolved to a gid at startup (§1.1). |
-| `--log-level <lvl>` | `info` | `trace`/`debug`/`info`/`warn`/`error`. |
+| `--config <path>` | `/etc/nmidid/nmidid.toml` | TOML config file (see below) — the mandated source of configuration (seq-1377). When present it is authoritative; the flags below are a transitional fallback used only if it is absent. |
+| `--socket <path>` | `/run/nmidid.sock` | *(transitional)* Unix control socket to bind (§1). Prefer `socket` in the TOML. |
+| `--monitor-interval <secs>` | `5` | *(transitional)* Local MIDI hot-plug poll interval (§5). Prefer `monitor-interval`. |
+| `--allow-uid <uid>` | *(none)* | *(transitional)* Permit connections from this uid (repeatable); own uid always allowed (§1.1). Prefer `allow-uids`. |
+| `--allow-gid <gid>` | *(none)* | *(transitional)* Permit connections from this gid (repeatable) (§1.1). Prefer `allow-gids`. |
+| `--allow-group <name>` | *(none)* | *(transitional)* Permit connections from this group name (repeatable), resolved to a gid at startup (§1.1). Prefer `allow-groups`. |
+| `--log-level <lvl>` | `info` | *(transitional)* Log env-filter directive. Prefer `log`. |
+
+### Config file (`--config`)
+
+Per the fleet TOML-config mandate (seq-1377) the daemon takes its configuration
+from the `--config` TOML, **never** from environment variables (no `RUST_LOG`).
+The NixOS module renders it from `services.nmidid.*`. All keys are optional:
+
+```toml
+socket = "/run/nmidid.sock"    # Unix control socket to bind (§1)
+monitor-interval = 5           # local MIDI hot-plug poll seconds (§5)
+log = "info"                   # tracing env-filter directive (e.g. "nmidid=debug,info")
+allow-uids = []                # §1.1 permitted uids (own uid always allowed)
+allow-gids = []                # §1.1 permitted gids
+allow-groups = ["capmesh"]     # §1.1 group names, resolved to gids at startup
+```
 
 The control socket is local-trust-only. With none of `--allow-uid` / `--allow-gid`
 / `--allow-group` given, peer-credential enforcement is **off** and only the
