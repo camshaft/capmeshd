@@ -77,6 +77,13 @@ pub struct Config {
     /// not the peer-facing mesh endpoint. Absent → the endpoint is off (config routes only).
     #[serde(rename = "mcp-control-addr", default)]
     pub mcp_control_addr: Option<String>,
+
+    /// Local bind address for capmesh's own embedded control-tools MCP server (DESIGN §7.1). When
+    /// set, capmeshd serves `POST /mcp` here exposing its control tools (discover/describe/connect/
+    /// disconnect/status), so the gateway can federate capmesh as a `cap=mcp` upstream. Bind
+    /// loopback (or the mesh interface once `cap=mcp` advertise lands). Absent → the server is off.
+    #[serde(rename = "mcp-serve-addr", default)]
+    pub mcp_serve_addr: Option<String>,
 }
 
 /// A statically-declared MCP route (DESIGN §7.2), the config form of an [`McpRoute`].

@@ -12,6 +12,7 @@
 //! [`reconcile::Reconciler`].
 
 mod config;
+mod control_ops;
 
 use anyhow::{Context, Result};
 use axum::{
@@ -427,6 +428,33 @@ async fn main() -> Result<()> {
                 });
             }
             Err(e) => warn!(%addr, "mcp route control endpoint: bind failed: {e}"),
+        }
+    }
+
+    // Serve capmesh's OWN control-tools MCP server (DESIGN §7.1) when configured, so the gateway can
+    // federate capmesh as a `cap=mcp` upstream. Its control ops drive the configured data-plane
+    // socket (MIDI-first: the `midi` dataplane's socket, else the first configured socket).
+    // Best-effort: a bind failure is logged, not fatal.
+    if let Some(addr) = cfg.mcp_serve_addr.clone() {
+        let socket = cfg
+            .dataplane
+            .get("midi")
+            .and_then(|dp| dp.socket.clone())
+            .or_else(|| cfg.dataplane.values().find_map(|dp| dp.socket.clone()));
+        let ops = control_ops::CapmeshControlOps::new(socket);
+        let executor = capmesh_daemon::control_exec::OpsExecutor::new(Arc::new(ops));
+        let state = capmesh_daemon::control_http::ControlState::new(Arc::new(executor));
+        match tokio::net::TcpListener::bind(&addr).await {
+            Ok(listener) => {
+                info!(%addr, "control-tools MCP server listening");
+                let router = capmesh_daemon::control_http::control_mcp_router(state);
+                tokio::spawn(async move {
+                    if let Err(e) = axum::serve(listener, router).await {
+                        warn!("control-tools MCP server error: {e}");
+                    }
+                });
+            }
+            Err(e) => warn!(%addr, "control-tools MCP server: bind failed: {e}"),
         }
     }
 
