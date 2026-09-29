@@ -220,6 +220,10 @@ struct MountArgs {
     /// Display name for the local virtual device (mirror roles).
     #[arg(long)]
     local_name: Option<String>,
+    /// The local **real** port to bind for a `link` mount — the id from the data-plane daemon's own
+    /// `list-ports` (§3.1 `local.port-id`). Required for `link`; ignored for the mirror roles.
+    #[arg(long)]
+    local_port_id: Option<String>,
     /// Chosen wire-format codec.
     #[arg(long, default_value = "midi1")]
     codec: String,
@@ -243,8 +247,12 @@ impl MountArgs {
                 // Mirror roles materialize a local virtual endpoint; `link` uses a real port.
                 is_virtual: !matches!(role, MountRole::Link),
                 name: self.local_name.clone(),
-                // CLI connect does not yet name a local real port for `link` (follow-on).
-                port_id: None,
+                // A `link` binds the named local real port (§3.1 `local.port-id`); mirror roles
+                // create a virtual endpoint and ignore it.
+                port_id: match role {
+                    MountRole::Link => self.local_port_id.clone(),
+                    MountRole::MirrorSource | MountRole::MirrorSink => None,
+                },
             },
             remote: RemoteEndpoint {
                 host: self.remote_host.clone(),
@@ -1891,6 +1899,38 @@ remote = { addr = "192.168.1.23", port = 5004, port-id = "kbd-0" }
         assert_eq!(spec.role, MountRole::Link);
         assert!(!spec.local.is_virtual);
         assert_eq!(spec.local.port_id.as_deref(), Some("sink-supercollider"));
+    }
+
+    #[test]
+    fn mount_args_link_carries_the_local_port_id() {
+        // `capmeshd mount --role link --local-port-id <id> ...` → a non-virtual MountSpec whose
+        // local end names the local real port to bind (§3.1 `local.port-id`).
+        let args = MountArgs {
+            socket: PathBuf::from("/run/nmidid.sock"),
+            remote_host: "source-host".into(),
+            remote_addr: "127.0.0.1".parse().unwrap(),
+            remote_port: 5008,
+            remote_port_id: "kbd-0".into(),
+            role: "link".into(),
+            local_name: None,
+            local_port_id: Some("sink-virmidi-0".into()),
+            codec: "midi1".into(),
+            mount_id: None,
+        };
+        let spec = args.to_spec().expect("spec");
+        assert_eq!(spec.role, MountRole::Link);
+        assert!(!spec.local.is_virtual);
+        assert_eq!(spec.local.port_id.as_deref(), Some("sink-virmidi-0"));
+
+        // A mirror role ignores a (wrongly) supplied local-port-id.
+        let mirror = MountArgs {
+            role: "mirror-source".into(),
+            local_port_id: Some("ignored".into()),
+            ..args
+        };
+        let spec = mirror.to_spec().expect("spec");
+        assert!(spec.local.is_virtual);
+        assert_eq!(spec.local.port_id, None);
     }
 
     #[test]
