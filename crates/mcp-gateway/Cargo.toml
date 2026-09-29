@@ -7,8 +7,12 @@ description = "capmesh MCP gateway: federates mesh-discovered MCP servers behind
 
 [dependencies]
 serde_json.workspace = true
+# The pure cores (federation/client/server/serve) depend only on serde_json; the inbound `/mcp`
+# HTTP transport (http.rs) adds axum + a tokio runtime. All already in the workspace lock.
+axum = "0.8"
+tokio.workspace = true
 
 [dev-dependencies]
-# The serve seam is async (it awaits an injected forwarder); tests drive it with a runtime.
-# Runtime deps stay pure — the daemon supplies the actual async transport.
-tokio.workspace = true
+# In-process transport tests (tower `oneshot`, no sockets), mirroring the capmeshd register endpoint.
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
