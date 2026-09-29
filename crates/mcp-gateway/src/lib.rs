@@ -50,9 +50,18 @@ impl Federation {
         Self::default()
     }
 
-    /// Record (or replace) an upstream's advertised tools — its raw `tools/list` entries.
-    pub fn set_upstream_tools(&mut self, upstream_id: impl Into<String>, tools: Vec<Value>) {
-        self.upstreams.insert(upstream_id.into(), tools);
+    /// Record (or replace) an upstream's advertised tools — its raw `tools/list` entries. Returns
+    /// whether the federated surface actually changed (a new upstream, or different tools), so a
+    /// live route update can decide whether to emit `tools/list_changed`.
+    pub fn set_upstream_tools(&mut self, upstream_id: impl Into<String>, tools: Vec<Value>) -> bool {
+        let id = upstream_id.into();
+        match self.upstreams.get(&id) {
+            Some(existing) if *existing == tools => false,
+            _ => {
+                self.upstreams.insert(id, tools);
+                true
+            }
+        }
     }
 
     /// Drop an upstream (it defederated / went away). Returns whether it had been federated.
