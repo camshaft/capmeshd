@@ -8,6 +8,7 @@
 pub mod automount;
 pub mod control_http;
 pub mod control_mcp;
+pub mod control_result;
 pub mod mcp_routes;
 pub mod negotiate;
 pub mod reconcile;
