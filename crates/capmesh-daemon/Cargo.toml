@@ -10,6 +10,11 @@ capmesh-ctl = { path = "../capmesh-ctl" }
 serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+# The §7.1 embedded control-tools MCP server (control_http) serves capmesh's own control tools over
+# HTTP; axum is already in the workspace lock (used by capmeshd).
+axum = "0.8"
 
 [dev-dependencies]
 tokio.workspace = true
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
