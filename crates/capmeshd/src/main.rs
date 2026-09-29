@@ -77,6 +77,17 @@ enum Cmd {
         #[arg(long)]
         watch: bool,
     },
+    /// List a data-plane daemon's ports (§3 `list-ports`). Machine-readable with `--json` — e.g.
+    /// resolve a local real port's id to bind for a `link` mount:
+    /// `capmeshd list-ports --socket … --json | jq -r '.ports[]|select(.dir=="sink")|.["port-id"]'`.
+    ListPorts {
+        /// Path to the daemon's Unix control socket (e.g. /run/nmidid.sock).
+        #[arg(long)]
+        socket: PathBuf,
+        /// Emit the `list-ports` result as JSON on stdout (wire keys), instead of a human log.
+        #[arg(long)]
+        json: bool,
+    },
     /// Browse the mesh and list discovered capmesh capabilities (§7 discover).
     Discover {
         /// How long to browse before printing, in seconds.
@@ -289,6 +300,7 @@ async fn main() -> Result<()> {
 
     match &args.cmd {
         Some(Cmd::ProbeCtl { socket, watch }) => return probe_ctl(socket, *watch).await,
+        Some(Cmd::ListPorts { socket, json }) => return cmd_list_ports(socket, *json).await,
         Some(Cmd::Discover {
             timeout_secs,
             kind,
@@ -1040,6 +1052,30 @@ async fn probe_ctl(socket: &Path, watch: bool) -> Result<()> {
                     break;
                 }
             }
+        }
+    }
+    Ok(())
+}
+
+/// List a data-plane daemon's ports (§3 `list-ports`). With `json`, print the `ListPortsResult` as
+/// JSON on stdout (wire keys) for machine consumption — e.g. a test/operator resolving the local
+/// real port id to bind for a `link` mount (`--role link --local-port-id`). Otherwise log a human
+/// summary. Unlike `probe-ctl` this is a focused, scriptable query (no describe-port / watch).
+async fn cmd_list_ports(socket: &Path, json: bool) -> Result<()> {
+    let mut client = CtlClient::connect(socket)
+        .await
+        .with_context(|| format!("connect {}", socket.display()))?;
+    let ports = client.list_ports().await.context("list-ports")?;
+    if json {
+        println!("{}", serde_json::to_string(&ports).context("serialize list-ports")?);
+    } else {
+        if ports.ports.is_empty() {
+            info!("daemon reported no ports");
+        }
+        for p in &ports.ports {
+            let codecs: Vec<&str> = p.formats.iter().map(|f| f.codec.as_str()).collect();
+            info!(port_id = %p.port_id, kind = %p.kind, dir = ?p.dir, r#type = %p.type_,
+                name = %p.name, virtualizable = p.virtualizable, formats = ?codecs, "port");
         }
     }
     Ok(())
