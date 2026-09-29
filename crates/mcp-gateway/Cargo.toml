@@ -20,6 +20,8 @@ hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
 http-body-util = "0.1"
 bytes.workspace = true
+# The GET /mcp SSE stream turns the (de)federation broadcast into tools/list_changed events.
+tokio-stream = { version = "0.1", features = ["sync"] }
 # The gateway daemon reads its route table + bind addr from a --config TOML (seq-1377: no env vars).
 serde = { workspace = true }
 toml.workspace = true

@@ -47,9 +47,13 @@ async fn main() {
     // channel (de)federates them live — both see the same state.
     let federation = Arc::new(tokio::sync::RwLock::new(fed));
     let forwarder = Arc::new(HttpForwarder::new(endpoints));
+    // Change notifier: the admin channel signals it on a (de)federate; each GET /mcp SSE stream
+    // subscribes and pushes tools/list_changed.
+    let (notifier, _) = tokio::sync::broadcast::channel(16);
     let state = GatewayState {
         federation: federation.clone(),
         forwarder: forwarder.clone(),
+        notifier: notifier.clone(),
     };
 
     // Control channel (DESIGN §7.2): capmeshd drives (de)federation over this loopback admin API.
@@ -59,6 +63,7 @@ async fn main() {
             client: client.clone(),
             federation: federation.clone(),
             forwarder: forwarder.clone(),
+            notifier: notifier.clone(),
         };
         match tokio::net::TcpListener::bind(&admin_addr).await {
             Ok(listener) => {

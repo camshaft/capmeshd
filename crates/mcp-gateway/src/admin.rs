@@ -22,15 +22,25 @@ use axum::{
 use serde::Deserialize;
 use serde_json::json;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{broadcast, RwLock};
 
 /// Shared state behind the admin API: the outbound client + the same live federation and forwarder
-/// the `/mcp` server uses (so a (de)federate is visible to agents immediately).
+/// the `/mcp` server uses (so a (de)federate is visible to agents immediately), plus the change
+/// notifier the `GET /mcp` SSE streams push `tools/list_changed` from.
 #[derive(Clone)]
 pub struct AdminState {
     pub client: HttpClient,
     pub federation: Arc<RwLock<Federation>>,
     pub forwarder: Arc<HttpForwarder>,
+    pub notifier: broadcast::Sender<()>,
+}
+
+impl AdminState {
+    /// Signal connected `GET /mcp` streams that the federated surface changed. Best-effort: a send
+    /// with no live subscribers is a no-op (agents re-list on their next connect anyway).
+    fn notify_changed(&self) {
+        let _ = self.notifier.send(());
+    }
 }
 
 /// A `federate` request body — an upstream to connect + merge. `transport` is accepted for parity
@@ -81,8 +91,13 @@ async fn federate_upstream(State(state): State<AdminState>, Json(req): Json<Fede
         .as_deref()
         .unwrap_or(client::DEFAULT_PROTOCOL_VERSION);
     match federate(&state.client, &state.federation, &state.forwarder, &req.id, &req.url, protocol).await {
-        // A successful connect: `changed` tells the caller whether to push tools/list_changed.
-        Ok(changed) => (StatusCode::OK, Json(json!({ "id": req.id, "changed": changed }))).into_response(),
+        // A successful connect: on a real surface change, push tools/list_changed to live streams.
+        Ok(changed) => {
+            if changed {
+                state.notify_changed();
+            }
+            (StatusCode::OK, Json(json!({ "id": req.id, "changed": changed }))).into_response()
+        }
         // The upstream could not be reached / handshaked — a bad gateway.
         Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({ "error": e }))).into_response(),
     }
@@ -90,6 +105,9 @@ async fn federate_upstream(State(state): State<AdminState>, Json(req): Json<Fede
 
 async fn defederate_upstream(State(state): State<AdminState>, Path(id): Path<String>) -> Response {
     let changed = defederate(&state.federation, &state.forwarder, &id).await;
+    if changed {
+        state.notify_changed();
+    }
     (StatusCode::OK, Json(json!({ "id": id, "changed": changed }))).into_response()
 }
 
@@ -136,6 +154,7 @@ mod tests {
             client: http_client(),
             federation: Arc::new(RwLock::new(Federation::new())),
             forwarder: Arc::new(HttpForwarder::new(HashMap::new())),
+            notifier: broadcast::channel(8).0,
         }
     }
 
@@ -193,6 +212,29 @@ mod tests {
         .await;
         assert_eq!(s, 502);
         assert!(b["error"].as_str().unwrap().contains("http request"));
+    }
+
+    #[tokio::test]
+    async fn a_surface_change_signals_the_notifier() {
+        let url = spawn_upstream("create_task").await;
+        let st = state();
+        let mut rx = st.notifier.subscribe();
+        let router = admin_router(st.clone());
+
+        // A federate that changes the surface fires the notifier (→ GET /mcp pushes list_changed).
+        let (s, _) = call(&router, "POST", "/admin/upstreams", Some(json!({ "id": "board", "url": url.clone() }))).await;
+        assert_eq!(s, 200);
+        assert!(rx.try_recv().is_ok(), "federate should have signalled a surface change");
+
+        // Re-federating identical tools does not signal (no change).
+        let (s, b) = call(&router, "POST", "/admin/upstreams", Some(json!({ "id": "board", "url": url }))).await;
+        assert_eq!(s, 200);
+        assert_eq!(b["changed"], false);
+        assert!(rx.try_recv().is_err(), "an unchanged re-federate must not signal");
+
+        // Defederate changes the surface → signals again.
+        call(&router, "DELETE", "/admin/upstreams/board", None).await;
+        assert!(rx.try_recv().is_ok(), "defederate should have signalled a surface change");
     }
 
     #[tokio::test]
