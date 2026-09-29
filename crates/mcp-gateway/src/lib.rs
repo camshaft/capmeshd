@@ -12,6 +12,8 @@
 //! capmeshd drives live in the gateway daemon around it.
 
 pub mod client;
+pub mod config;
+pub mod daemon;
 pub mod forward;
 pub mod http;
 pub mod serve;

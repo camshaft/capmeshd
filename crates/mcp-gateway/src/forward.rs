@@ -20,7 +20,12 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 
 /// A hyper client speaking plain HTTP (Streamable-HTTP upstreams on the mesh are HTTP; no TLS leg).
-type HttpClient = Client<HttpConnector, Full<Bytes>>;
+pub type HttpClient = Client<HttpConnector, Full<Bytes>>;
+
+/// Build the gateway's outbound HTTP client (shared by the forwarder and the startup connect).
+pub fn http_client() -> HttpClient {
+    Client::builder(TokioExecutor::new()).build_http()
+}
 
 /// Where the gateway reaches one federated upstream, plus any session it has negotiated.
 #[derive(Debug, Clone, Default)]
@@ -54,7 +59,7 @@ impl HttpForwarder {
     /// [`crate::Federation`] uses).
     pub fn new(endpoints: HashMap<String, UpstreamEndpoint>) -> Self {
         Self {
-            client: Client::builder(TokioExecutor::new()).build_http(),
+            client: http_client(),
             endpoints: Arc::new(endpoints),
             next_id: Arc::new(AtomicI64::new(1)),
         }
@@ -85,6 +90,20 @@ pub async fn post_jsonrpc(
     session_id: Option<&str>,
     message: &Value,
 ) -> Result<Value, String> {
+    post_and_session(client, url, session_id, message)
+        .await
+        .map(|(message, _session)| message)
+}
+
+/// Like [`post_jsonrpc`], but also returns the `Mcp-Session-Id` the upstream assigned on the
+/// response (present on an `initialize` reply). The startup connect uses this to carry the session
+/// into subsequent requests.
+pub async fn post_and_session(
+    client: &HttpClient,
+    url: &str,
+    session_id: Option<&str>,
+    message: &Value,
+) -> Result<(Value, Option<String>), String> {
     let body = serde_json::to_vec(message).map_err(|e| format!("encode request: {e}"))?;
     let mut builder = hyper::Request::builder()
         .method(hyper::Method::POST)
@@ -102,18 +121,23 @@ pub async fn post_jsonrpc(
         .request(request)
         .await
         .map_err(|e| format!("http request to {url} failed: {e}"))?;
-    let content_type = response
-        .headers()
-        .get(hyper::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_string);
+    let header = |name: &str| {
+        response
+            .headers()
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+    };
+    let content_type = header("content-type");
+    let session = header("mcp-session-id");
     let bytes = response
         .into_body()
         .collect()
         .await
         .map_err(|e| format!("read response body: {e}"))?
         .to_bytes();
-    parse_response_body(content_type.as_deref(), &bytes)
+    let message = parse_response_body(content_type.as_deref(), &bytes)?;
+    Ok((message, session))
 }
 
 #[cfg(test)]
