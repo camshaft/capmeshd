@@ -39,9 +39,10 @@ The transport, framing, JSON-RPC semantics, `hello` handshake gate, versioning, 
 local-trust model are **exactly as specified in [`CONTROL-PROTOCOL.md`](CONTROL-PROTOCOL.md)
 §1**. In brief (see there for the normative text):
 
-- **Unix domain socket**, local only. `surfaced` binds it when started with `--socket`
-  (`SURFACED_SOCKET`); the default deployment path is `/run/surfaced/surfaced.sock`.
-  Without `--socket`, surfaced runs HTTP-only and this protocol is unavailable.
+- **Unix domain socket**, local only. `surfaced` binds it when configured with a
+  `socket` key in its `--config` TOML (or the transitional `--socket` flag); the
+  default deployment path is `/run/surfaced/surfaced.sock`. Without it, surfaced
+  runs HTTP-only and this protocol is unavailable.
 - **NDJSON** framing — one JSON value per line.
 - **JSON-RPC 2.0** — requests carry an `id`; the daemon replies with a matching `result`
   or `error`. capmeshd is the client; `surfaced` is the server.
@@ -264,6 +265,7 @@ Tools:
 `{"type":"link","url":…,"title":…}`, `{"type":"navigate","url":…}`, `{"type":"html","markup":…}`,
 or `{"type":"script","code":…}`.
 
-**Auth.** Optional: run `surfaced --mcp-token <t>` (or `SURFACED_MCP_TOKEN`) and the agent
-sends `Authorization: Bearer <t>`; omitted, `/mcp` is open (trust the LAN / a reverse proxy).
+**Auth.** Optional: set `mcp-token = "<t>"` in surfaced's `--config` TOML (or the
+transitional `--mcp-token <t>` flag) and the agent sends `Authorization: Bearer <t>`;
+omitted, `/mcp` is open (trust the LAN / a reverse proxy).
 Point an MCP client at `http://<host>:8787/mcp` (or `…/surfaced/mcp` behind nginx).

@@ -19,8 +19,26 @@ overview and how-to-run.
 
 ## Run it
 
+`surfaced` is configured from a `--config` TOML file (fleet mandate seq-1377:
+config comes from a file, never environment variables). The NixOS module renders
+it to `/etc/surfaced/surfaced.toml` and passes `--config`. The CLI flags below
+are a transitional fallback, used only when no `--config` file is present.
+
+```toml
+# /etc/surfaced/surfaced.toml — every key optional, defaults shown
+http-addr = "127.0.0.1:8787"   # HTTP/SSE bind address (pages + push path)
+state-dir = "/var/lib/surfaced" # durable per-surface state; omit for in-memory
+base-path = ""                  # mount under a URL prefix behind a reverse proxy
+socket    = "/run/surfaced/surfaced.sock" # Unix surface-ctl socket; omit for HTTP-only
+mcp-token = "s3cr3t"            # bearer token on /mcp; omit to leave it open
+log       = "info"              # tracing env-filter directive; NOT RUST_LOG
+```
+
 ```sh
-# ephemeral (surfaces are lost on restart)
+# from a config file (the deployed shape)
+cargo run -p surfaced -- --config /etc/surfaced/surfaced.toml
+
+# transitional CLI-flag fallback (no --config file): ephemeral
 cargo run -p surfaced -- --http-addr 127.0.0.1:8787
 
 # durable, with the control socket + an MCP bearer token
@@ -37,16 +55,20 @@ nix run .#surfaced -- --http-addr 0.0.0.0:8787 --state-dir /tmp/surfaces
 Then open `http://<host>:8787/s/<surface-id>` (the id is created on first touch)
 and push to it — see below.
 
-### Flags
+### `--config` TOML keys / transitional flags
 
-| flag | env | default | purpose |
+seq-1377 forbids env-var config, so `surfaced` reads **no** environment variables
+(no `RUST_LOG`, no `SURFACED_*`); the `env` clap feature is dropped so an
+`#[arg(env = …)]` will not compile.
+
+| TOML key | transitional flag | default | purpose |
 |---|---|---|---|
-| `-a, --http-addr` | | `127.0.0.1:8787` | HTTP/SSE bind address (pages + push path) |
-| `-d, --state-dir` | | *(in-memory)* | directory for durable per-surface state; omit for non-durable |
-| `-b, --base-path` | `SURFACED_BASE_PATH` | `""` | mount under a URL prefix (e.g. `/surfaced`) behind a reverse proxy |
-| `-s, --socket` | `SURFACED_SOCKET` | *(off)* | Unix `surface-ctl` control socket capmeshd drives |
-| `-m, --mcp-token` | `SURFACED_MCP_TOKEN` | *(open)* | bearer token required on the `/mcp` agent endpoint |
-| `-l, --log-level` | | `info` | `trace`/`debug`/`info`/`warn`/`error` |
+| `http-addr` | `-a, --http-addr` | `127.0.0.1:8787` | HTTP/SSE bind address (pages + push path) |
+| `state-dir` | `-d, --state-dir` | *(in-memory)* | directory for durable per-surface state; omit for non-durable |
+| `base-path` | `-b, --base-path` | `""` | mount under a URL prefix (e.g. `/surfaced`) behind a reverse proxy |
+| `socket` | `-s, --socket` | *(off)* | Unix `surface-ctl` control socket capmeshd drives |
+| `mcp-token` | `-m, --mcp-token` | *(open)* | bearer token required on the `/mcp` agent endpoint |
+| `log` | `-l, --log-level` | `info` | tracing env-filter directive (e.g. `info`, `surfaced=debug,info`) |
 
 ## HTTP endpoints
 
