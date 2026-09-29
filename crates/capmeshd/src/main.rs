@@ -39,7 +39,7 @@ use config::{Automount, Config};
 use discovery::{CapabilityAdvert, ServiceAdvertiser};
 use mdns_sd::ServiceEvent;
 use std::collections::HashMap;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tracing::{debug, info, warn};
@@ -397,6 +397,21 @@ async fn main() -> Result<()> {
             Err(e) => warn!(cap = %kind, "failed to advertise: {e:#}"),
         }
     }
+    // Advertise capmesh's own control-tools MCP server (§7.1) as `cap=mcp` when it is served, so
+    // peers and the gateway discover + federate it. Best-effort: a bad addr / publish is logged.
+    if let Some(serve_addr) = &cfg.mcp_serve_addr {
+        match mcp_capability_advert(&host_id, serve_addr) {
+            Ok(advert) => match advertiser.advertise(&advert) {
+                Ok(handle) => {
+                    info!(port = advert.ep, "advertising cap=mcp control server");
+                    adverts.push(handle);
+                }
+                Err(e) => warn!("failed to advertise cap=mcp: {e:#}"),
+            },
+            Err(e) => warn!("cap=mcp advert skipped: {e:#}"),
+        }
+    }
+
     if adverts.is_empty() {
         info!("no data-plane kinds configured; browsing only");
     }
@@ -1135,6 +1150,24 @@ async fn cmd_discover(
     Ok(())
 }
 
+/// Build the `cap=mcp` advert for capmesh's own control-tools MCP server (DESIGN §7.1), so peers and
+/// the gateway discover it. The endpoint port is parsed from `serve_addr` (`host:port`); the
+/// descriptor path is the MCP endpoint `/mcp`. Pure — the mDNS publish is the caller's job.
+fn mcp_capability_advert(host_id: &str, serve_addr: &str) -> Result<CapabilityAdvert> {
+    let addr: SocketAddr = serve_addr
+        .parse()
+        .with_context(|| format!("mcp-serve-addr `{serve_addr}` is not a host:port socket address"))?;
+    let id = format!("{host_id}-mcp");
+    Ok(CapabilityAdvert {
+        cap: "mcp".to_string(),
+        dir: "control".to_string(),
+        id: id.clone(),
+        host: host_id.to_string(),
+        ep: addr.port(),
+        descr: "/mcp".to_string(),
+    })
+}
+
 fn parse_role(s: &str) -> Result<MountRole> {
     match s {
         "mirror-source" => Ok(MountRole::MirrorSource),
@@ -1555,6 +1588,22 @@ async fn connect_and_hello(socket: &Path) -> Result<CtlClient> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mcp_advert_carries_the_serve_port_and_mcp_path() {
+        let a = mcp_capability_advert("sc-host", "127.0.0.1:8092").unwrap();
+        assert_eq!(a.cap, "mcp");
+        assert_eq!(a.dir, "control");
+        assert_eq!(a.id, "sc-host-mcp");
+        assert_eq!(a.host, "sc-host");
+        assert_eq!(a.ep, 8092);
+        assert_eq!(a.descr, "/mcp");
+    }
+
+    #[test]
+    fn mcp_advert_rejects_a_non_socket_addr() {
+        assert!(mcp_capability_advert("h", "not-a-socket").is_err());
+    }
 
     fn rule(kind: Option<&str>) -> Automount {
         Automount {
