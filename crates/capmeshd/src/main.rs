@@ -554,6 +554,12 @@ async fn main() -> Result<()> {
         pending: Arc::clone(&pending),
     };
 
+    // Registered `cap=mcp` peers, keyed by mDNS fullname → the route id auto-registration used, so a
+    // `ServiceRemoved` can defederate the right upstream (§7.2 teardown — the MCP analogue of a
+    // while-advertised auto-mount teardown). Loop-local: both browse arms run in this single task, so
+    // no shared lock is needed. `register`/`unregister` on `shared` stay the source of truth.
+    let mut mcp_peers: HashMap<String, String> = HashMap::new();
+
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
@@ -578,8 +584,10 @@ async fn main() -> Result<()> {
                                             // A `cap=mcp` peer is an MCP server, not a data-plane
                                             // capability to mount: auto-register it into the route
                                             // registry + federate it on the gateway (§7.2). No
-                                            // descriptor fetch / mount planning applies.
+                                            // descriptor fetch / mount planning applies. Remember the
+                                            // fullname → route-id so a later removal defederates it.
                                             auto_register_mcp(&shared, &gateway, &advert, addr);
+                                            mcp_peers.insert(svc.get_fullname().to_string(), advert.id.clone());
                                         } else {
                                             // Mark the advert live *before* spawning, so an issuance
                                             // that outraces a `ServiceRemoved` sees the removal (§6.1).
@@ -612,6 +620,11 @@ async fn main() -> Result<()> {
                     }
                     Ok(ServiceEvent::ServiceRemoved(_ty, fullname)) => {
                         info!(%fullname, "capmesh peer removed");
+                        // A removed `cap=mcp` peer: drop its route + defederate it on the gateway
+                        // (§7.2 teardown, symmetric with the resolve-time auto-registration).
+                        if let Some(route_id) = mcp_peers.remove(&fullname) {
+                            auto_unregister_mcp(&shared, &gateway, &route_id);
+                        }
                         // Tear down this peer's `while-advertised` auto-mounts (§6.1); retain any
                         // `permanent` ones (they outlive the advert, like a permanent mount).
                         let torn = {
@@ -1341,6 +1354,20 @@ fn auto_register_mcp(
             drive_gateway(gateway, gateway_driver::on_register(&route, oc));
         }
         Err(e) => warn!(id = %route.id, "cap=mcp discovered but route rejected: {e}"),
+    }
+}
+
+/// Auto-unregister a removed `cap=mcp` peer (DESIGN §7.2 teardown): drop it from the shared route
+/// registry and drive the running gateway to defederate — the symmetric counterpart of
+/// [`auto_register_mcp`], and the MCP analogue of a `while-advertised` auto-mount teardown (§6.1).
+/// Only drives the gateway when the route was actually present (a peer removed after a manual
+/// `unregister` is already gone → nothing to do).
+fn auto_unregister_mcp(routes: &SharedMcpRoutes, gateway: &Option<GatewayDriver>, route_id: &str) {
+    if routes.lock().unwrap().unregister(route_id).is_some() {
+        info!(id = %route_id, "cap=mcp peer removed → unregistered; defederating on gateway");
+        drive_gateway(gateway, gateway_driver::on_unregister(route_id));
+    } else {
+        debug!(id = %route_id, "cap=mcp peer removed but route already gone; nothing to defederate");
     }
 }
 
