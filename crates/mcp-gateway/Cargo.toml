@@ -1,0 +1,9 @@
+[package]
+name = "mcp-gateway"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "capmesh MCP gateway: federates mesh-discovered MCP servers behind one endpoint (DESIGN §7.2)"
+
+[dependencies]
+serde_json.workspace = true
