@@ -15,6 +15,18 @@ use serde_json::{Value, json};
 /// `tools/list_changed` a v2 client honors mid-session.
 pub const SERVER_PROTOCOL_VERSION: &str = "2026-07-28";
 
+/// The JSON-RPC method for the tools-list-changed notification (MCP `notifications/tools/list_changed`).
+pub const TOOLS_LIST_CHANGED_METHOD: &str = "notifications/tools/list_changed";
+
+/// The `notifications/tools/list_changed` message the gateway pushes to a connected agent when the
+/// federated tool surface changes — an MCP upstream (de)federating mid-session (DESIGN §7.2, the M2
+/// exit). It carries no `id` and no params; the agent re-issues `tools/list` to pick up the new
+/// namespaced surface. The daemon sends this after a route-table change mutates the
+/// [`crate::Federation`] (a `set_upstream_tools` / `remove_upstream` that altered the merged surface).
+pub fn tools_list_changed() -> Value {
+    json!({ "jsonrpc": "2.0", "method": TOOLS_LIST_CHANGED_METHOD })
+}
+
 /// What the transport should do with one dispatched message.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ServerAction {
@@ -175,5 +187,17 @@ mod tests {
     fn ping_replies_empty() {
         let out = dispatch(&federation(), &req(6, "ping", json!({})));
         assert_eq!(out, ServerAction::Reply(ok(json!(6), json!({}))));
+    }
+
+    #[test]
+    fn tools_list_changed_is_a_bare_notification() {
+        let n = tools_list_changed();
+        assert_eq!(n["jsonrpc"], "2.0");
+        assert_eq!(n["method"], "notifications/tools/list_changed");
+        // A notification carries no `id` and no `params`.
+        assert!(n.get("id").is_none());
+        assert!(n.get("params").is_none());
+        // And it is precisely what a receiving dispatch treats as a notification (no reply).
+        assert_eq!(dispatch(&federation(), &n), ServerAction::Ignore);
     }
 }
