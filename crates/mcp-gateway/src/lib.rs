@@ -11,6 +11,8 @@
 //! unit-tested; the outbound client, the inbound `/mcp` server, and the route-table wiring that
 //! capmeshd drives live in the gateway daemon around it.
 
+pub mod client;
+
 use serde_json::Value;
 use std::collections::BTreeMap;
 
