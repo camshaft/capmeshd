@@ -202,8 +202,11 @@ name = "capmesh-daemon"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "bytes",
  "capmesh-ctl",
  "http-body-util",
+ "hyper",
+ "hyper-util",
  "serde_json",
  "thiserror",
  "tokio",

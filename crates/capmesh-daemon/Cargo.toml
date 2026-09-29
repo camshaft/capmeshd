@@ -13,8 +13,13 @@ tracing.workspace = true
 # The §7.1 embedded control-tools MCP server (control_http) serves capmesh's own control tools over
 # HTTP; axum is already in the workspace lock (used by capmeshd).
 axum = "0.8"
+# The gateway driver (gateway_driver) POSTs route changes to the gateway's admin control channel;
+# a small hyper client sends them. All already in the workspace lock.
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
+http-body-util = "0.1"
+bytes.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true
 tower = { version = "0.5", features = ["util"] }
-http-body-util = "0.1"
