@@ -150,6 +150,11 @@ enum Cmd {
         /// Display name for the local virtual device (mirror roles).
         #[arg(long)]
         local_name: Option<String>,
+        /// The local **real** port to bind for a `link` mount — the id from the data-plane daemon's
+        /// own `list-ports` (§3.1 `local.port-id`). Required for `link` (pair with `--dir source` to
+        /// bind the remote's source port); ignored for the mirror roles.
+        #[arg(long)]
+        local_port_id: Option<String>,
         /// Local codecs in preference order (the consuming side); defaults to [midi1].
         #[arg(long = "local-codec")]
         local_codecs: Vec<String>,
@@ -333,6 +338,7 @@ async fn main() -> Result<()> {
             port,
             role,
             local_name,
+            local_port_id,
             local_codecs,
             timeout_secs,
             mount_id,
@@ -346,6 +352,7 @@ async fn main() -> Result<()> {
                 port.as_deref(),
                 role,
                 local_name.clone(),
+                local_port_id.clone(),
                 local_codecs,
                 *timeout_secs,
                 mount_id.clone(),
@@ -1595,6 +1602,7 @@ async fn cmd_connect_discover(
     port: Option<&str>,
     role: &str,
     local_name: Option<String>,
+    local_port_id: Option<String>,
     local_codecs: &[String],
     timeout_secs: u64,
     mount_id: Option<String>,
@@ -1638,8 +1646,9 @@ async fn cmd_connect_discover(
         *addr,
         control_port,
         local_name,
-        // connect-discover does not yet name a local real port for `link` (follow-on).
-        None,
+        // A `link` binds the named local real port (§3.1 `local.port-id`); build_mount_spec ignores
+        // it for the mirror roles.
+        local_port_id,
     );
 
     let mut client = connect_and_hello(socket).await?;
