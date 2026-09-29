@@ -12,6 +12,7 @@
 //! capmeshd drives live in the gateway daemon around it.
 
 pub mod client;
+pub mod server;
 
 use serde_json::Value;
 use std::collections::BTreeMap;
