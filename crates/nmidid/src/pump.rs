@@ -519,6 +519,17 @@ mod tests {
         }
     }
 
+    /// A `MidiSource` backed by a channel the test drives — stands in for local
+    /// apps writing MIDI into a `mirror-sink` virtual port.
+    struct ChannelSource {
+        rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    }
+    impl MidiSource for ChannelSource {
+        fn receiver(&mut self) -> &mut tokio::sync::mpsc::Receiver<Vec<u8>> {
+            &mut self.rx
+        }
+    }
+
     fn connecting_status() -> Arc<Mutex<MountStatus>> {
         Arc::new(Mutex::new(MountStatus {
             mount_id: "m1".to_string(),
@@ -1040,17 +1051,6 @@ mod tests {
         use nmidi_core::network::NetworkSockets;
         use tokio::sync::mpsc;
 
-        // A MidiSource backed by a channel the test drives (stands in for the
-        // local apps writing into the virtual sink).
-        struct ChannelSource {
-            rx: mpsc::Receiver<Vec<u8>>,
-        }
-        impl MidiSource for ChannelSource {
-            fn receiver(&mut self) -> &mut mpsc::Receiver<Vec<u8>> {
-                &mut self.rx
-            }
-        }
-
         // Fake remote peer on consecutive ports: control accepts the invitation,
         // data receives our outbound RTP (data port = control port + 1).
         let fake = NetworkSockets::bind_consecutive("127.0.0.1").await.unwrap();
@@ -1135,5 +1135,90 @@ mod tests {
             "mirror-sink must accumulate bytes-out"
         );
         pump.abort();
+    }
+
+    /// The mirror-sink counterpart of `pump_cancel_sends_end_to_peer_and_tears_down`:
+    /// unmounting a mirror-sink mount must tear the session down *gracefully* —
+    /// `run_sink_pump` sends `End` (BY) to the remote sink so it does not hold a
+    /// stale session, and the mount transitions to `torn-down`.
+    #[tokio::test]
+    async fn sink_pump_cancel_sends_end_to_peer_and_tears_down() {
+        use tokio::net::UdpSocket;
+        use tokio::sync::mpsc;
+
+        let fake_ctl = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let fake_ctl_port = fake_ctl.local_addr().unwrap().port();
+
+        let got_end = Arc::new(Mutex::new(false));
+        let got_end_w = Arc::clone(&got_end);
+        tokio::spawn(async move {
+            let mut buf = [0u8; 2048];
+            let (n, from) = fake_ctl.recv_from(&mut buf).await.unwrap();
+            let AppleMidiPacket::Invitation { token, ssrc, .. } =
+                AppleMidiPacket::parse(&buf[..n]).unwrap()
+            else {
+                return;
+            };
+            let accept = AppleMidiPacket::InvitationAccepted {
+                version: APPLEMIDI_VERSION,
+                token,
+                ssrc,
+                name: "fake-peer".to_string(),
+            };
+            fake_ctl.send_to(&accept.to_bytes(), from).await.unwrap();
+            // Wait for the graceful End (BY) that unmount should send.
+            loop {
+                let (n, _) = fake_ctl.recv_from(&mut buf).await.unwrap();
+                if let Ok(AppleMidiPacket::End { .. }) = AppleMidiPacket::parse(&buf[..n]) {
+                    *got_end_w.lock().unwrap() = true;
+                    break;
+                }
+            }
+        });
+
+        // The local sink source never yields; we only exercise handshake + cancel.
+        let (_tx, rx) = mpsc::channel::<Vec<u8>>(1);
+        let status = connecting_status();
+        let (notifier, _rx) = broadcast::channel(8);
+        let cancel = Arc::new(Notify::new());
+        let remote = RemoteEndpoint {
+            host: None,
+            addr: "127.0.0.1".to_string(),
+            port: fake_ctl_port,
+            port_id: "sink-0".to_string(),
+        };
+        let pump = tokio::spawn(run_sink_pump(
+            remote,
+            Box::new(ChannelSource { rx }),
+            Arc::clone(&status),
+            notifier,
+            Arc::clone(&cancel),
+        ));
+
+        // Once active, unmount (cancel) and expect a graceful BY at the peer.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if status.lock().unwrap().state == MountState::Active {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("mount reached active");
+        cancel.notify_one();
+
+        let ended = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if *got_end.lock().unwrap() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(ended.is_ok(), "peer did not receive End (BY) on mirror-sink unmount");
+        let _ = pump.await;
+        assert_eq!(status.lock().unwrap().state, MountState::TornDown);
     }
 }
