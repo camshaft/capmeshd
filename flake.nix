@@ -370,12 +370,13 @@
               # while keeping the DynamicUser sandbox, and the group must be declared.
               supGroups = toString (sys.config.systemd.services.capmesh.serviceConfig.SupplementaryGroups or [ ]);
               dynUser = pkgs.lib.boolToString (sys.config.systemd.services.capmesh.serviceConfig.DynamicUser or false);
+              svcUser = sys.config.systemd.services.capmesh.serviceConfig.User or "";
               hasGroup = pkgs.lib.boolToString (sys.config.users.groups ? capmesh);
               rustLog = sys.config.systemd.services.capmesh.environment.RUST_LOG or "";
             in
             pkgs.runCommand "capmesh-module-render"
               {
-                inherit supGroups dynUser hasGroup rustLog;
+                inherit supGroups dynUser svcUser hasGroup rustLog;
               } ''
               cp ${sys.config.environment.etc."capmesh/capmesh.toml".source} rendered.toml
               cat rendered.toml
@@ -391,10 +392,14 @@
               grep -q 'kind = "midi"' rendered.toml
               grep -q 'lifetime = "while-advertised"' rendered.toml
               # §8 trust boundary: capmesh group joined, group declared, sandbox kept.
-              printf 'SupplementaryGroups=%s DynamicUser=%s hasGroup=%s\n' "$supGroups" "$dynUser" "$hasGroup"
+              printf 'SupplementaryGroups=%s DynamicUser=%s User=%s hasGroup=%s\n' "$supGroups" "$dynUser" "$svcUser" "$hasGroup"
               [ "$supGroups" = "capmesh" ]
               [ "$dynUser" = "true" ]
               [ "$hasGroup" = "true" ]
+              # The DynamicUser transient user/group name (User=) MUST differ from the static trust
+              # group, or systemd 217/USER-crashes on the colliding same-named transient group (#79).
+              [ "$svcUser" = "capmeshd" ]
+              [ "$svcUser" != "$supGroups" ]
               # Log verbosity is set declaratively (defaults to info) via RUST_LOG.
               printf 'RUST_LOG=%s\n' "$rustLog"
               [ "$rustLog" = "info" ]
