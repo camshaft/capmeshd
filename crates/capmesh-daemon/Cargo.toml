@@ -7,9 +7,9 @@ description = "capmesh control-plane core: the desired-mount reconciler and form
 
 [dependencies]
 capmesh-ctl = { path = "../capmesh-ctl" }
+serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true
-serde_json.workspace = true
