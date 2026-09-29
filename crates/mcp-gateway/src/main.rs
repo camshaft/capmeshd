@@ -40,10 +40,38 @@ async fn main() {
     info!(bind = %bind, upstreams = cfg.upstream.len(), "mcp-gateway starting");
 
     let client = http_client();
-    let (federation, endpoints) = connect_upstreams(&client, &cfg.upstream).await;
-    info!(federated = federation.upstream_ids().len(), "startup federation built");
+    let (fed, endpoints) = connect_upstreams(&client, &cfg.upstream).await;
+    info!(federated = fed.upstream_ids().len(), "startup federation built");
 
-    let state = GatewayState::new(federation, Arc::new(HttpForwarder::new(endpoints)));
+    // The federation + forwarder are shared: the /mcp server serves them, and the admin control
+    // channel (de)federates them live — both see the same state.
+    let federation = Arc::new(tokio::sync::RwLock::new(fed));
+    let forwarder = Arc::new(HttpForwarder::new(endpoints));
+    let state = GatewayState {
+        federation: federation.clone(),
+        forwarder: forwarder.clone(),
+    };
+
+    // Control channel (DESIGN §7.2): capmeshd drives (de)federation over this loopback admin API.
+    // Best-effort: a bind failure is logged, not fatal.
+    if let Some(admin_addr) = cfg.admin_addr.clone() {
+        let admin = mcp_gateway::admin::AdminState {
+            client: client.clone(),
+            federation: federation.clone(),
+            forwarder: forwarder.clone(),
+        };
+        match tokio::net::TcpListener::bind(&admin_addr).await {
+            Ok(listener) => {
+                info!(addr = %admin_addr, "serving gateway control channel /admin");
+                tokio::spawn(async move {
+                    if let Err(e) = axum::serve(listener, mcp_gateway::admin::admin_router(admin)).await {
+                        warn!("gateway control channel error: {e}");
+                    }
+                });
+            }
+            Err(e) => warn!(addr = %admin_addr, "control channel: bind failed: {e}"),
+        }
+    }
 
     let listener = match tokio::net::TcpListener::bind(&bind).await {
         Ok(l) => l,

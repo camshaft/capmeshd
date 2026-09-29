@@ -11,6 +11,7 @@
 //! unit-tested; the outbound client, the inbound `/mcp` server, and the route-table wiring that
 //! capmeshd drives live in the gateway daemon around it.
 
+pub mod admin;
 pub mod client;
 pub mod config;
 pub mod daemon;

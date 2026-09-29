@@ -17,6 +17,12 @@ pub struct GatewayConfig {
     #[serde(default = "default_log")]
     pub log: String,
 
+    /// Local bind address for the gateway **control channel** (DESIGN §7.2) — the loopback admin API
+    /// (`/admin/upstreams`) capmeshd drives to (de)federate upstreams live. Absent → control channel
+    /// off (static config only). Distinct from `bind` (the agent-facing `/mcp`).
+    #[serde(rename = "admin-addr", default)]
+    pub admin_addr: Option<String>,
+
     /// The upstreams to federate at startup (the explicit floor).
     #[serde(default)]
     pub upstream: Vec<UpstreamConfig>,
