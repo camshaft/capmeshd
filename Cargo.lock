@@ -527,6 +527,7 @@ dependencies = [
  "pin-project-lite",
  "smallvec",
  "tokio",
+ "want",
 ]
 
 [[package]]
@@ -536,12 +537,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ddc03d96684f9226b8a787cdb71488417b53ab5ea8fdb1dac946cb9431cc8bff"
 dependencies = [
  "bytes",
+ "futures-channel",
+ "futures-util",
  "http",
  "http-body",
+ "httparse",
  "hyper",
+ "libc",
  "pin-project-lite",
+ "socket2",
  "tokio",
  "tower-service",
+ "tracing",
 ]
 
 [[package]]
@@ -640,7 +647,10 @@ name = "mcp-gateway"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "bytes",
  "http-body-util",
+ "hyper",
+ "hyper-util",
  "serde_json",
  "tokio",
  "tower",
@@ -1308,6 +1318,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "try-lock"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
+
+[[package]]
 name = "unicode-ident"
 version = "1.0.26"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1335,6 +1351,15 @@ name = "valuable"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
+
+[[package]]
+name = "want"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bfa7760aed19e106de2c7c0b581b509f2f25d3dacaf737cb82ac61bc6d760b0e"
+dependencies = [
+ "try-lock",
+]
 
 [[package]]
 name = "wasi"
