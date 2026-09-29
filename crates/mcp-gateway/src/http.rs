@@ -9,19 +9,23 @@
 //! (an HTTP client built from [`crate::client`]) and the route-table that keeps the `Federation`
 //! current.
 
-use crate::{serve, Federation};
+use crate::{serve, server, Federation};
 use axum::{
     Json, Router,
     extract::State,
     http::StatusCode,
+    response::sse::{Event, KeepAlive, Sse},
     response::{IntoResponse, Response},
     routing::post,
 };
 use serde_json::Value;
+use std::convert::Infallible;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{broadcast, RwLock};
+use tokio_stream::wrappers::BroadcastStream;
+use tokio_stream::{Stream, StreamExt};
 
 /// A boxed, `'static` future — a forward round-trip in flight.
 pub type ForwardFuture = Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'static>>;
@@ -36,27 +40,49 @@ pub trait UpstreamForwarder: Send + Sync + 'static {
 }
 
 /// Shared state behind the `/mcp` endpoint: the live federated tool surface (mutated as upstreams
-/// (de)federate) and the outbound forwarder. Cheaply cloneable per axum's state contract.
+/// (de)federate), the outbound forwarder, and a change notifier the `GET /mcp` SSE stream turns into
+/// `tools/list_changed` events. Cheaply cloneable per axum's state contract.
 #[derive(Clone)]
 pub struct GatewayState {
     pub federation: Arc<RwLock<Federation>>,
     pub forwarder: Arc<dyn UpstreamForwarder>,
+    /// Fires whenever the federated surface changes; each `GET /mcp` stream subscribes and pushes a
+    /// `tools/list_changed`. The control channel ([`crate::admin`]) is the sender.
+    pub notifier: broadcast::Sender<()>,
 }
 
 impl GatewayState {
-    /// Build state from a federation snapshot and a forwarder.
-    pub fn new(federation: Federation, forwarder: Arc<dyn UpstreamForwarder>) -> Self {
+    /// Build state from a federation snapshot, a forwarder, and a change notifier.
+    pub fn new(
+        federation: Federation,
+        forwarder: Arc<dyn UpstreamForwarder>,
+        notifier: broadcast::Sender<()>,
+    ) -> Self {
         Self {
             federation: Arc::new(RwLock::new(federation)),
             forwarder,
+            notifier,
         }
     }
 }
 
-/// The gateway's agent-facing router: `POST /mcp` (Streamable-HTTP). MCP is a single-endpoint
-/// protocol — every message (initialize / tools/list / tools/call / notifications) is one POST.
+/// The gateway's agent-facing router (Streamable-HTTP): `POST /mcp` handles each JSON-RPC message,
+/// `GET /mcp` opens the server→agent SSE stream carrying `tools/list_changed` as upstreams
+/// (de)federate mid-session.
 pub fn router(state: GatewayState) -> Router {
-    Router::new().route("/mcp", post(handle_mcp)).with_state(state)
+    Router::new()
+        .route("/mcp", post(handle_mcp).get(mcp_stream))
+        .with_state(state)
+}
+
+/// `GET /mcp`: the server→agent event stream. Subscribes to the change notifier and emits a
+/// `notifications/tools/list_changed` SSE event whenever the federated surface changes (the agent
+/// then re-issues `tools/list`). A broadcast lag also yields the notification — re-listing is safe.
+async fn mcp_stream(State(state): State<GatewayState>) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let notification = serde_json::to_string(&server::tools_list_changed()).unwrap_or_default();
+    let stream = BroadcastStream::new(state.notifier.subscribe())
+        .map(move |_signal_or_lag| Ok(Event::default().data(notification.clone())));
+    Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
 /// Handle one POSTed JSON-RPC message. A malformed (non-JSON) body is rejected by the `Json`
@@ -106,6 +132,7 @@ mod tests {
         GatewayState {
             federation: Arc::new(RwLock::new(fed)),
             forwarder: stub,
+            notifier: broadcast::channel(8).0,
         }
     }
 
@@ -194,5 +221,18 @@ mod tests {
         assert_eq!(status, 200); // JSON-RPC errors ride a 200 HTTP response
         assert_eq!(body["error"]["code"], -32602);
         assert!(stub.seen.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn get_mcp_opens_a_server_sent_event_stream() {
+        let stub = Arc::new(StubForwarder { seen: std::sync::Mutex::new(None) });
+        let router = router(state_with(board_federation(), stub));
+
+        let req = Request::builder().method("GET").uri("/mcp").body(Body::empty()).unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        // The SSE stream is long-lived, so assert the response head only — don't drain the body.
+        assert_eq!(resp.status().as_u16(), 200);
+        let ct = resp.headers().get("content-type").unwrap().to_str().unwrap();
+        assert!(ct.contains("text/event-stream"), "content-type was {ct}");
     }
 }
