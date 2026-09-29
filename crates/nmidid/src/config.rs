@@ -39,9 +39,11 @@ pub struct Config {
     #[serde(default = "default_socket")]
     pub socket: String,
 
-    /// How often to poll local MIDI ports for hot-plug, in seconds (§5).
-    #[serde(rename = "monitor-interval", default = "default_monitor_interval")]
-    pub monitor_interval: u64,
+    /// How often to poll local MIDI ports for hot-plug, in seconds (§5). Keyed
+    /// `monitor-interval-secs` to make the unit explicit (aligned with the NixOS
+    /// module render + gate, #166).
+    #[serde(rename = "monitor-interval-secs", default = "default_monitor_interval")]
+    pub monitor_interval_secs: u64,
 
     /// Log verbosity as a `tracing` env-filter directive (e.g. `info` or
     /// `nmidid=debug,info`). Configured here in the TOML — NOT via `RUST_LOG` or
@@ -69,7 +71,7 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             socket: default_socket(),
-            monitor_interval: default_monitor_interval(),
+            monitor_interval_secs: default_monitor_interval(),
             log: default_log(),
             allow_uids: Vec::new(),
             allow_gids: Vec::new(),
@@ -101,7 +103,7 @@ mod tests {
         let cfg = Config::parse("").expect("empty parses");
         assert_eq!(cfg, Config::default());
         assert_eq!(cfg.socket, "/run/nmidid.sock");
-        assert_eq!(cfg.monitor_interval, 5);
+        assert_eq!(cfg.monitor_interval_secs, 5);
         assert_eq!(cfg.log, "info");
         assert!(cfg.allow_uids.is_empty());
         assert!(cfg.allow_gids.is_empty());
@@ -113,7 +115,7 @@ mod tests {
         let cfg = Config::parse(
             r#"
 socket = "/run/nmidid/nmidid.sock"
-monitor-interval = 10
+monitor-interval-secs = 10
 log = "nmidid=debug,info"
 allow-uids = [1000, 1001]
 allow-gids = [29]
@@ -122,7 +124,7 @@ allow-groups = ["capmesh", "audio"]
         )
         .expect("parse");
         assert_eq!(cfg.socket, "/run/nmidid/nmidid.sock");
-        assert_eq!(cfg.monitor_interval, 10);
+        assert_eq!(cfg.monitor_interval_secs, 10);
         assert_eq!(cfg.log, "nmidid=debug,info");
         assert_eq!(cfg.allow_uids, vec![1000, 1001]);
         assert_eq!(cfg.allow_gids, vec![29]);
@@ -155,6 +157,6 @@ allow-groups = ["capmesh", "audio"]
         assert_eq!(cfg.log, "trace");
         // Untouched keys keep their defaults.
         assert_eq!(cfg.socket, "/run/nmidid.sock");
-        assert_eq!(cfg.monitor_interval, 5);
+        assert_eq!(cfg.monitor_interval_secs, 5);
     }
 }
