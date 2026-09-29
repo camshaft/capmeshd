@@ -86,6 +86,14 @@ pub struct LocalEndpoint {
     /// Display name for the virtual device.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// The local **real** port to bind for a `link` mount (`virtual:false`) — the `port-id` from the
+    /// data-plane daemon's own `list-ports`. Names *which* local port the daemon connects; the daemon
+    /// resolves it against its list-ports (unknown → `no-such-port`) and derives the direction from
+    /// its own descriptor for that id (a real source → forward out, a real sink → forward in), so no
+    /// direction travels on the wire. Absent for the mirror roles (they create a virtual endpoint,
+    /// not bind an existing one). Additive/optional on the frozen wire.
+    #[serde(rename = "port-id", default, skip_serializing_if = "Option::is_none")]
+    pub port_id: Option<String>,
 }
 
 /// The remote peer a mount connects to, DIRECT peer-to-peer (§3.1). `addr` is typed as an
@@ -416,6 +424,25 @@ mod tests {
         assert_eq!(v["local"]["virtual"], true);
         assert_eq!(v["remote"]["port-id"], "kbd-0");
         assert_eq!(v["remote"]["addr"], "192.168.1.23");
+        // A mirror mount omits local.port-id entirely (absent, not null).
+        assert_eq!(spec.local.port_id, None);
+        assert!(v["local"].get("port-id").is_none());
+    }
+
+    #[test]
+    fn link_mount_carries_local_port_id() {
+        // A `link` MountSpec names the local REAL port to bind via `local.port-id`.
+        let json = r#"{"mount-id":"m1","role":"link",
+            "local":{"virtual":false,"port-id":"sink-supercollider"},
+            "remote":{"host":"studio","addr":"10.0.0.5","port":5004,"port-id":"kbd-0"},
+            "format":{"codec":"midi1"}}"#;
+        let spec: MountSpec = serde_json::from_str(json).unwrap();
+        assert_eq!(spec.role, MountRole::Link);
+        assert!(!spec.local.is_virtual);
+        assert_eq!(spec.local.port_id.as_deref(), Some("sink-supercollider"));
+        // Round-trips under the hyphenated wire key.
+        let v = serde_json::to_value(&spec).unwrap();
+        assert_eq!(v["local"]["port-id"], "sink-supercollider");
     }
 
     #[test]

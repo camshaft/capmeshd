@@ -98,7 +98,9 @@ pub fn plan_mount(
 /// `_apple-midi._udp` record — and goes into `remote.port` **verbatim**: the data-plane daemon
 /// derives the data port as `remote.port + 1` itself, so capmeshd MUST NOT add 1. The port is
 /// resolved by the caller, keeping this kind-agnostic. Mirror roles create a local virtual
-/// endpoint named `local_name`; `link` binds an existing real local port (no virtual endpoint).
+/// endpoint named `local_name`; `link` binds an existing real local port named by `local_port_id`
+/// (the id from the data-plane daemon's `list-ports`; no virtual endpoint). `local_port_id` is
+/// carried only for `link` — a mirror role ignores it (it creates a virtual endpoint, §3.1).
 pub fn build_mount_spec(
     plan: MountPlan,
     mount_id: String,
@@ -106,6 +108,7 @@ pub fn build_mount_spec(
     remote_addr: IpAddr,
     control_port: u16,
     local_name: Option<String>,
+    local_port_id: Option<String>,
 ) -> MountSpec {
     let is_virtual = matches!(plan.role, MountRole::MirrorSource | MountRole::MirrorSink);
     MountSpec {
@@ -114,6 +117,11 @@ pub fn build_mount_spec(
         local: LocalEndpoint {
             is_virtual,
             name: local_name,
+            // Only a `link` binds a named local real port; mirror roles never do.
+            port_id: match plan.role {
+                MountRole::Link => local_port_id,
+                MountRole::MirrorSource | MountRole::MirrorSink => None,
+            },
         },
         remote: RemoteEndpoint {
             host: remote_host,
@@ -275,6 +283,10 @@ pub fn evaluate(
         remote.addr,
         control_port,
         remote.local_name,
+        // Discovery-driven auto-mount does not yet name a local real port for a `link` rule (the
+        // rule selects a remote capability, not a local port); sourcing it is a follow-on. Manual
+        // link mounts (connect / permanent-mount config) will pass it once those paths carry it.
+        None,
     ))
 }
 
@@ -412,11 +424,14 @@ mod tests {
             "192.168.1.23".parse().unwrap(),
             5004, // the AppleMIDI CONTROL port (SRV port), verbatim; the daemon derives data = 5005
             Some("laptop: Keystation 49e".into()),
+            // A local port-id passed for a mirror role is ignored — mirrors create a virtual endpoint.
+            Some("ignored-for-mirror".into()),
         );
         assert_eq!(spec.mount_id, "laptop-kbd-0");
         assert_eq!(spec.role, MountRole::MirrorSource);
         assert!(spec.local.is_virtual);
         assert_eq!(spec.local.name.as_deref(), Some("laptop: Keystation 49e"));
+        assert_eq!(spec.local.port_id, None); // mirror never binds a local real port
         assert_eq!(spec.remote.host, "laptop");
         assert_eq!(
             spec.remote.addr,
@@ -441,9 +456,12 @@ mod tests {
             "10.0.0.1".parse().unwrap(),
             6000,
             None,
+            // A `link` carries the local real-port selector through to `local.port-id`.
+            Some("sink-supercollider".into()),
         );
         assert!(!spec.local.is_virtual);
         assert!(spec.local.name.is_none());
+        assert_eq!(spec.local.port_id.as_deref(), Some("sink-supercollider"));
     }
 
     fn remote(control_port: Option<u16>) -> Remote {
