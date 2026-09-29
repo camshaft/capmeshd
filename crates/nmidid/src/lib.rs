@@ -14,10 +14,12 @@
 //! - **Methods**: `hello` / `list-ports` / `describe-port` and
 //!   `mount` / `unmount` / `mount-status`, plus the unsolicited §5 notifications
 //!   `mount-state` and `port-added` / `port-removed` (hot-plug, [`hotplug`]).
-//! - **`mirror-source` mount** ([`mounts`], [`pump`]): materialize a local
-//!   virtual MIDI source and drive the AppleMIDI handshake + RTP-MIDI pump so a
-//!   remote keyboard plays it — `connecting → active`, with clock-sync,
-//!   dead-peer detection, and graceful teardown. Other roles are declined
+//! - **Mirror mounts** ([`mounts`], [`pump`]): materialize a local virtual MIDI
+//!   endpoint and drive the AppleMIDI handshake + RTP-MIDI pump — `connecting →
+//!   active`, with clock-sync, dead-peer detection, and graceful teardown.
+//!   `mirror-source` creates a local virtual source a remote keyboard plays;
+//!   `mirror-sink` creates a local virtual sink whose MIDI is forwarded out to a
+//!   remote sink. `link` (bind an existing real local port) is declined
 //!   (`role-unsupported`) pending later work.
 //!
 //! # Seams

@@ -16,7 +16,7 @@ use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
-use tokio::sync::{Notify, broadcast};
+use tokio::sync::{Notify, broadcast, mpsc};
 
 use crate::protocol::{
     DaemonError, MountRole, MountSpec, MountState, MountStats, MountStatus, RemoteEndpoint,
@@ -64,12 +64,34 @@ pub(crate) fn transition(
     let _ = notifier.send(notification);
 }
 
-/// A place to push decoded MIDI bytes — the local end of a mount. Owned by the
-/// mount's data-path task; dropping it releases the underlying endpoint (e.g.
-/// removes the virtual MIDI port).
+/// A place to push decoded MIDI bytes — the local end of a `mirror-source` mount
+/// (a virtual source other apps read from). Owned by the mount's data-path task;
+/// dropping it releases the underlying endpoint (e.g. removes the virtual MIDI
+/// port).
 pub trait MidiSink: Send {
     /// Send one MIDI message (raw status+data bytes) to the local endpoint.
     fn send(&self, message: &[u8]) -> anyhow::Result<()>;
+}
+
+/// The local end of a `mirror-sink` mount: a stream of MIDI messages produced by
+/// local apps writing into the virtual sink, which the pump forwards out to the
+/// remote sink over RTP-MIDI. Owned by the mount's data-path task; dropping it
+/// releases the underlying endpoint (removes the virtual MIDI port).
+pub trait MidiSource: Send {
+    /// The channel carrying MIDI messages received from the local virtual sink.
+    /// The pump awaits it; a `None` from `recv` means the endpoint is gone.
+    fn receiver(&mut self) -> &mut mpsc::Receiver<Vec<u8>>;
+}
+
+/// Which local endpoint a mount materializes, handed to the [`Connector`] so the
+/// one pump implementation can drive either data direction: `mirror-source` pushes
+/// remote MIDI into a local [`MidiSink`]; `mirror-sink` pumps local MIDI out from a
+/// [`MidiSource`] to the remote.
+pub enum LocalEnd {
+    /// `mirror-source`: a local virtual source fed by the remote source.
+    Source(Box<dyn MidiSink>),
+    /// `mirror-sink`: a local virtual sink whose MIDI is forwarded to the remote.
+    Sink(Box<dyn MidiSource>),
 }
 
 /// Materializes the local OS endpoint of a mount.
@@ -81,17 +103,22 @@ pub trait Mounter: Send + Sync {
     /// which we push the remote source's events) named `display_name`, returning
     /// the sink to push into.
     fn create_virtual_source(&self, display_name: &str) -> anyhow::Result<Box<dyn MidiSink>>;
+
+    /// Create a local virtual **sink** (a port other apps write to) named
+    /// `display_name`, returning the source that yields the MIDI they send — the
+    /// pump forwards it out to the remote sink.
+    fn create_virtual_sink(&self, display_name: &str) -> anyhow::Result<Box<dyn MidiSource>>;
 }
 
-/// Drives a mount's data path: connects to the remote and pumps events into the
-/// sink, updating `status`. The task runs until the remote ends the session or
-/// `cancel` is notified (unmount), at which point it tears the session down
-/// gracefully (sends `End`) and drops the sink → the local endpoint.
+/// Drives a mount's data path: connects to the remote and pumps events between it
+/// and the local endpoint, updating `status`. The task runs until the remote ends
+/// the session or `cancel` is notified (unmount), at which point it tears the
+/// session down gracefully (sends `End`) and drops the local endpoint.
 pub trait Connector: Send + Sync {
     fn start(
         &self,
         remote: RemoteEndpoint,
-        sink: Box<dyn MidiSink>,
+        local: LocalEnd,
         status: Arc<Mutex<MountStatus>>,
         notifier: broadcast::Sender<Value>,
         cancel: Arc<Notify>,
@@ -172,13 +199,14 @@ impl MountRegistry {
             }
         }
 
-        // Only mirror-source is implemented in M0a; other roles are declined
-        // honestly rather than silently faked.
-        if spec.role != MountRole::MirrorSource {
+        // The two mirror roles are implemented; `link` (bind an existing real
+        // local port, no virtual endpoint) is declined honestly rather than
+        // silently faked.
+        if spec.role == MountRole::Link {
             return Err(DaemonError::domain(
                 "role-unsupported",
                 format!(
-                    "role {:?} is not implemented yet (mirror-source only)",
+                    "role {:?} is not implemented yet (mirror-source / mirror-sink only)",
                     spec.role
                 ),
             ));
@@ -212,12 +240,21 @@ impl MountRegistry {
             .clone()
             .unwrap_or_else(|| format!("nmidid: {}", spec.remote.port_id));
 
-        let sink = self
-            .mounter
-            .create_virtual_source(&display_name)
-            .map_err(|e| {
-                DaemonError::domain("busy", format!("could not create virtual port: {e}"))
-            })?;
+        // Materialize the local endpoint matching the role's data direction:
+        // mirror-source → a virtual source we push into; mirror-sink → a virtual
+        // sink we read from and forward out. (`link` was declined above.)
+        let local = match spec.role {
+            MountRole::MirrorSource => LocalEnd::Source(
+                self.mounter
+                    .create_virtual_source(&display_name)
+                    .map_err(|e| {
+                        DaemonError::domain("busy", format!("could not create virtual port: {e}"))
+                    })?,
+            ),
+            _ => LocalEnd::Sink(self.mounter.create_virtual_sink(&display_name).map_err(
+                |e| DaemonError::domain("busy", format!("could not create virtual port: {e}")),
+            )?),
+        };
 
         let status = Arc::new(Mutex::new(MountStatus {
             mount_id: spec.mount_id.clone(),
@@ -239,7 +276,7 @@ impl MountRegistry {
         let cancel = Arc::new(Notify::new());
         self.connector.start(
             spec.remote.clone(),
-            sink,
+            local,
             Arc::clone(&status),
             self.notifier.clone(),
             Arc::clone(&cancel),
@@ -313,6 +350,28 @@ impl MidiSink for MidirSink {
     }
 }
 
+/// The `mirror-sink` local end: owns the `midir` virtual INPUT connection (whose
+/// callback feeds `rx`) and hands the pump the receiving end. Dropping this drops
+/// the connection, removing the virtual port.
+#[cfg(unix)]
+struct MidirSource {
+    // Held only to keep the virtual input port alive; its callback feeds `rx`.
+    _conn: midir::MidiInputConnection<()>,
+    rx: mpsc::Receiver<Vec<u8>>,
+}
+
+#[cfg(unix)]
+impl MidiSource for MidirSource {
+    fn receiver(&mut self) -> &mut mpsc::Receiver<Vec<u8>> {
+        &mut self.rx
+    }
+}
+
+/// Bound on the callback→pump channel for a virtual sink. MIDI is realtime, so a
+/// full channel drops rather than blocks the OS callback (see `create_virtual_sink`).
+#[cfg(unix)]
+const SINK_CHANNEL_DEPTH: usize = 1024;
+
 impl Mounter for MidirMounter {
     fn supports_virtual(&self) -> bool {
         // `midir` supports virtual ports on ALSA (Linux) and CoreMIDI (macOS).
@@ -331,6 +390,36 @@ impl Mounter for MidirMounter {
                 .create_virtual(display_name)
                 .map_err(|e| anyhow::anyhow!("create_virtual failed: {e}"))?;
             Ok(Box::new(MidirSink(Mutex::new(conn))))
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = display_name;
+            anyhow::bail!("virtual MIDI ports are not supported on this platform")
+        }
+    }
+
+    fn create_virtual_sink(&self, display_name: &str) -> anyhow::Result<Box<dyn MidiSource>> {
+        #[cfg(unix)]
+        {
+            use midir::MidiInput;
+            use midir::os::unix::VirtualInput;
+            // A virtual INPUT we own appears to other local apps as a writable
+            // MIDI sink; the callback forwards each message they send into the
+            // channel the pump reads. `try_send` never blocks the realtime MIDI
+            // callback — under sustained overload the oldest-unsent message is
+            // dropped rather than stalling the OS thread.
+            let inp = MidiInput::new("nmidid")?;
+            let (tx, rx) = mpsc::channel::<Vec<u8>>(SINK_CHANNEL_DEPTH);
+            let conn = inp
+                .create_virtual(
+                    display_name,
+                    move |_timestamp, message, _| {
+                        let _ = tx.try_send(message.to_vec());
+                    },
+                    (),
+                )
+                .map_err(|e| anyhow::anyhow!("create_virtual (input) failed: {e}"))?;
+            Ok(Box::new(MidirSource { _conn: conn, rx }))
         }
         #[cfg(not(unix))]
         {
@@ -381,6 +470,30 @@ impl MidiSink for NullSink {
     }
 }
 
+/// A no-op `MidiSource` for tests: never yields a message (its sender is retained
+/// so the channel stays open). Enough to satisfy the mirror-sink endpoint seam
+/// where no pump actually polls it.
+#[cfg(test)]
+pub(crate) struct NullSource {
+    _tx: mpsc::Sender<Vec<u8>>,
+    rx: mpsc::Receiver<Vec<u8>>,
+}
+
+#[cfg(test)]
+impl NullSource {
+    pub(crate) fn new() -> Self {
+        let (tx, rx) = mpsc::channel(1);
+        NullSource { _tx: tx, rx }
+    }
+}
+
+#[cfg(test)]
+impl MidiSource for NullSource {
+    fn receiver(&mut self) -> &mut mpsc::Receiver<Vec<u8>> {
+        &mut self.rx
+    }
+}
+
 #[cfg(test)]
 impl Mounter for NullMounter {
     fn supports_virtual(&self) -> bool {
@@ -388,6 +501,9 @@ impl Mounter for NullMounter {
     }
     fn create_virtual_source(&self, _display_name: &str) -> anyhow::Result<Box<dyn MidiSink>> {
         Ok(Box::new(NullSink))
+    }
+    fn create_virtual_sink(&self, _display_name: &str) -> anyhow::Result<Box<dyn MidiSource>> {
+        Ok(Box::new(NullSource::new()))
     }
 }
 
@@ -400,7 +516,7 @@ impl Connector for NullConnector {
     fn start(
         &self,
         _remote: RemoteEndpoint,
-        _sink: Box<dyn MidiSink>,
+        _local: LocalEnd,
         _status: Arc<Mutex<MountStatus>>,
         _notifier: broadcast::Sender<Value>,
         _cancel: Arc<Notify>,
@@ -422,6 +538,9 @@ mod tests {
         }
         fn create_virtual_source(&self, _display_name: &str) -> anyhow::Result<Box<dyn MidiSink>> {
             Ok(Box::new(NullSink))
+        }
+        fn create_virtual_sink(&self, _display_name: &str) -> anyhow::Result<Box<dyn MidiSource>> {
+            Ok(Box::new(NullSource::new()))
         }
     }
 
@@ -522,12 +641,36 @@ mod tests {
     }
 
     #[test]
-    fn non_mirror_source_role_is_declined() {
+    fn link_role_is_declined() {
         let reg = registry(true);
         let mut s = spec("m1", "source-0", "midi1");
         s.role = MountRole::Link;
         let err = reg.mount(s).unwrap_err();
         assert_eq!(err.code, "role-unsupported");
+    }
+
+    #[test]
+    fn mount_mirror_sink_is_connecting_and_listed() {
+        // mirror-sink creates a local virtual sink and drives the outbound pump;
+        // it must be accepted (not declined) and reach `connecting`.
+        let reg = registry(true);
+        let mut s = spec("m1", "sink-0", "midi1");
+        s.role = MountRole::MirrorSink;
+        let r = reg.mount(s).unwrap();
+        assert_eq!(r["state"], "connecting");
+        assert_eq!(r["mount-id"], "m1");
+        let mounts = reg.status(None)["mounts"].as_array().unwrap().clone();
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(mounts[0]["state"], "connecting");
+    }
+
+    #[test]
+    fn mirror_sink_on_platform_without_virtual_support_is_declined() {
+        let reg = registry(false);
+        let mut s = spec("m1", "sink-0", "midi1");
+        s.role = MountRole::MirrorSink;
+        let err = reg.mount(s).unwrap_err();
+        assert_eq!(err.code, "virtual-unsupported");
     }
 
     #[test]

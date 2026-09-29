@@ -36,7 +36,7 @@ use serde_json::Value;
 use tokio::sync::{Notify, broadcast};
 use tracing::{debug, info, warn};
 
-use crate::mounts::{Connector, MidiSink, now_rfc3339, transition};
+use crate::mounts::{Connector, LocalEnd, MidiSink, MidiSource, now_rfc3339, transition};
 use crate::protocol::{MountState, MountStatus, RemoteEndpoint};
 
 /// How long to wait for `InvitationAccepted` before retrying, and how many times.
@@ -110,15 +110,25 @@ impl Connector for RtpConnector {
     fn start(
         &self,
         remote: RemoteEndpoint,
-        sink: Box<dyn MidiSink>,
+        local: LocalEnd,
         status: Arc<Mutex<MountStatus>>,
         notifier: broadcast::Sender<Value>,
         cancel: Arc<Notify>,
     ) {
         tokio::spawn(async move {
-            if let Err(e) =
-                run_pump(remote, sink, Arc::clone(&status), notifier.clone(), cancel).await
-            {
+            // One connector drives either data direction: mirror-source pumps the
+            // remote source into a local sink; mirror-sink pumps a local source
+            // out to the remote.
+            let result = match local {
+                LocalEnd::Source(sink) => {
+                    run_pump(remote, sink, Arc::clone(&status), notifier.clone(), cancel).await
+                }
+                LocalEnd::Sink(source) => {
+                    run_sink_pump(remote, source, Arc::clone(&status), notifier.clone(), cancel)
+                        .await
+                }
+            };
+            if let Err(e) = result {
                 warn!("mount pump failed: {e}");
                 transition(&status, &notifier, MountState::Failed, Some(format!("{e}")));
             }
@@ -252,6 +262,174 @@ async fn run_pump(
                         // AppleMIDI clock-sync (100µs units). Answer a peer's CK0
                         // with CK1, and complete our own exchange by answering the
                         // peer's CK1 (a response to our CK0) with CK2.
+                        match count {
+                            0 => {
+                                let reply = AppleMidiPacket::Synchronization {
+                                    ssrc,
+                                    count: 1,
+                                    timestamp1,
+                                    timestamp2: now_ts(&started),
+                                    timestamp3: 0,
+                                };
+                                let _ = sockets.send_control(&reply, &from).await;
+                            }
+                            1 => {
+                                let reply = AppleMidiPacket::Synchronization {
+                                    ssrc,
+                                    count: 2,
+                                    timestamp1,
+                                    timestamp2,
+                                    timestamp3: now_ts(&started),
+                                };
+                                let _ = sockets.send_control(&reply, &from).await;
+                            }
+                            _ => {}
+                        }
+                    }
+                    Ok(_) => live.record_activity(),
+                    Err(e) => debug!("control recv error: {e}"),
+                },
+            }
+        }
+    }
+
+    let end = AppleMidiPacket::End {
+        version: APPLEMIDI_VERSION,
+        token,
+        ssrc,
+    };
+    let _ = sockets.send_control(&end, &control_addr).await;
+    transition(&status, &notifier, MountState::TornDown, None);
+    Ok(())
+}
+
+/// The `mirror-sink` data-path pump: make local MIDI play a **remote** instrument.
+///
+/// Structurally the mirror image of [`run_pump`]. It is the AppleMIDI *inviter*
+/// exactly the same way (invite control, await `OK`, then invite data; drive
+/// clock-sync; detect a dead peer; tear down with `End`), but instead of
+/// forwarding *inbound* RTP into a local sink it reads MIDI from the local virtual
+/// sink (`source`) and sends it *outbound* as RTP-MIDI to the remote's data port,
+/// accumulating `bytes-out`.
+async fn run_sink_pump(
+    remote: RemoteEndpoint,
+    mut source: Box<dyn MidiSource>,
+    status: Arc<Mutex<MountStatus>>,
+    notifier: broadcast::Sender<Value>,
+    cancel: Arc<Notify>,
+) -> anyhow::Result<()> {
+    let control_addr: SocketAddr = format!("{}:{}", remote.addr, remote.port)
+        .parse()
+        .map_err(|e| anyhow::anyhow!("bad remote addr {}:{}: {e}", remote.addr, remote.port))?;
+    let data_addr = SocketAddr::new(control_addr.ip(), control_addr.port().wrapping_add(1));
+
+    let sockets = NetworkSockets::bind_consecutive("0.0.0.0").await?;
+    let ssrc = generate_ssrc();
+    let token = generate_token();
+    let name = get_hostname();
+
+    let invitation = AppleMidiPacket::Invitation {
+        version: APPLEMIDI_VERSION,
+        token,
+        ssrc,
+        name: name.clone(),
+    };
+    // Same handshake ordering as the source pump: control channel first.
+    sockets.send_control(&invitation, &control_addr).await?;
+    debug!("sent AppleMIDI control invitation to {control_addr} (mirror-sink)");
+
+    let mut attempts = 0;
+    let mut cancelled = false;
+    loop {
+        tokio::select! {
+            biased;
+            _ = cancel.notified() => { cancelled = true; break; }
+            res = tokio::time::timeout(HANDSHAKE_TIMEOUT, sockets.recv_control()) => match res {
+                Ok(Ok((AppleMidiPacket::InvitationAccepted { .. }, _))) => break,
+                Ok(Ok((AppleMidiPacket::InvitationRejected { .. }, _))) => {
+                    anyhow::bail!("remote rejected the invitation");
+                }
+                Ok(Ok(_)) => continue,
+                Ok(Err(e)) => debug!("control recv during handshake: {e}"),
+                Err(_) => {
+                    attempts += 1;
+                    if attempts >= HANDSHAKE_ATTEMPTS {
+                        anyhow::bail!("no InvitationAccepted after {HANDSHAKE_ATTEMPTS} attempts");
+                    }
+                    sockets.send_control(&invitation, &control_addr).await?;
+                }
+            }
+        }
+    }
+
+    if !cancelled {
+        // Invite the data channel so the remote accepts our outbound RTP.
+        let _ = sockets.send_control_on_data(&invitation, &data_addr).await;
+        debug!("sent AppleMIDI data invitation to {data_addr} (mirror-sink)");
+
+        info!(
+            "mount active: forwarding local virtual sink out to {} (mirror-sink)",
+            data_addr
+        );
+        transition(&status, &notifier, MountState::Active, None);
+
+        let started = Instant::now();
+        let now_ts = |started: &Instant| (started.elapsed().as_micros() / 100) as u64;
+        // Outbound RTP sequence number, incremented per packet sent.
+        let mut seq: u16 = 0;
+        let mut ck_timer = tokio::time::interval(CK_SYNC_INTERVAL);
+        let mut live = SessionLiveness::new(SESSION_TIMEOUT);
+        loop {
+            tokio::select! {
+                biased;
+                _ = cancel.notified() => {
+                    info!("mount unmounted; tearing down session (mirror-sink)");
+                    break;
+                }
+                _ = ck_timer.tick() => {
+                    if live.is_stale(Instant::now()) {
+                        anyhow::bail!("remote unresponsive for {SESSION_TIMEOUT:?}");
+                    }
+                    let ck0 = AppleMidiPacket::Synchronization {
+                        ssrc,
+                        count: 0,
+                        timestamp1: now_ts(&started),
+                        timestamp2: 0,
+                        timestamp3: 0,
+                    };
+                    let _ = sockets.send_control(&ck0, &control_addr).await;
+                }
+                msg = source.receiver().recv() => match msg {
+                    Some(message) => {
+                        if message.is_empty() {
+                            continue;
+                        }
+                        let mut pkt = RtpPacket::new(ssrc, seq, now_ts(&started) as u32);
+                        pkt.add_command(0, message.clone());
+                        match sockets.send_data(&pkt, &data_addr).await {
+                            Ok(()) => {
+                                seq = seq.wrapping_add(1);
+                                let mut s = status.lock().unwrap();
+                                s.stats.bytes_out += message.len() as u64;
+                                s.stats.last_event = Some(now_rfc3339());
+                                s.state = MountState::Active;
+                            }
+                            Err(e) => warn!("dropping local MIDI, RTP send failed: {e}"),
+                        }
+                    }
+                    // The local virtual sink is gone (endpoint dropped): end the mount.
+                    None => {
+                        info!("local virtual sink closed; ending session (mirror-sink)");
+                        break;
+                    }
+                },
+                control = sockets.recv_control() => match control {
+                    Ok((AppleMidiPacket::End { .. }, _)) => {
+                        info!("remote ended the session (mirror-sink)");
+                        break;
+                    }
+                    Ok((AppleMidiPacket::Synchronization { count, timestamp1, timestamp2, .. }, from)) => {
+                        live.record_activity();
                         match count {
                             0 => {
                                 let reply = AppleMidiPacket::Synchronization {
@@ -796,7 +974,7 @@ mod tests {
 
         RtpConnector.start(
             remote,
-            Box::new(RecordingSink::new()),
+            LocalEnd::Source(Box::new(RecordingSink::new())),
             Arc::clone(&status),
             notifier,
             Arc::new(Notify::new()),
@@ -834,7 +1012,7 @@ mod tests {
 
         RtpConnector.start(
             remote,
-            Box::new(RecordingSink::new()),
+            LocalEnd::Source(Box::new(RecordingSink::new())),
             Arc::clone(&status),
             notifier,
             Arc::new(Notify::new()),
@@ -851,5 +1029,111 @@ mod tests {
             "failed notification carries a detail"
         );
         assert_eq!(status.lock().unwrap().state, MountState::Failed);
+    }
+
+    /// End-to-end mirror-sink test: a fake remote peer accepts the invitation,
+    /// then the real `run_sink_pump` must forward a MIDI message written to the
+    /// local virtual sink OUT as an RTP-MIDI packet to the remote's data port,
+    /// driving the mount to `active` with `bytes-out` — no MIDI hardware.
+    #[tokio::test]
+    async fn sink_pump_forwards_local_midi_out_as_rtp() {
+        use nmidi_core::network::NetworkSockets;
+        use tokio::sync::mpsc;
+
+        // A MidiSource backed by a channel the test drives (stands in for the
+        // local apps writing into the virtual sink).
+        struct ChannelSource {
+            rx: mpsc::Receiver<Vec<u8>>,
+        }
+        impl MidiSource for ChannelSource {
+            fn receiver(&mut self) -> &mut mpsc::Receiver<Vec<u8>> {
+                &mut self.rx
+            }
+        }
+
+        // Fake remote peer on consecutive ports: control accepts the invitation,
+        // data receives our outbound RTP (data port = control port + 1).
+        let fake = NetworkSockets::bind_consecutive("127.0.0.1").await.unwrap();
+        let fake_ctl_port = fake.control.local_addr().unwrap().port();
+        let note = vec![0x90u8, 0x3C, 0x64];
+        let got_note = Arc::new(Mutex::new(false));
+        let got_note_w = Arc::clone(&got_note);
+        let note_w = note.clone();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 2048];
+            let (n, from) = fake.control.recv_from(&mut buf).await.unwrap();
+            let AppleMidiPacket::Invitation { token, ssrc, .. } =
+                AppleMidiPacket::parse(&buf[..n]).unwrap()
+            else {
+                return;
+            };
+            let accept = AppleMidiPacket::InvitationAccepted {
+                version: APPLEMIDI_VERSION,
+                token,
+                ssrc,
+                name: "fake-peer".to_string(),
+            };
+            fake.control.send_to(&accept.to_bytes(), from).await.unwrap();
+
+            // Read datagrams on the data port until our note arrives as RTP
+            // (the data-channel invitation also lands here and is ignored).
+            loop {
+                let (n, _) = fake.data.recv_from(&mut buf).await.unwrap();
+                if let Ok(pkt) = RtpPacket::parse(&buf[..n])
+                    && pkt.commands.iter().any(|c| c.data == note_w)
+                {
+                    *got_note_w.lock().unwrap() = true;
+                    break;
+                }
+            }
+        });
+
+        let (tx, rx) = mpsc::channel::<Vec<u8>>(8);
+        let status = connecting_status();
+        let (notifier, _rx) = broadcast::channel(8);
+        let remote = RemoteEndpoint {
+            host: None,
+            addr: "127.0.0.1".to_string(),
+            port: fake_ctl_port,
+            port_id: "sink-0".to_string(),
+        };
+        let pump = tokio::spawn(run_sink_pump(
+            remote,
+            Box::new(ChannelSource { rx }),
+            Arc::clone(&status),
+            notifier,
+            Arc::new(Notify::new()),
+        ));
+
+        // Once the handshake completes the mount is active; then a local write is
+        // forwarded out.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if status.lock().unwrap().state == MountState::Active {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("mount reached active");
+
+        tx.send(note.clone()).await.unwrap();
+
+        let received = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if *got_note.lock().unwrap() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(received.is_ok(), "remote did not receive the outbound RTP note");
+        assert!(
+            status.lock().unwrap().stats.bytes_out >= 3,
+            "mirror-sink must accumulate bytes-out"
+        );
+        pump.abort();
     }
 }
