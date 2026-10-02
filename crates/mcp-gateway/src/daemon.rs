@@ -10,19 +10,27 @@
 //! [`GatewayState`](crate::http::GatewayState), and serves [`crate::http::router`].
 
 use crate::client::{
-    initialized_notification, initialize_request, rpc_result, tools_from_list_result,
-    tools_list_request, DEFAULT_PROTOCOL_VERSION,
+    DEFAULT_PROTOCOL_VERSION, initialize_request, initialized_notification, rpc_result,
+    tools_from_list_result, tools_list_request,
 };
 use crate::config::UpstreamConfig;
-use crate::forward::{post_and_session, post_jsonrpc, HttpClient, HttpForwarder, UpstreamEndpoint};
+use crate::forward::{HttpClient, HttpForwarder, UpstreamEndpoint, post_and_session, post_jsonrpc};
 use crate::{Federation, NS_SEP};
 use serde_json::Value;
 use std::collections::HashMap;
-use tokio::sync::RwLock;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::{RwLock, broadcast};
 use tracing::{info, warn};
 
 /// The client name the gateway presents to upstreams on `initialize`.
 const GATEWAY_CLIENT_NAME: &str = "capmesh-gateway";
+
+/// Default interval between startup-retry sweeps of the still-pending upstreams.
+pub const RETRY_INTERVAL: Duration = Duration::from_secs(5);
+/// Default number of startup-retry sweeps before the gateway gives up on a straggler upstream
+/// (`RETRY_INTERVAL` × this ≈ the window an upstream has to come up after the gateway).
+pub const RETRY_MAX_ATTEMPTS: usize = 60;
 
 /// Connect every configured upstream into a [`Federation`] and an endpoint map (best-effort). An
 /// upstream that fails to connect — or whose id contains the `__` namespace separator — is logged
@@ -38,7 +46,10 @@ pub async fn connect_upstreams(
             warn!(id = %up.id, "skipping upstream: id must not contain '__' (namespace separator)");
             continue;
         }
-        let protocol = up.protocol_rev.as_deref().unwrap_or(DEFAULT_PROTOCOL_VERSION);
+        let protocol = up
+            .protocol_rev
+            .as_deref()
+            .unwrap_or(DEFAULT_PROTOCOL_VERSION);
         match connect_one(client, &up.url, protocol).await {
             Ok((tools, session_id)) => {
                 info!(id = %up.id, url = %up.url, tools = tools.len(), "federated upstream");
@@ -77,7 +88,13 @@ async fn connect_one(
 
     // Per MCP the client sends `notifications/initialized` after initialize. It carries no id, so the
     // server replies with no body — best-effort, we don't parse or require the response.
-    let _ = post_jsonrpc(client, url, session_id.as_deref(), &initialized_notification()).await;
+    let _ = post_jsonrpc(
+        client,
+        url,
+        session_id.as_deref(),
+        &initialized_notification(),
+    )
+    .await;
 
     let (list_msg, _) =
         post_and_session(client, url, session_id.as_deref(), &tools_list_request(2)).await?;
@@ -127,12 +144,70 @@ pub async fn defederate(
     changed
 }
 
+/// Retry the upstreams that failed to connect at startup, federating each live the moment it answers.
+///
+/// [`connect_upstreams`] is best-effort: an upstream still booting — or ordered *after* the gateway —
+/// is skipped. On a host where capmeshd drives the control channel, that straggler gets re-registered;
+/// but on the static-config floor (no capmeshd) nothing re-drives it, so it would stay dark until the
+/// gateway restarts, forcing a strict "every upstream before the gateway" start-ordering. This
+/// background loop removes that constraint: it re-attempts each still-pending upstream every
+/// `interval` and [`federate`]s it live when it comes up (firing `tools/list_changed` to connected
+/// agents via `notifier`), giving up on a given upstream only after `max_attempts` sweeps.
+///
+/// `pending` must already exclude `__`-invalid ids (those never federate); it is consumed as the loop
+/// drops each upstream that successfully federates.
+#[allow(clippy::too_many_arguments)]
+pub async fn retry_pending_upstreams(
+    client: HttpClient,
+    federation: Arc<RwLock<Federation>>,
+    forwarder: Arc<HttpForwarder>,
+    notifier: broadcast::Sender<()>,
+    mut pending: Vec<UpstreamConfig>,
+    interval: Duration,
+    max_attempts: usize,
+) {
+    for attempt in 1..=max_attempts {
+        if pending.is_empty() {
+            return;
+        }
+        tokio::time::sleep(interval).await;
+        let mut still_pending = Vec::with_capacity(pending.len());
+        for up in pending {
+            let protocol = up
+                .protocol_rev
+                .as_deref()
+                .unwrap_or(DEFAULT_PROTOCOL_VERSION);
+            match federate(&client, &federation, &forwarder, &up.id, &up.url, protocol).await {
+                Ok(changed) => {
+                    info!(id = %up.id, attempt, "late-federated pending upstream");
+                    // A real surface change pushes tools/list_changed to connected agents.
+                    if changed {
+                        let _ = notifier.send(());
+                    }
+                }
+                Err(e) => {
+                    warn!(id = %up.id, attempt, "pending upstream still unreachable: {e}");
+                    still_pending.push(up);
+                }
+            }
+        }
+        pending = still_pending;
+    }
+    if !pending.is_empty() {
+        let ids: Vec<&str> = pending.iter().map(|u| u.id.as_str()).collect();
+        warn!(
+            ?ids,
+            max_attempts, "giving up retrying pending upstreams after startup window"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::forward::http_client;
     use axum::response::IntoResponse;
-    use axum::{routing::post, Json, Router};
+    use axum::{Json, Router, routing::post};
     use serde_json::json;
 
     /// An in-process MCP upstream: answers initialize (assigning a session), the initialized note,
@@ -241,9 +316,16 @@ mod tests {
         let forwarder = HttpForwarder::new(HashMap::new());
 
         // Federate on the running gateway: new upstream → surface changed.
-        let changed = federate(&client, &federation, &forwarder, "board", &url, "2026-07-28")
-            .await
-            .unwrap();
+        let changed = federate(
+            &client,
+            &federation,
+            &forwarder,
+            "board",
+            &url,
+            "2026-07-28",
+        )
+        .await
+        .unwrap();
         assert!(changed);
         assert_eq!(
             federation.read().await.merged_tools()[0]["name"],
@@ -257,9 +339,16 @@ mod tests {
         assert_eq!(msg["result"]["content"][0]["text"], "created");
 
         // Re-federate with identical tools → no surface change (idempotent).
-        let changed = federate(&client, &federation, &forwarder, "board", &url, "2026-07-28")
-            .await
-            .unwrap();
+        let changed = federate(
+            &client,
+            &federation,
+            &forwarder,
+            "board",
+            &url,
+            "2026-07-28",
+        )
+        .await
+        .unwrap();
         assert!(!changed);
 
         // Defederate → removed from both; the forwarder no longer routes it.
@@ -275,14 +364,130 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retry_federates_an_upstream_that_comes_up_after_startup() {
+        use crate::forward::HttpForwarder;
+        use std::collections::HashMap;
+        use std::time::Duration;
+
+        // Bind the listener now (so we know its port) but DON'T serve yet — the upstream is "down"
+        // at startup, mirroring an upstream ordered after the gateway.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://{addr}/mcp");
+
+        let client = http_client();
+        let federation = Arc::new(RwLock::new(Federation::new()));
+        let forwarder = Arc::new(HttpForwarder::new(HashMap::new()));
+        let (notifier, mut rx) = broadcast::channel(8);
+
+        // The upstream wasn't connectable at startup, so it is pending.
+        let pending = vec![UpstreamConfig {
+            id: "board".to_string(),
+            url: url.clone(),
+            transport: "streamable-http".to_string(),
+            protocol_rev: None,
+        }];
+        let retry = tokio::spawn(retry_pending_upstreams(
+            client,
+            federation.clone(),
+            forwarder.clone(),
+            notifier,
+            pending,
+            Duration::from_millis(20),
+            50,
+        ));
+
+        // Bring the upstream up shortly after; a retry sweep should then federate it live.
+        let app = Router::new().route(
+            "/mcp",
+            post(move |Json(req): Json<Value>| async move {
+                let id = req.get("id").cloned();
+                match req["method"].as_str().unwrap_or("") {
+                    "initialize" => (
+                        [("mcp-session-id", "sess-late")],
+                        Json(json!({ "jsonrpc": "2.0", "id": id,
+                            "result": { "protocolVersion": "2026-07-28", "capabilities": {} } })),
+                    )
+                        .into_response(),
+                    "tools/list" => Json(json!({ "jsonrpc": "2.0", "id": id,
+                        "result": { "tools": [{ "name": "create_task", "inputSchema": {"type":"object"} }] } }))
+                    .into_response(),
+                    _ => axum::http::StatusCode::ACCEPTED.into_response(),
+                }
+            }),
+        );
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        // The retry loop drains to empty and returns once the upstream is federated.
+        tokio::time::timeout(Duration::from_secs(5), retry)
+            .await
+            .expect("retry loop should finish once the upstream comes up")
+            .unwrap();
+
+        assert_eq!(
+            federation.read().await.merged_tools()[0]["name"],
+            "board__create_task"
+        );
+        // A late federation that changed the surface signalled connected streams.
+        assert!(
+            rx.try_recv().is_ok(),
+            "late federation should fire tools/list_changed"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_gives_up_after_max_attempts_on_a_dead_upstream() {
+        use crate::forward::HttpForwarder;
+        use std::collections::HashMap;
+        use std::time::Duration;
+
+        let client = http_client();
+        let federation = Arc::new(RwLock::new(Federation::new()));
+        let forwarder = Arc::new(HttpForwarder::new(HashMap::new()));
+        let (notifier, _rx) = broadcast::channel(8);
+
+        let pending = vec![UpstreamConfig {
+            id: "dead".to_string(),
+            url: "http://127.0.0.1:1/mcp".to_string(),
+            transport: "streamable-http".to_string(),
+            protocol_rev: None,
+        }];
+
+        // Bounded: 3 sweeps of 10ms must return (not hang) and leave the federation empty.
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            retry_pending_upstreams(
+                client,
+                federation.clone(),
+                forwarder,
+                notifier,
+                pending,
+                Duration::from_millis(10),
+                3,
+            ),
+        )
+        .await
+        .expect("retry loop must give up after max_attempts, not hang");
+
+        assert!(federation.read().await.upstream_ids().is_empty());
+    }
+
+    #[tokio::test]
     async fn federate_rejects_a_namespaced_id() {
         let url = spawn_upstream("t").await;
         let client = http_client();
         let federation = RwLock::new(Federation::new());
         let forwarder = crate::forward::HttpForwarder::new(std::collections::HashMap::new());
-        let err = federate(&client, &federation, &forwarder, "bad__id", &url, "2026-07-28")
-            .await
-            .unwrap_err();
+        let err = federate(
+            &client,
+            &federation,
+            &forwarder,
+            "bad__id",
+            &url,
+            "2026-07-28",
+        )
+        .await
+        .unwrap_err();
         assert!(err.contains("must not contain"));
     }
 }
