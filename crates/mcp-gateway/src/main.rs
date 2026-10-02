@@ -9,8 +9,8 @@ use std::sync::Arc;
 
 use mcp_gateway::config::GatewayConfig;
 use mcp_gateway::daemon::connect_upstreams;
-use mcp_gateway::forward::{http_client, HttpForwarder};
-use mcp_gateway::http::{router, GatewayState};
+use mcp_gateway::forward::{HttpForwarder, http_client};
+use mcp_gateway::http::{GatewayState, router};
 use tracing::{info, warn};
 
 /// Default config path (overridable with `--config`).
@@ -41,7 +41,22 @@ async fn main() {
 
     let client = http_client();
     let (fed, endpoints) = connect_upstreams(&client, &cfg.upstream).await;
-    info!(federated = fed.upstream_ids().len(), "startup federation built");
+    // Upstreams that didn't connect at startup (still booting, or ordered after the gateway) are
+    // retried live in the background below, so the gateway need not start strictly after its
+    // upstreams. `__`-invalid ids never federate, so they are not retry-eligible.
+    let federated: std::collections::HashSet<String> =
+        fed.upstream_ids().into_iter().map(str::to_string).collect();
+    let pending: Vec<_> = cfg
+        .upstream
+        .iter()
+        .filter(|u| !u.id.contains(mcp_gateway::NS_SEP) && !federated.contains(&u.id))
+        .cloned()
+        .collect();
+    info!(
+        federated = federated.len(),
+        pending = pending.len(),
+        "startup federation built"
+    );
 
     // The federation + forwarder are shared: the /mcp server serves them, and the admin control
     // channel (de)federates them live — both see the same state.
@@ -56,6 +71,30 @@ async fn main() {
         notifier: notifier.clone(),
     };
 
+    // Retry any upstream that didn't connect at startup, federating it live when it comes up (lifts
+    // the gateway-after-upstreams start-ordering constraint). Best-effort background task.
+    if !pending.is_empty() {
+        warn!(
+            pending = pending.len(),
+            "retrying unconnected upstreams in the background until they come up"
+        );
+        let (client, federation, forwarder, notifier) = (
+            client.clone(),
+            federation.clone(),
+            forwarder.clone(),
+            notifier.clone(),
+        );
+        tokio::spawn(mcp_gateway::daemon::retry_pending_upstreams(
+            client,
+            federation,
+            forwarder,
+            notifier,
+            pending,
+            mcp_gateway::daemon::RETRY_INTERVAL,
+            mcp_gateway::daemon::RETRY_MAX_ATTEMPTS,
+        ));
+    }
+
     // Control channel (DESIGN §7.2): capmeshd drives (de)federation over this loopback admin API.
     // Best-effort: a bind failure is logged, not fatal.
     if let Some(admin_addr) = cfg.admin_addr.clone() {
@@ -69,7 +108,9 @@ async fn main() {
             Ok(listener) => {
                 info!(addr = %admin_addr, "serving gateway control channel /admin");
                 tokio::spawn(async move {
-                    if let Err(e) = axum::serve(listener, mcp_gateway::admin::admin_router(admin)).await {
+                    if let Err(e) =
+                        axum::serve(listener, mcp_gateway::admin::admin_router(admin)).await
+                    {
                         warn!("gateway control channel error: {e}");
                     }
                 });
